@@ -153,10 +153,9 @@ pub fn render_stem_aware_master_mix(
                     stem_cfg.transient_crisp_lock = true;
                 }
                 StemRole::ReverbTail => {
-                    // Reverb tail is time-stretched without pitch warping to avoid metallic room artifacts
-                    stem_cfg.semitones = 0.0;
-                    stem_cfg.cents = 0.0;
+                    // Keep reverb tail pitch-locked to the transposed key without formant warping
                     stem_cfg.preserve_formants = false;
+                    stem_cfg.transient_crisp_lock = false;
                 }
             }
         }

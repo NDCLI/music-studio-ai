@@ -9,7 +9,7 @@ export type SeparationPresetId =
   | 'practice_backing'
   | 'acapella';
 
-export type SeparationQualityMode = 'fast_mdx' | 'pro_roformer';
+export type SeparationQualityMode = 'fast_mdx' | 'pro_roformer' | 'htdemucs';
 
 export type ComputeDeviceMode = 'auto' | 'gpu' | 'cpu';
 

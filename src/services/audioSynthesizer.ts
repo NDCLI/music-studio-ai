@@ -47,6 +47,16 @@ export class StudioPreviewAudioEngine {
   private playheadSample = 0;
   private grainPhaseA = 0;
   private grainPhaseB = 0.5;
+  private masterGain = 1.0;
+  private limiterEnabled = true;
+
+  public setMasterVolume(volumePercent: number): void {
+    this.masterGain = Math.max(0, Math.min(2.0, volumePercent / 100));
+  }
+
+  public setLimiterEnabled(enabled: boolean): void {
+    this.limiterEnabled = enabled;
+  }
 
   public getCustomAudioBuffer(): AudioBuffer | null {
     return this.customBuffer;
@@ -230,38 +240,45 @@ export class StudioPreviewAudioEngine {
         const winA = 0.5 * (1 - Math.cos(2 * Math.PI * this.grainPhaseA));
         const winB = 0.5 * (1 - Math.cos(2 * Math.PI * this.grainPhaseB));
 
-        const idxA = Math.min(
-          totalSamples - 1,
-          Math.max(0, Math.floor(this.playheadSample + this.grainPhaseA * grainSize))
+        const rawPosA = Math.min(
+          totalSamples - 2,
+          Math.max(0, this.playheadSample + this.grainPhaseA * grainSize)
         );
-        const idxB = Math.min(
-          totalSamples - 1,
-          Math.max(0, Math.floor(this.playheadSample + this.grainPhaseB * grainSize))
+        const rawPosB = Math.min(
+          totalSamples - 2,
+          Math.max(0, this.playheadSample + this.grainPhaseB * grainSize)
         );
+        const idxA = Math.floor(rawPosA);
+        const fracA = rawPosA - idxA;
+        const idxB = Math.floor(rawPosB);
+        const fracB = rawPosB - idxB;
+
+        const lerp = (arr: Float32Array, idx: number, f: number) =>
+          arr[idx] + (arr[idx + 1] - arr[idx]) * f;
 
         let sumL = 0;
         let sumR = 0;
 
         if (sep) {
           if (leadGain > 0.001) {
-            sumL += (sep.lead_vocal.left[idxA] * winA + sep.lead_vocal.left[idxB] * winB) * leadGain;
-            sumR += (sep.lead_vocal.right[idxA] * winA + sep.lead_vocal.right[idxB] * winB) * leadGain;
+            sumL += (lerp(sep.lead_vocal.left, idxA, fracA) * winA + lerp(sep.lead_vocal.left, idxB, fracB) * winB) * leadGain;
+            sumR += (lerp(sep.lead_vocal.right, idxA, fracA) * winA + lerp(sep.lead_vocal.right, idxB, fracB) * winB) * leadGain;
           }
           if (backingGain > 0.001) {
-            sumL += (sep.backing_vocal.left[idxA] * winA + sep.backing_vocal.left[idxB] * winB) * backingGain;
-            sumR += (sep.backing_vocal.right[idxA] * winA + sep.backing_vocal.right[idxB] * winB) * backingGain;
+            sumL += (lerp(sep.backing_vocal.left, idxA, fracA) * winA + lerp(sep.backing_vocal.left, idxB, fracB) * winB) * backingGain;
+            sumR += (lerp(sep.backing_vocal.right, idxA, fracA) * winA + lerp(sep.backing_vocal.right, idxB, fracB) * winB) * backingGain;
           }
           if (instGain > 0.001) {
-            sumL += (sep.instrumental.left[idxA] * winA + sep.instrumental.left[idxB] * winB) * instGain;
-            sumR += (sep.instrumental.right[idxA] * winA + sep.instrumental.right[idxB] * winB) * instGain;
+            sumL += (lerp(sep.instrumental.left, idxA, fracA) * winA + lerp(sep.instrumental.left, idxB, fracB) * winB) * instGain;
+            sumR += (lerp(sep.instrumental.right, idxA, fracA) * winA + lerp(sep.instrumental.right, idxB, fracB) * winB) * instGain;
           }
           if (reverbGain > 0.001) {
-            sumL += (sep.reverb_tail.left[idxA] * winA + sep.reverb_tail.left[idxB] * winB) * reverbGain;
-            sumR += (sep.reverb_tail.right[idxA] * winA + sep.reverb_tail.right[idxB] * winB) * reverbGain;
+            sumL += (lerp(sep.reverb_tail.left, idxA, fracA) * winA + lerp(sep.reverb_tail.left, idxB, fracB) * winB) * reverbGain;
+            sumR += (lerp(sep.reverb_tail.right, idxA, fracA) * winA + lerp(sep.reverb_tail.right, idxB, fracB) * winB) * reverbGain;
           }
         } else {
-          const rawL = chLeft[idxA] * winA + chLeft[idxB] * winB;
-          const rawR = chRight[idxA] * winA + chRight[idxB] * winB;
+          const rawL = lerp(chLeft, idxA, fracA) * winA + lerp(chLeft, idxB, fracB) * winB;
+          const rawR = lerp(chRight, idxA, fracA) * winA + lerp(chRight, idxB, fracB) * winB;
 
           const mid = 0.5 * (rawL + rawR);
           const side = 0.5 * (rawL - rawR);
@@ -277,8 +294,14 @@ export class StudioPreviewAudioEngine {
           sumR = vocalComponent + backingComponentR + instComponentR - revComponent;
         }
 
-        const mixL = Math.max(-0.966, Math.min(0.966, sumL));
-        const mixR = Math.max(-0.966, Math.min(0.966, sumR));
+        const scaledL = sumL * this.masterGain;
+        const scaledR = sumR * this.masterGain;
+        const mixL = this.limiterEnabled
+          ? Math.max(-0.966, Math.min(0.966, scaledL))
+          : Math.max(-1.0, Math.min(1.0, scaledL));
+        const mixR = this.limiterEnabled
+          ? Math.max(-0.966, Math.min(0.966, scaledR))
+          : Math.max(-1.0, Math.min(1.0, scaledR));
 
         outL[i] = mixL;
         outR[i] = mixR;

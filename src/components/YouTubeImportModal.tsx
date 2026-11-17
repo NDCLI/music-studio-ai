@@ -22,15 +22,18 @@ import { openExternalUrl } from '../services/tauriBridge';
 interface YouTubeImportModalProps {
   isOpen: boolean;
   onClose: () => void;
+  onImportYouTubeUrl?: (canonicalUrl: string, title?: string) => Promise<void>;
 }
 
 export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
   isOpen,
   onClose,
+  onImportYouTubeUrl,
 }) => {
   const [rawUrl, setRawUrl] = useState('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isDownloadingAudio, setIsDownloadingAudio] = useState(false);
   const [resolvedInfo, setResolvedInfo] =
     useState<YouTubeTrackResolvedInfo | null>(null);
 
@@ -139,10 +142,10 @@ export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
             </div>
           </div>
 
-          <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs text-amber-200">
-            <Info className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+          <div className="flex items-start gap-2.5 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-3.5 text-xs text-indigo-200">
+            <Info className="h-4 w-4 text-indigo-400 shrink-0 mt-0.5" />
             <span>
-              YouTube yêu cầu xác thực bot khi tải luồng âm thanh trực tiếp (<code>LOGIN_REQUIRED</code>). Để tách nhạc, nâng/hạ tone và xuất file thật, hãy tải audio/video về máy rồi mở bằng nút <strong>Mở Nhạc / Video</strong>.
+              Dán link YouTube / YouTube Music bên trên rồi bấm <strong>Tải &amp; Nạp Vào Studio</strong> để tải luồng âm thanh chất lượng cao qua <code>yt-dlp</code> và xử lý tách nhạc, dịch tone ngay trong app.
             </span>
           </div>
 
@@ -239,11 +242,46 @@ export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
         <div className="flex items-center justify-end gap-2.5 border-t border-white/10 px-6 py-4">
           <button
             type="button"
+            disabled={isDownloadingAudio}
             onClick={onClose}
-            className="cursor-pointer rounded-xl border border-white/10 bg-slate-800 px-4 py-2 text-xs font-semibold text-slate-300 hover:bg-slate-700"
+            className="cursor-pointer rounded-xl border border-white/10 bg-slate-800 px-4 py-2 text-xs font-semibold text-slate-300 hover:bg-slate-700 disabled:opacity-50"
           >
             Đóng
           </button>
+          {onImportYouTubeUrl && resolvedInfo && (
+            <button
+              type="button"
+              disabled={isDownloadingAudio}
+              onClick={async () => {
+                setErrorMsg(null);
+                setIsDownloadingAudio(true);
+                try {
+                  await onImportYouTubeUrl(
+                    resolvedInfo.parsed.canonicalWatchUrl,
+                    resolvedInfo.title
+                  );
+                  onClose();
+                } catch (err) {
+                  setErrorMsg(err instanceof Error ? err.message : String(err));
+                } finally {
+                  setIsDownloadingAudio(false);
+                }
+              }}
+              className="cursor-pointer inline-flex items-center gap-2 rounded-xl bg-rose-600 px-4 py-2 text-xs font-bold text-white transition-colors hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isDownloadingAudio ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  <span>Đang tải âm thanh từ YouTube...</span>
+                </>
+              ) : (
+                <>
+                  <Play className="h-3.5 w-3.5 fill-current" />
+                  <span>Tải &amp; Nạp Vào Studio</span>
+                </>
+              )}
+            </button>
+          )}
         </div>
       </div>
     </div>

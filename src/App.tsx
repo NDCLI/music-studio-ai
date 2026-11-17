@@ -12,6 +12,7 @@ import { ExportModal, ExportFormat, ExportOutcome, ExportTarget } from './compon
 import { YouTubeImportModal } from './components/YouTubeImportModal';
 import { LOCAL_AI_MODELS } from './data/modelsCatalog';
 import { StudioPreviewAudioEngine } from './services/audioSynthesizer';
+import { encodeStereoAudioBlob } from './services/dspEngine';
 import {
   deleteCachedModelFromDb,
   downloadModelFromHuggingFace,
@@ -29,11 +30,11 @@ import {
   type BrowserDirectoryHandle,
   type BrowserFileHandle,
 } from './services/exportStorage';
-import { separateAudioBuffer3Stage } from './services/stemSeparator';
 import {
   base64ToArrayBuffer,
   deleteModelViaRustBackend,
   downloadModelViaRustBackend,
+  downloadYouTubeAudioViaRust,
   exportAudioViaRustBackend,
   getDefaultExportDirViaRust,
   getSeparatedStemsWavViaRust,
@@ -173,7 +174,7 @@ export const App: React.FC = () => {
   >('none');
 
   const [qualityMode, setQualityMode] =
-    useState<SeparationQualityMode>('fast_mdx');
+    useState<SeparationQualityMode>('htdemucs');
   const [activePreset, setActivePreset] =
     useState<SeparationPresetId>('full_mix');
   const [separationStatus, setSeparationStatus] =
@@ -295,6 +296,14 @@ export const App: React.FC = () => {
   pitchSpeedRef.current = pitchSpeed;
 
   useEffect(() => {
+    audioEngineRef.current?.setMasterVolume(masterVolume);
+  }, [masterVolume]);
+
+  useEffect(() => {
+    audioEngineRef.current?.setLimiterEnabled(limiterEnabled);
+  }, [limiterEnabled]);
+
+  useEffect(() => {
     audioEngineRef.current = new StudioPreviewAudioEngine();
 
     if (isTauriDesktopRuntime()) {
@@ -322,6 +331,7 @@ export const App: React.FC = () => {
       const rustMap = new Map(
         (rustOverview?.cached_status ?? []).map((item) => [item.id, item])
       );
+      const isDesktop = isTauriDesktopRuntime();
       setModels((prev) =>
         prev.map((m) => {
           const rustHit = rustMap.get(m.id);
@@ -333,6 +343,9 @@ export const App: React.FC = () => {
               sha256Hex: rustHit.sha256_hex ?? m.sha256Hex,
               cachedSource: 'huggingface',
             };
+          }
+          if (isDesktop) {
+            return { ...m, installed: false };
           }
           const hit = dbMap[m.id];
           if (!hit) return m;
@@ -415,8 +428,17 @@ export const App: React.FC = () => {
       const decoded = await engine.loadAudioFromArrayBuffer(rawArrayBuffer);
       const cleanTitle = file.name.replace(/\.[^/.]+$/, '');
 
-      if (isTauriDesktopRuntime() && rawArrayBuffer.byteLength <= 80 * 1024 * 1024) {
-        void loadAudioBytesViaRustBackend(file.name, rawArrayBuffer).catch(() => null);
+      if (isTauriDesktopRuntime()) {
+        void loadAudioBytesViaRustBackend(file.name, rawArrayBuffer).catch(async () => {
+          const decodedBuf = engine.getCustomAudioBuffer();
+          if (!decodedBuf) return null;
+          const left = decodedBuf.getChannelData(0);
+          const right = decodedBuf.numberOfChannels > 1 ? decodedBuf.getChannelData(1) : left;
+          const wavBlob = encodeStereoAudioBlob(left, right, decodedBuf.sampleRate, 'wav16');
+          const wavBuf = await wavBlob.arrayBuffer();
+          const wavName = `${file.name.replace(/\.[^/.]+$/, '')}.wav`;
+          return loadAudioBytesViaRustBackend(wavName, wavBuf).catch(() => null);
+        });
       }
 
       setSong({
@@ -463,12 +485,9 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleDesktopOpenTrack = async () => {
+  const loadDesktopFileFromPath = async (pickedPath: string, overrideTitle?: string) => {
     const engine = audioEngineRef.current;
     if (!engine) return;
-
-    const pickedPath = await pickAudioFileViaRust().catch(() => null);
-    if (!pickedPath) return;
 
     if (isPlaying) {
       engine.stop();
@@ -479,20 +498,43 @@ export const App: React.FC = () => {
     setTrackLoadError(null);
 
     try {
-      const rustSummary = await loadTrackViaRustBackend(pickedPath);
-      if (!rustSummary) {
-        throw new Error('Không đọc được file qua bộ giải mã cục bộ.');
-      }
+      let rustSummary = await loadTrackViaRustBackend(pickedPath).catch(() => null);
 
-      try {
+      if (rustSummary) {
+        try {
+          const rawBytes = await readFileBytesViaRust(pickedPath);
+          await engine.loadAudioFromArrayBuffer(rawBytes);
+        } catch {
+          const previewWavBytes = await preparePreviewWavViaRust();
+          await engine.loadAudioFromArrayBuffer(previewWavBytes);
+        }
+      } else {
+        // Fallback for containers/codecs Symphonia lacks (e.g., MKV/WebM with Opus):
+        // Decode via WebView2 AudioContext (which supports Opus/MKV), then hand WAV to Rust.
         const rawBytes = await readFileBytesViaRust(pickedPath);
         await engine.loadAudioFromArrayBuffer(rawBytes);
-      } catch {
-        const previewWavBytes = await preparePreviewWavViaRust();
-        await engine.loadAudioFromArrayBuffer(previewWavBytes);
+        const decodedBuf = engine.getCustomAudioBuffer();
+        if (!decodedBuf) {
+          throw new Error('Không giải mã được audio từ file đã chọn.');
+        }
+        const left = decodedBuf.getChannelData(0);
+        const right = decodedBuf.numberOfChannels > 1 ? decodedBuf.getChannelData(1) : left;
+        const wavBlob = encodeStereoAudioBlob(left, right, decodedBuf.sampleRate, 'wav16');
+        const wavBuffer = await wavBlob.arrayBuffer();
+        const fileName = pickedPath.split(/[\\/]/).pop() || 'audio.mkv';
+        const wavName = `${fileName.replace(/\.[^/.]+$/, '')}.wav`;
+        const uploadedSummary = await loadAudioBytesViaRustBackend(wavName, wavBuffer);
+        if (!uploadedSummary) {
+          throw new Error('Không nạp được dữ liệu WAV đã giải mã vào Rust.');
+        }
+        rustSummary = {
+          ...uploadedSummary,
+          file_name: fileName,
+          is_video_source: /\.(mkv|mp4|webm|mov|avi)$/i.test(fileName),
+        };
       }
 
-      const cleanTitle = rustSummary.file_name.replace(/\.[^/.]+$/, '');
+      const cleanTitle = overrideTitle?.trim() || rustSummary.file_name.replace(/\.[^/.]+$/, '');
       setSong({
         title: cleanTitle,
         artist: rustSummary.is_video_source ? 'Video Audio Track' : 'Local Audio Track',
@@ -535,6 +577,23 @@ export const App: React.FC = () => {
     } finally {
       setIsLoadingTrack(false);
     }
+  };
+
+  const handleDesktopOpenTrack = async () => {
+    const pickedPath = await pickAudioFileViaRust().catch(() => null);
+    if (!pickedPath) return;
+    await loadDesktopFileFromPath(pickedPath);
+  };
+
+  const handleImportYouTubeTrack = async (canonicalUrl: string, title?: string) => {
+    if (!isTauriDesktopRuntime()) {
+      throw new Error('Tính năng tải âm thanh từ YouTube chỉ hỗ trợ trên bản Desktop (.exe).');
+    }
+    const downloadedPath = await downloadYouTubeAudioViaRust(canonicalUrl);
+    if (!downloadedPath) {
+      throw new Error('Không tải được file âm thanh từ YouTube.');
+    }
+    await loadDesktopFileFromPath(downloadedPath, title);
   };
 
   const activeDesktopExportDir = customExportDir ?? defaultExportDir;
@@ -866,156 +925,161 @@ export const App: React.FC = () => {
     });
   };
 
-  const runSpectralSeparation = async () => {
-    const engine = audioEngineRef.current;
-    const customBuffer = engine?.getCustomAudioBuffer();
-    if (!customBuffer || !engine) return;
-
-    const startedAt = performance.now();
-    setSeparationToast(null);
-    setSeparationStatus({
-      isRunning: true,
-      isSeparated: false,
-      currentStage: 1,
-      progressPercent: 1,
-      stageMessage: 'Đang phân tích tín hiệu & tách phổ STFT 3 tầng trên file thực tế...',
-    });
-
-    try {
-      const result = await separateAudioBuffer3Stage(
-        customBuffer,
-        qualityMode,
-        (info) => {
-          setSeparationStatus({
-            isRunning: true,
-            isSeparated: false,
-            currentStage: info.stage,
-            progressPercent: info.percent,
-            stageMessage: info.message,
-          });
-        }
-      );
-
-      const elapsedSec = ((performance.now() - startedAt) / 1000).toFixed(1);
-      engine.setSeparatedStems(result.stems);
-      setStems((prev) =>
-        prev.map((s) => ({
-          ...s,
-          modelSource: 'Tách Phổ STFT (DSP)',
-          peaks: result.peaks[s.id] ?? s.peaks,
-        }))
-      );
-      setSeparationBackendType('stft_dsp');
-      const doneMessage = `Đã tách xong 4 kênh độc lập trong ${elapsedSec}s (Vocal chính, Giọng bè, Nhạc nền, Đuôi vang).`;
-      setSeparationStatus({
-        isRunning: false,
-        isSeparated: true,
-        currentStage: 3,
-        progressPercent: 100,
-        stageMessage: doneMessage,
-        executionBackend: 'Tách Phổ STFT (DSP)',
-      });
-      showSeparationSuccessToast(`Tách nhạc thành công (${elapsedSec}s)! Sóng âm 4 kênh đã hiển thị.`);
-    } catch (err) {
-      setSeparationStatus({
-        isRunning: false,
-        isSeparated: false,
-        currentStage: 0,
-        progressPercent: 0,
-        stageMessage: `Lỗi khi tách phổ: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      });
-    }
-  };
-
   const handleRunSeparation = async () => {
     if (separationStatus.isRunning) return;
     const engine = audioEngineRef.current;
     const customBuffer = engine?.getCustomAudioBuffer();
     if (!customBuffer || !engine || !song) return;
 
-    if (isTauriDesktopRuntime()) {
-      const startedAt = performance.now();
-      const useGpu = computeDevice !== 'cpu';
-      const deviceLabel =
-        computeDevice === 'cpu'
-          ? 'CPU đa luồng'
-          : computeDevice === 'gpu'
-            ? 'GPU (DirectML)'
-            : 'AUTO (Ưu tiên GPU)';
-      setSeparationToast(null);
+    if (!isTauriDesktopRuntime()) {
+      setSeparationStatus({
+        isRunning: false,
+        isSeparated: false,
+        currentStage: 0,
+        progressPercent: 0,
+        stageMessage: 'Tách nhạc AI ONNX chỉ khả dụng trên ứng dụng Desktop (Tauri).',
+        onnxPrereqMissing:
+          'Chế độ trình duyệt không hỗ trợ chạy AI ONNX. Vui lòng chạy ứng dụng Desktop để tự động tải model .ONNX và tách nhạc.',
+      });
+      return;
+    }
+
+    const startedAt = performance.now();
+    const useGpu = computeDevice !== 'cpu';
+    const deviceLabel =
+      computeDevice === 'cpu'
+        ? 'CPU đa luồng'
+        : computeDevice === 'gpu'
+          ? 'GPU (DirectML)'
+          : 'AUTO (Ưu tiên GPU)';
+    setSeparationToast(null);
+    setSeparationStatus({
+      isRunning: true,
+      isSeparated: false,
+      currentStage: 1,
+      progressPercent: 5,
+      stageMessage: 'Đang kiểm tra model AI ONNX trên ổ đĩa...',
+    });
+
+    try {
+      const requiredIds =
+        qualityMode === 'pro_roformer'
+          ? ['uvr_mdx_inst_hq1', 'mel_band_roformer_karaoke']
+          : qualityMode === 'htdemucs'
+            ? ['htdemucs_4stems', 'mel_band_roformer_karaoke']
+            : ['uvr_mdx_inst_hq1', 'uvr_mdx_kara_2'];
+
+      const overview = await listModelsViaRustBackend().catch(() => null);
+      const installedMap = new Map(
+        (overview?.cached_status ?? []).map((item) => [item.id, item.installed])
+      );
+      const missingIds = requiredIds.filter((id) => !installedMap.get(id));
+
+      for (let i = 0; i < missingIds.length; i += 1) {
+        const modelId = missingIds[i];
+        const spec = models.find((m) => m.id === modelId);
+        const label = spec?.fileName ?? modelId;
+        setSeparationStatus({
+          isRunning: true,
+          isSeparated: false,
+          currentStage: 1,
+          progressPercent: Math.round(5 + (i / missingIds.length) * 20),
+          stageMessage: `Chưa có model '${label}' — đang tự động tải từ HuggingFace (${i + 1}/${missingIds.length})...`,
+        });
+
+        const rustSaved = await downloadModelViaRustBackend(modelId);
+        if (!rustSaved?.installed) {
+          throw new Error(`Không thể tự động tải model '${label}'.`);
+        }
+
+        setModels((prev) =>
+          prev.map((m) =>
+            m.id === modelId
+              ? {
+                  ...m,
+                  downloading: false,
+                  installed: true,
+                  downloadProgress: 100,
+                  cachedSizeBytes: rustSaved.size_bytes,
+                  sha256Hex: rustSaved.sha256_hex,
+                  cachedSource: 'huggingface',
+                  downloadError: undefined,
+                }
+              : m
+          )
+        );
+      }
+
       setSeparationStatus({
         isRunning: true,
         isSeparated: false,
         currentStage: 1,
-        progressPercent: 15,
+        progressPercent: 28,
         stageMessage: `Đang chạy suy luận 3 tầng AI ONNX (${deviceLabel})...`,
       });
 
-      try {
-        const rustMode = qualityMode === 'pro_roformer' ? 'ProRoformer' : 'FastMdx';
-        const res = await runSeparationViaRustBackend(rustMode, useGpu);
-        const wavRes = await getSeparatedStemsWavViaRust();
+      const rustMode =
+        qualityMode === 'pro_roformer'
+          ? 'ProRoformer'
+          : qualityMode === 'htdemucs'
+            ? 'HtDemucs'
+            : 'FastMdx';
+      const res = await runSeparationViaRustBackend(rustMode, useGpu);
+      const wavRes = await getSeparatedStemsWavViaRust();
 
-        const [lead, backing, inst, rev] = await Promise.all([
-          engine.decodeWavArrayBufferToStereo(base64ToArrayBuffer(wavRes.lead_vocal_b64)),
-          engine.decodeWavArrayBufferToStereo(base64ToArrayBuffer(wavRes.backing_vocal_b64)),
-          engine.decodeWavArrayBufferToStereo(base64ToArrayBuffer(wavRes.instrumental_b64)),
-          engine.decodeWavArrayBufferToStereo(base64ToArrayBuffer(wavRes.reverb_tail_b64)),
-        ]);
+      const [lead, backing, inst, rev] = await Promise.all([
+        engine.decodeWavArrayBufferToStereo(base64ToArrayBuffer(wavRes.lead_vocal_b64)),
+        engine.decodeWavArrayBufferToStereo(base64ToArrayBuffer(wavRes.backing_vocal_b64)),
+        engine.decodeWavArrayBufferToStereo(base64ToArrayBuffer(wavRes.instrumental_b64)),
+        engine.decodeWavArrayBufferToStereo(base64ToArrayBuffer(wavRes.reverb_tail_b64)),
+      ]);
 
-        engine.setSeparatedStems({
-          lead_vocal: lead,
-          backing_vocal: backing,
-          instrumental: inst,
-          reverb_tail: rev,
-        });
+      engine.setSeparatedStems({
+        lead_vocal: lead,
+        backing_vocal: backing,
+        instrumental: inst,
+        reverb_tail: rev,
+      });
 
-        const elapsedSec = ((performance.now() - startedAt) / 1000).toFixed(1);
-        setStems((prev) =>
-          prev.map((s) => ({
-            ...s,
-            peaks: res[s.id] ?? s.peaks,
-          }))
-        );
-        setSeparationBackendType('onnx_rust');
-        setSeparationStatus({
-          isRunning: false,
-          isSeparated: true,
-          currentStage: 3,
-          progressPercent: 100,
-          stageMessage: `Đã tách xong 4 kênh bằng AI ONNX cục bộ trong ${elapsedSec}s.`,
-          executionBackend: res.execution_backend,
-        });
-        showSeparationSuccessToast(`Tách nhạc AI ONNX thành công (${elapsedSec}s)!`);
-        return;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes('ONNX_PREREQ_MISSING:')) {
-          const cleanReason = msg.replace(/^.*ONNX_PREREQ_MISSING:\s*/, '');
-          setSeparationStatus({
-            isRunning: false,
-            isSeparated: false,
-            currentStage: 0,
-            progressPercent: 0,
-            stageMessage: 'Chưa thể chạy mô hình AI ONNX trên máy.',
-            onnxPrereqMissing: cleanReason,
-          });
-          return;
-        }
+      const elapsedSec = ((performance.now() - startedAt) / 1000).toFixed(1);
+      setStems((prev) =>
+        prev.map((s) => ({
+          ...s,
+          peaks: res[s.id] ?? s.peaks,
+        }))
+      );
+      setSeparationBackendType('onnx_rust');
+      setSeparationStatus({
+        isRunning: false,
+        isSeparated: true,
+        currentStage: 3,
+        progressPercent: 100,
+        stageMessage: `Đã tách xong 4 kênh trong ${elapsedSec}s.`,
+        executionBackend: res.execution_backend,
+      });
+      showSeparationSuccessToast(`Tách nhạc AI ONNX thành công (${elapsedSec}s)!`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('ONNX_PREREQ_MISSING:')) {
+        const cleanReason = msg.replace(/^.*ONNX_PREREQ_MISSING:\s*/, '');
         setSeparationStatus({
           isRunning: false,
           isSeparated: false,
           currentStage: 0,
           progressPercent: 0,
-          stageMessage: `Lỗi AI ONNX: ${msg}`,
+          stageMessage: 'Chưa thể chạy mô hình AI ONNX trên máy.',
+          onnxPrereqMissing: cleanReason,
         });
         return;
       }
+      setSeparationStatus({
+        isRunning: false,
+        isSeparated: false,
+        currentStage: 0,
+        progressPercent: 0,
+        stageMessage: `Lỗi AI ONNX: ${msg}`,
+      });
     }
-
-    await runSpectralSeparation();
   };
 
   const handleApplyPreset = (preset: SeparationPresetId) => {
@@ -1104,7 +1168,7 @@ export const App: React.FC = () => {
     );
 
     try {
-      if (isTauriDesktopRuntime() && spec.sizeMb > 200) {
+      if (isTauriDesktopRuntime()) {
         const rustSaved = await downloadModelViaRustBackend(modelId);
         if (rustSaved?.installed) {
           setModels((prev) =>
@@ -1125,6 +1189,7 @@ export const App: React.FC = () => {
           );
           return;
         }
+        throw new Error('Không thể hoàn tất tải model qua Rust backend.');
       }
 
       const saved = await downloadModelFromHuggingFace(
@@ -1365,6 +1430,7 @@ export const App: React.FC = () => {
         song={song}
         semitones={pitchSpeed.semitones}
         speed={pitchSpeed.speed}
+        isSeparated={separationStatus.isSeparated}
         onSelectAudioFile={handleSelectAudioFile}
         onRequestOpenTrack={isTauriDesktopRuntime() ? () => void handleDesktopOpenTrack() : undefined}
         onOpenYouTubeModal={() => setIsYouTubeModalOpen(true)}
@@ -1481,7 +1547,6 @@ export const App: React.FC = () => {
               separationStatus={separationStatus}
               onChangeQualityMode={setQualityMode}
               onRunSeparation={() => void handleRunSeparation()}
-              onRunSpectralFallback={() => void runSpectralSeparation()}
               onOpenModelManager={() => setIsModelModalOpen(true)}
               onApplyPreset={handleApplyPreset}
               onToggleMute={handleToggleMute}
@@ -1511,6 +1576,9 @@ export const App: React.FC = () => {
       <YouTubeImportModal
         isOpen={isYouTubeModalOpen}
         onClose={() => setIsYouTubeModalOpen(false)}
+        onImportYouTubeUrl={
+          isDesktopRuntime ? handleImportYouTubeTrack : undefined
+        }
       />
 
       <ModelManagerModal

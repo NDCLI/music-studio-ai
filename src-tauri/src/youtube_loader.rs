@@ -123,6 +123,127 @@ pub fn parse_youtube_single_video_url(raw_url: &str) -> Result<ParsedYouTubeTarg
     })
 }
 
+fn find_or_install_yt_dlp(models_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let exe_name = if cfg!(target_os = "windows") {
+        "yt-dlp.exe"
+    } else {
+        "yt-dlp"
+    };
+
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(dir) = cur.parent() {
+            let p = dir.join(exe_name);
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+    }
+
+    let in_models = models_dir.join(exe_name);
+    if in_models.is_file() {
+        return Ok(in_models);
+    }
+
+    if let Ok(output) = std::process::Command::new(exe_name).arg("--version").output() {
+        if output.status.success() {
+            return Ok(std::path::PathBuf::from(exe_name));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::io::{Read, Write};
+        let url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
+        let agent = ureq::Agent::new_with_defaults();
+        let mut resp = agent
+            .get(url)
+            .call()
+            .map_err(|e| format!("Không tải được yt-dlp.exe: {}", e))?;
+        let part = models_dir.join("yt-dlp.exe.part");
+        let mut file = std::fs::File::create(&part)
+            .map_err(|e| format!("Không tạo được file yt-dlp.exe: {}", e))?;
+        let mut reader = resp.body_mut().as_reader();
+        let mut buf = [0_u8; 64 * 1024];
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        }
+        file.flush().map_err(|e| e.to_string())?;
+        drop(file);
+        std::fs::rename(&part, &in_models).map_err(|e| e.to_string())?;
+        return Ok(in_models);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    Err("yt-dlp not found".to_string())
+}
+
+/// Downloads the best audio stream of a single YouTube video via `yt-dlp` into a local temp file.
+pub fn download_youtube_audio_file(
+    canonical_watch_url: &str,
+    video_id: &str,
+    models_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let yt_dlp = find_or_install_yt_dlp(models_dir)?;
+    let out_dir = std::env::temp_dir().join("music_studio_yt");
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("Không tạo được thư mục tạm YouTube: {}", e))?;
+
+    // Clean any stale file for this video_id before downloading
+    if let Ok(entries) = std::fs::read_dir(&out_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(video_id) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    let out_template = out_dir.join(format!("{}.%(ext)s", video_id));
+    let mut cmd = std::process::Command::new(&yt_dlp);
+    cmd.arg("--no-playlist")
+        .arg("-f")
+        .arg("bestaudio[ext=m4a]/bestaudio")
+        .arg("-o")
+        .arg(&out_template)
+        .arg(canonical_watch_url);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Lỗi khi chạy yt-dlp: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "yt-dlp tải thất bại: {}",
+            stderr.lines().last().unwrap_or("Unknown error")
+        ));
+    }
+
+    if let Ok(entries) = std::fs::read_dir(&out_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(video_id) && !name.ends_with(".part") {
+                    return Ok(p);
+                }
+            }
+        }
+    }
+
+    Err("Không tìm thấy file âm thanh sau khi tải từ YouTube.".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

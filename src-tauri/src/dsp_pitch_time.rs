@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio_io::StereoAudioBuffer;
 
-const VOCODER_FFT_SIZE: usize = 2048;
-const VOCODER_SYNTH_HOP: usize = 512; // 75% overlap
+const VOCODER_FFT_SIZE: usize = 4096;
+const VOCODER_SYNTH_HOP: usize = 512; // 87.5% overlap for low-phasiness pitch shifting
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PitchShiftEngine {
@@ -71,6 +71,12 @@ pub fn process_stereo_pitch_and_speed(
         return input.clone();
     }
 
+    if let Some(mut rb_out) = try_rubberband_r3_pitch_and_speed(input, config, speed_ratio) {
+        apply_soft_knee_limiter(&mut rb_out.left, 0.966);
+        apply_soft_knee_limiter(&mut rb_out.right, 0.966);
+        return rb_out;
+    }
+
     let mut left_out = process_channel_vocoder(
         &input.left,
         pitch_ratio,
@@ -93,6 +99,123 @@ pub fn process_stereo_pitch_and_speed(
     StereoAudioBuffer::new(input.sample_rate, left_out, right_out)
 }
 
+fn discover_rubberband_exe() -> Option<std::path::PathBuf> {
+    let names = if cfg!(target_os = "windows") {
+        ["rubberband-r3.exe", "rubberband.exe"]
+    } else {
+        ["rubberband-r3", "rubberband"]
+    };
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(dir) = exe_path.parent() {
+            for name in names {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    let models_dir = crate::model_manager::resolve_default_models_dir();
+    for name in names {
+        let candidate = models_dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    for name in names {
+        let candidate = std::path::PathBuf::from(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn try_rubberband_r3_pitch_and_speed(
+    input: &StereoAudioBuffer,
+    config: &PitchSpeedConfig,
+    speed_ratio: f32,
+) -> Option<StereoAudioBuffer> {
+    let rb_exe = discover_rubberband_exe()?;
+    if input.num_frames() == 0 {
+        return Some(input.clone());
+    }
+
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let temp_dir = std::env::temp_dir();
+    let in_wav = temp_dir.join(format!("msai_rb_in_{}_{}.wav", pid, seq));
+    let out_wav = temp_dir.join(format!("msai_rb_out_{}_{}.wav", pid, seq));
+
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: input.sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+
+    {
+        let mut writer = hound::WavWriter::create(&in_wav, spec).ok()?;
+        let frames = input.num_frames();
+        for i in 0..frames {
+            writer.write_sample(input.left[i]).ok()?;
+            writer.write_sample(input.right[i]).ok()?;
+        }
+        writer.finalize().ok()?;
+    }
+
+    let total_semitones = config.semitones + (config.cents / 100.0);
+    let mut cmd = std::process::Command::new(&rb_exe);
+    cmd.arg("-3")
+        .arg("-q")
+        .arg("--tempo")
+        .arg(format!("{:.6}", speed_ratio))
+        .arg("--pitch")
+        .arg(format!("{:.6}", total_semitones));
+    if config.preserve_formants {
+        cmd.arg("--formant");
+    }
+    cmd.arg(&in_wav).arg(&out_wav);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let status = cmd.status().ok();
+    let result = if matches!(status, Some(s) if s.success()) {
+        if let Ok(mut reader) = hound::WavReader::open(&out_wav) {
+            let mut left = Vec::new();
+            let mut right = Vec::new();
+            let mut samples = reader.samples::<f32>();
+            while let (Some(Ok(l)), Some(Ok(r))) = (samples.next(), samples.next()) {
+                left.push(l);
+                right.push(r);
+            }
+            if !left.is_empty() {
+                Some(StereoAudioBuffer::new(input.sample_rate, left, right))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let _ = std::fs::remove_file(&in_wav);
+    let _ = std::fs::remove_file(&out_wav);
+    result
+}
+
 /// Core Spectral Phase Vocoder with Formant Envelope Preservation and Transient Phase Reset.
 pub fn process_channel_vocoder(
     samples: &[f32],
@@ -105,9 +228,10 @@ pub fn process_channel_vocoder(
         return samples.to_vec();
     }
 
-    // Time-stretch factor combined with pitch-shift resampling compensation
-    let stretch_ratio = speed_ratio * pitch_ratio;
-    let analysis_hop = ((VOCODER_SYNTH_HOP as f32) * stretch_ratio).round().max(1.0) as usize;
+    // Resampling by pitch_ratio scales duration by 1 / pitch_ratio,
+    // so the vocoder must first scale duration by pitch_ratio / speed_ratio.
+    let time_stretch = pitch_ratio / speed_ratio;
+    let analysis_hop = ((VOCODER_SYNTH_HOP as f32) / time_stretch).round().max(1.0) as usize;
     let num_bins = VOCODER_FFT_SIZE / 2 + 1;
 
     let mut planner = RealFftPlanner::<f32>::new();
@@ -123,7 +247,7 @@ pub fn process_channel_vocoder(
     let mut prev_magnitudes = vec![0.0_f32; num_bins];
 
     let estimated_stretched_len =
-        ((samples.len() as f32) / stretch_ratio) as usize + VOCODER_FFT_SIZE * 2;
+        ((samples.len() as f32) * time_stretch) as usize + VOCODER_FFT_SIZE * 2;
     let mut stretched_buf = vec![0.0_f32; estimated_stretched_len];
     let mut window_norm = vec![0.0_f32; estimated_stretched_len];
 
@@ -164,24 +288,55 @@ pub fn process_channel_vocoder(
             Vec::new()
         };
 
-        for k in 0..num_bins {
-            let expected_phase_adv =
-                2.0 * PI * (k as f32) * (analysis_hop as f32) / (VOCODER_FFT_SIZE as f32);
-            let delta_phase = phases[k] - prev_analysis_phase[k] - expected_phase_adv;
-            prev_analysis_phase[k] = phases[k];
+        // Detect spectral peaks for Laroche-Dolson Identity Phase Locking
+        // (eliminates metallic/robotic phasiness by preserving harmonic phase coherence).
+        let mut peaks = Vec::new();
+        for k in 1..(num_bins - 1) {
+            if magnitudes[k] >= magnitudes[k - 1] && magnitudes[k] >= magnitudes[k + 1] {
+                peaks.push(k);
+            }
+        }
+        if peaks.is_empty() {
+            peaks.push(0);
+        }
 
-            // Wrap phase deviation to [-PI, PI]
-            let wrapped_dev = (delta_phase + PI).rem_euclid(2.0 * PI) - PI;
-            let true_freq_per_sample =
-                (expected_phase_adv + wrapped_dev) / (analysis_hop as f32);
+        let mut peak_idx = 0usize;
+        let mut locked_phase = vec![0.0_f32; num_bins];
 
-            if is_transient {
-                // Phase reset at percussive onset preserves crisp drum/guitar attack
+        if is_transient {
+            for k in 0..num_bins {
+                prev_analysis_phase[k] = phases[k];
                 sum_synthesis_phase[k] = phases[k];
-            } else {
-                sum_synthesis_phase[k] += true_freq_per_sample * (VOCODER_SYNTH_HOP as f32);
+                locked_phase[k] = phases[k];
+            }
+        } else {
+            for &p in &peaks {
+                let expected_phase_adv =
+                    2.0 * PI * (p as f32) * (analysis_hop as f32) / (VOCODER_FFT_SIZE as f32);
+                let delta_phase = phases[p] - prev_analysis_phase[p] - expected_phase_adv;
+                let wrapped_dev = (delta_phase + PI).rem_euclid(2.0 * PI) - PI;
+                let true_freq_per_sample =
+                    (expected_phase_adv + wrapped_dev) / (analysis_hop as f32);
+                sum_synthesis_phase[p] += true_freq_per_sample * (VOCODER_SYNTH_HOP as f32);
             }
 
+            for k in 0..num_bins {
+                prev_analysis_phase[k] = phases[k];
+                while peak_idx + 1 < peaks.len()
+                    && (peaks[peak_idx + 1] as isize - k as isize).abs()
+                        < (peaks[peak_idx] as isize - k as isize).abs()
+                {
+                    peak_idx += 1;
+                }
+                let p = peaks[peak_idx];
+                locked_phase[k] = sum_synthesis_phase[p] + (phases[k] - phases[p]);
+                if k != p {
+                    sum_synthesis_phase[k] = locked_phase[k];
+                }
+            }
+        }
+
+        for k in 0..num_bins {
             // Formant-Preserved Magnitude Compensation:
             // Keeps the original vocal tract envelope E[k] while pitch-shifting harmonics
             let mut out_mag = magnitudes[k];
@@ -194,7 +349,7 @@ pub fn process_channel_vocoder(
                 out_mag *= formant_gain;
             }
 
-            synth_spectrum[k] = Complex::from_polar(out_mag, sum_synthesis_phase[k]);
+            synth_spectrum[k] = Complex::from_polar(out_mag, locked_phase[k]);
         }
 
         // Enforce real-valued DC and Nyquist bins for inverse real FFT
@@ -248,25 +403,28 @@ fn compute_spectral_envelope(magnitudes: &[f32], half_window: usize) -> Vec<f32>
     env
 }
 
-/// Cubic/Linear fractional resampler used after time-stretching to achieve exact pitch ratio.
+/// 4-point Catmull-Rom cubic resampler used after time-stretching to achieve exact pitch ratio.
 fn resample_channel_linear(input: &[f32], pitch_ratio: f32) -> Vec<f32> {
     if input.is_empty() || pitch_ratio <= 0.0 {
         return Vec::new();
     }
     let out_len = ((input.len() as f32) / pitch_ratio).round() as usize;
     let mut output = Vec::with_capacity(out_len);
+    let last = input.len() - 1;
 
     for i in 0..out_len {
         let src_pos = (i as f32) * pitch_ratio;
-        let idx0 = src_pos.floor() as usize;
-        let frac = src_pos - (idx0 as f32);
-
-        if idx0 + 1 < input.len() {
-            let s = input[idx0] * (1.0 - frac) + input[idx0 + 1] * frac;
-            output.push(s);
-        } else if idx0 < input.len() {
-            output.push(input[idx0]);
-        }
+        let idx = (src_pos.floor() as usize).min(last);
+        let t = src_pos - (idx as f32);
+        let s0 = input[idx.saturating_sub(1)];
+        let s1 = input[idx];
+        let s2 = input[(idx + 1).min(last)];
+        let s3 = input[(idx + 2).min(last)];
+        let a0 = -0.5 * s0 + 1.5 * s1 - 1.5 * s2 + 0.5 * s3;
+        let a1 = s0 - 2.5 * s1 + 2.0 * s2 - 0.5 * s3;
+        let a2 = -0.5 * s0 + 0.5 * s2;
+        let a3 = s1;
+        output.push(((a0 * t + a1) * t + a2) * t + a3);
     }
 
     output
@@ -399,4 +557,31 @@ pub fn detect_bpm(buffer: &StereoAudioBuffer) -> f32 {
 
     let bpm = 60.0 * env_rate / (best_lag as f32);
     (bpm * 2.0).round() / 2.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pitch_shift_preserves_duration() {
+        let sr = 44_100;
+        let len = sr * 2;
+        let samples: Vec<f32> = (0..len)
+            .map(|i| (2.0 * PI * 440.0 * (i as f32) / (sr as f32)).sin() * 0.5)
+            .collect();
+        let input = StereoAudioBuffer::new(sr, samples.clone(), samples);
+        let cfg = PitchSpeedConfig {
+            semitones: -4.0,
+            speed_ratio: 1.0,
+            ..Default::default()
+        };
+        let out = process_stereo_pitch_and_speed(&input, &cfg);
+        let ratio = (out.num_frames() as f32) / (len as f32);
+        assert!(
+            (ratio - 1.0).abs() < 0.03,
+            "Pitch shift -4st at 1.0x speed should preserve duration, got ratio {}",
+            ratio
+        );
+    }
 }

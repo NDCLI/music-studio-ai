@@ -4,7 +4,7 @@
 //! 2. Memory-safe chunking (`dim_t` frames) with 50% Windowed Overlap-Add (prevents RAM overflow).
 //! 3. ONNX Runtime (`load-dynamic`) Session Management with DirectML GPU + CPU fallback.
 //! 4. 3-Stage Stem Separation Pipeline:
-//!    - Stage 1: Instrumental vs. All Vocals (`UVR-MDX-NET-Inst_HQ_4.onnx` / `Mel-Band-RoFormer`)
+//!    - Stage 1: Instrumental vs. All Vocals (`UVR-MDX-NET-Inst_HQ_1.onnx` / `Mel-Band-RoFormer`)
 //!    - Stage 2: Backing Vocal vs. Lead Vocal (`UVR_MDXNET_KARA_2.onnx` / `Mel-Band-RoFormer-Karaoke`)
 //!    - Stage 3: Dry Lead Vocal vs. Reverb Tail (`Reverb_HQ_By_FoxJoy.onnx`)
 
@@ -14,7 +14,6 @@ use std::path::Path;
 use ndarray::{Array4, ArrayViewD};
 use ort::environment::Environment;
 use ort::ep;
-use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::TensorRef;
 use realfft::RealFftPlanner;
@@ -45,6 +44,8 @@ pub struct StftModelConfig {
     pub dim_f: usize,
     pub dim_t: usize,
     pub compensate: f32,
+    #[serde(default)]
+    pub outputs_vocals: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,13 +60,14 @@ impl SeparationPipelineConfig {
     pub fn default_mdx_pipeline() -> Self {
         Self {
             stage1_inst_model: StftModelConfig {
-                model_filename: "UVR-MDX-NET-Inst_HQ_4.onnx".to_string(),
+                model_filename: "UVR-MDX-NET-Inst_HQ_1.onnx".to_string(),
                 sample_rate: STUDIO_SAMPLE_RATE,
-                n_fft: 5120,
+                n_fft: 6144,
                 hop_length: 1024,
-                dim_f: 2560,
+                dim_f: 3072,
                 dim_t: 256,
                 compensate: 1.019,
+                outputs_vocals: false,
             },
             stage2_karaoke_model: StftModelConfig {
                 model_filename: "UVR_MDXNET_KARA_2.onnx".to_string(),
@@ -75,6 +77,7 @@ impl SeparationPipelineConfig {
                 dim_f: 2048,
                 dim_t: 256,
                 compensate: 1.065,
+                outputs_vocals: false,
             },
             stage3_dereverb_model: StftModelConfig {
                 model_filename: "Reverb_HQ_By_FoxJoy.onnx".to_string(),
@@ -82,32 +85,35 @@ impl SeparationPipelineConfig {
                 n_fft: 7680,
                 hop_length: 1024,
                 dim_f: 3072,
-                dim_t: 256,
+                dim_t: 512,
                 compensate: 1.028,
+                outputs_vocals: false,
             },
         }
     }
 
-    /// Returns STFT parameters for high-precision RoFormer 3-stage pipeline.
+    /// Combo 2: UVR-MDX-NET-Inst_HQ_1 + Mel-Band RoFormer Karaoke + De-Reverb.
     pub fn pro_roformer_pipeline() -> Self {
         Self {
             stage1_inst_model: StftModelConfig {
-                model_filename: "mel-roformer.fp16.onnx".to_string(),
+                model_filename: "UVR-MDX-NET-Inst_HQ_1.onnx".to_string(),
                 sample_rate: STUDIO_SAMPLE_RATE,
-                n_fft: 4096,
+                n_fft: 6144,
                 hop_length: 1024,
-                dim_f: 2048,
-                dim_t: 352,
-                compensate: 1.0,
+                dim_f: 3072,
+                dim_t: 256,
+                compensate: 1.019,
+                outputs_vocals: false,
             },
             stage2_karaoke_model: StftModelConfig {
                 model_filename: "mel_band_roformer_karaoke_aufr33_viperx.onnx".to_string(),
                 sample_rate: STUDIO_SAMPLE_RATE,
-                n_fft: 4096,
-                hop_length: 1024,
-                dim_f: 2048,
-                dim_t: 352,
+                n_fft: 2048,
+                hop_length: 441,
+                dim_f: 1025,
+                dim_t: 400,
                 compensate: 1.0,
+                outputs_vocals: true,
             },
             stage3_dereverb_model: StftModelConfig {
                 model_filename: "Reverb_HQ_By_FoxJoy.onnx".to_string(),
@@ -115,8 +121,45 @@ impl SeparationPipelineConfig {
                 n_fft: 7680,
                 hop_length: 1024,
                 dim_f: 3072,
-                dim_t: 256,
+                dim_t: 512,
                 compensate: 1.028,
+                outputs_vocals: false,
+            },
+        }
+    }
+
+    /// Combo 1: HTDemucs + Mel-Band RoFormer Karaoke + De-Reverb (highest accuracy).
+    pub fn htdemucs_pipeline() -> Self {
+        Self {
+            stage1_inst_model: StftModelConfig {
+                model_filename: "htdemucs.onnx".to_string(),
+                sample_rate: STUDIO_SAMPLE_RATE,
+                n_fft: 4096,
+                hop_length: 1024,
+                dim_f: 2048,
+                dim_t: 256,
+                compensate: 1.0,
+                outputs_vocals: false,
+            },
+            stage2_karaoke_model: StftModelConfig {
+                model_filename: "mel_band_roformer_karaoke_aufr33_viperx.onnx".to_string(),
+                sample_rate: STUDIO_SAMPLE_RATE,
+                n_fft: 2048,
+                hop_length: 441,
+                dim_f: 1025,
+                dim_t: 400,
+                compensate: 1.0,
+                outputs_vocals: true,
+            },
+            stage3_dereverb_model: StftModelConfig {
+                model_filename: "Reverb_HQ_By_FoxJoy.onnx".to_string(),
+                sample_rate: STUDIO_SAMPLE_RATE,
+                n_fft: 7680,
+                hop_length: 1024,
+                dim_f: 3072,
+                dim_t: 512,
+                compensate: 1.028,
+                outputs_vocals: false,
             },
         }
     }
@@ -174,8 +217,6 @@ pub fn create_mdx_session<P: AsRef<Path>>(
         ExecutionDevice::DirectMl { device_id } => {
             let dml_attempt = Session::builder(env)
                 .map_err(|e| e.to_string())?
-                .with_optimization_level(GraphOptimizationLevel::Level3)
-                .map_err(|e| e.to_string())?
                 // DirectML recommends disabling parallel execution & memory pattern for graph stability
                 .with_parallel_execution(false)
                 .map_err(|e| e.to_string())?
@@ -195,8 +236,6 @@ pub fn create_mdx_session<P: AsRef<Path>>(
             // Fallback to pure CPU EP if DirectML could not bind on this host
             let cpu_session = Session::builder(env)
                 .map_err(|e| e.to_string())?
-                .with_optimization_level(GraphOptimizationLevel::Level3)
-                .map_err(|e| e.to_string())?
                 .with_execution_providers([ep::CPU::default().build()])
                 .map_err(|e| e.to_string())?
                 .commit_from_file(path_ref)
@@ -206,8 +245,6 @@ pub fn create_mdx_session<P: AsRef<Path>>(
         }
         ExecutionDevice::Cpu { intra_threads } => {
             let session = Session::builder(env)
-                .map_err(|e| e.to_string())?
-                .with_optimization_level(GraphOptimizationLevel::Level3)
                 .map_err(|e| e.to_string())?
                 .with_intra_threads(intra_threads.max(1))
                 .map_err(|e| e.to_string())?
@@ -478,6 +515,279 @@ pub fn subtract_stereo_buffers(
     StereoAudioBuffer::new(minuend.sample_rate, out_l, out_r)
 }
 
+/// Runs HTDemucs ONNX (`[1, 2, 343980]` -> `[1, 4, 2, 343980]`) with 50% Hann overlap-add.
+/// Sums Demucs stems 0..3 (`drums + bass + other`) as Instrumental and stem 3 as Vocals.
+pub fn run_htdemucs_onnx_model<F>(
+    session: &mut Session,
+    audio: &StereoAudioBuffer,
+    mut on_chunk_progress: F,
+) -> Result<(StereoAudioBuffer, StereoAudioBuffer), String>
+where
+    F: FnMut(usize, usize),
+{
+    const HTDEMUCS_CHUNK: usize = 343_980;
+    let total_frames = audio.num_frames();
+    if total_frames == 0 {
+        return Ok((audio.clone(), audio.clone()));
+    }
+
+    let step = HTDEMUCS_CHUNK / 2;
+    let margin_pad = HTDEMUCS_CHUNK / 2;
+    let padded_total = total_frames + 2 * margin_pad;
+
+    let mut src_l = vec![0.0_f32; padded_total];
+    let mut src_r = vec![0.0_f32; padded_total];
+    src_l[margin_pad..margin_pad + total_frames].copy_from_slice(&audio.left[..total_frames]);
+    src_r[margin_pad..margin_pad + total_frames].copy_from_slice(&audio.right[..total_frames]);
+
+    let mut inst_l = vec![0.0_f32; padded_total];
+    let mut inst_r = vec![0.0_f32; padded_total];
+    let mut voc_l = vec![0.0_f32; padded_total];
+    let mut voc_r = vec![0.0_f32; padded_total];
+    let mut weight_acc = vec![0.0_f32; padded_total];
+
+    let chunk_blend = hann_window(HTDEMUCS_CHUNK);
+
+    let mut starts = Vec::new();
+    let mut pos = 0usize;
+    while pos < total_frames + margin_pad {
+        starts.push(pos);
+        if pos + HTDEMUCS_CHUNK >= padded_total {
+            break;
+        }
+        pos += step;
+    }
+    let total_chunks = starts.len().max(1);
+
+    for (idx, &start) in starts.iter().enumerate() {
+        let end = (start + HTDEMUCS_CHUNK).min(padded_total);
+        let valid_len = end - start;
+
+        let mut input_tensor = ndarray::Array3::<f32>::zeros((1, 2, HTDEMUCS_CHUNK));
+        for i in 0..valid_len {
+            input_tensor[[0, 0, i]] = src_l[start + i];
+            input_tensor[[0, 1, i]] = src_r[start + i];
+        }
+
+        let tensor_ref = TensorRef::from_array_view(&input_tensor)
+            .map_err(|e| format!("Failed to wrap HTDemucs tensor: {}", e))?;
+        let outputs = session
+            .run(ort::inputs![tensor_ref])
+            .map_err(|e| format!("HTDemucs inference failed on chunk {}/{}: {}", idx + 1, total_chunks, e))?;
+
+        let out_view = outputs[0]
+            .try_extract_array::<f32>()
+            .map_err(|e| format!("Failed to extract HTDemucs output tensor: {}", e))?;
+
+        for i in 0..valid_len {
+            let w = chunk_blend[i];
+            let il = out_view[[0, 0, 0, i]] + out_view[[0, 1, 0, i]] + out_view[[0, 2, 0, i]];
+            let ir = out_view[[0, 0, 1, i]] + out_view[[0, 1, 1, i]] + out_view[[0, 2, 1, i]];
+            let vl = out_view[[0, 3, 0, i]];
+            let vr = out_view[[0, 3, 1, i]];
+            inst_l[start + i] += il * w;
+            inst_r[start + i] += ir * w;
+            voc_l[start + i] += vl * w;
+            voc_r[start + i] += vr * w;
+            weight_acc[start + i] += w;
+        }
+
+        on_chunk_progress(idx + 1, total_chunks);
+    }
+
+    let mut final_inst_l = Vec::with_capacity(total_frames);
+    let mut final_inst_r = Vec::with_capacity(total_frames);
+    let mut final_voc_l = Vec::with_capacity(total_frames);
+    let mut final_voc_r = Vec::with_capacity(total_frames);
+    for i in margin_pad..(margin_pad + total_frames) {
+        let w = weight_acc[i].max(1e-6);
+        final_inst_l.push(inst_l[i] / w);
+        final_inst_r.push(inst_r[i] / w);
+        final_voc_l.push(voc_l[i] / w);
+        final_voc_r.push(voc_r[i] / w);
+    }
+
+    Ok((
+        StereoAudioBuffer::new(audio.sample_rate, final_inst_l, final_inst_r),
+        StereoAudioBuffer::new(audio.sample_rate, final_voc_l, final_voc_r),
+    ))
+}
+
+/// Runs `mel_band_roformer_karaoke_aufr33_viperx.onnx` (`stft_features [1, T, 4100]` -> `mask [1, 1, 2050, T, 2]`)
+/// with `n_fft = 2048`, `hop_length = 441` and 50% Hann overlap-add.
+/// Returns the extracted Lead Vocal buffer.
+pub fn run_roformer_karaoke_onnx_model<F>(
+    session: &mut Session,
+    audio: &StereoAudioBuffer,
+    cfg: &StftModelConfig,
+    mut on_chunk_progress: F,
+) -> Result<StereoAudioBuffer, String>
+where
+    F: FnMut(usize, usize),
+{
+    let total_frames = audio.num_frames();
+    if total_frames == 0 {
+        return Ok(audio.clone());
+    }
+
+    let n_fft = cfg.n_fft;
+    let hop = cfg.hop_length;
+    let num_bins = n_fft / 2 + 1; // 1025
+    let dim_t = cfg.dim_t;
+    let chunk_len = chunk_sample_length(cfg);
+    let step = (chunk_len / 2).max(1);
+    let margin_pad = chunk_len / 2;
+    let padded_total = total_frames + 2 * margin_pad;
+
+    let mut src_l = vec![0.0_f32; padded_total];
+    let mut src_r = vec![0.0_f32; padded_total];
+    src_l[margin_pad..margin_pad + total_frames].copy_from_slice(&audio.left[..total_frames]);
+    src_r[margin_pad..margin_pad + total_frames].copy_from_slice(&audio.right[..total_frames]);
+
+    let mut out_l = vec![0.0_f32; padded_total];
+    let mut out_r = vec![0.0_f32; padded_total];
+    let mut weight_acc = vec![0.0_f32; padded_total];
+    let chunk_blend = hann_window(chunk_len);
+
+    let window = hann_window(n_fft);
+    let mut planner = RealFftPlanner::<f32>::new();
+    let r2c = planner.plan_fft_forward(n_fft);
+    let c2r = planner.plan_fft_inverse(n_fft);
+    let fft_scale = 1.0 / (n_fft as f32);
+
+    let mut starts = Vec::new();
+    let mut pos = 0usize;
+    while pos < total_frames + margin_pad {
+        starts.push(pos);
+        if pos + chunk_len >= padded_total {
+            break;
+        }
+        pos += step;
+    }
+    let total_chunks = starts.len().max(1);
+
+    let pad = n_fft / 2;
+    let padded_chunk = chunk_len + 2 * pad;
+
+    for (idx, &start) in starts.iter().enumerate() {
+        let end = (start + chunk_len).min(padded_total);
+        let valid_len = end - start;
+
+        let mut pad_l = vec![0.0_f32; padded_chunk];
+        let mut pad_r = vec![0.0_f32; padded_chunk];
+        pad_l[pad..pad + valid_len].copy_from_slice(&src_l[start..end]);
+        pad_r[pad..pad + valid_len].copy_from_slice(&src_r[start..end]);
+
+        let mut stft_features = ndarray::Array3::<f32>::zeros((1, dim_t, 4100));
+        let mut spec_l = vec![vec![Complex::new(0.0_f32, 0.0_f32); num_bins]; dim_t];
+        let mut spec_r = vec![vec![Complex::new(0.0_f32, 0.0_f32); num_bins]; dim_t];
+
+        let mut frame_buf = vec![0.0_f32; n_fft];
+        let mut spectrum = r2c.make_output_vec();
+
+        for t in 0..dim_t {
+            let s = t * hop;
+            if s + n_fft > padded_chunk {
+                break;
+            }
+            for i in 0..n_fft {
+                frame_buf[i] = pad_l[s + i] * window[i];
+            }
+            let _ = r2c.process(&mut frame_buf, &mut spectrum);
+            for f in 0..num_bins.min(1025) {
+                spec_l[t][f] = spectrum[f];
+                stft_features[[0, t, 2 * f]] = spectrum[f].re;
+                stft_features[[0, t, 2 * f + 1]] = spectrum[f].im;
+            }
+
+            for i in 0..n_fft {
+                frame_buf[i] = pad_r[s + i] * window[i];
+            }
+            let _ = r2c.process(&mut frame_buf, &mut spectrum);
+            for f in 0..num_bins.min(1025) {
+                spec_r[t][f] = spectrum[f];
+                stft_features[[0, t, 2050 + 2 * f]] = spectrum[f].re;
+                stft_features[[0, t, 2050 + 2 * f + 1]] = spectrum[f].im;
+            }
+        }
+
+        let tensor_ref = TensorRef::from_array_view(&stft_features)
+            .map_err(|e| format!("Failed to wrap RoFormer Karaoke tensor: {}", e))?;
+        let outputs = session
+            .run(ort::inputs![tensor_ref])
+            .map_err(|e| format!("RoFormer Karaoke inference failed on chunk {}/{}: {}", idx + 1, total_chunks, e))?;
+
+        let mask_view = outputs[0]
+            .try_extract_array::<f32>()
+            .map_err(|e| format!("Failed to extract RoFormer Karaoke mask: {}", e))?;
+
+        let mut acc_l = vec![0.0_f32; padded_chunk];
+        let mut acc_r = vec![0.0_f32; padded_chunk];
+        let mut win_norm = vec![0.0_f32; padded_chunk];
+        let mut out_spec = vec![Complex::new(0.0_f32, 0.0_f32); num_bins];
+        let mut time_frame = c2r.make_output_vec();
+
+        for t in 0..dim_t {
+            let s = t * hop;
+            if s + n_fft > padded_chunk {
+                break;
+            }
+
+            // Left channel masked iFFT
+            for f in 0..num_bins.min(1025) {
+                let mr = mask_view[[0, 0, f, t, 0]];
+                let mi = mask_view[[0, 0, f, t, 1]];
+                let c = spec_l[t][f];
+                out_spec[f] = Complex::new(c.re * mr - c.im * mi, c.re * mi + c.im * mr);
+            }
+            out_spec[0].im = 0.0;
+            out_spec[num_bins - 1].im = 0.0;
+            let _ = c2r.process(&mut out_spec, &mut time_frame);
+            for i in 0..n_fft {
+                let w = window[i];
+                acc_l[s + i] += time_frame[i] * fft_scale * w;
+                win_norm[s + i] += w * w;
+            }
+
+            // Right channel masked iFFT
+            for f in 0..num_bins.min(1025) {
+                let mr = mask_view[[0, 0, 1025 + f, t, 0]];
+                let mi = mask_view[[0, 0, 1025 + f, t, 1]];
+                let c = spec_r[t][f];
+                out_spec[f] = Complex::new(c.re * mr - c.im * mi, c.re * mi + c.im * mr);
+            }
+            out_spec[0].im = 0.0;
+            out_spec[num_bins - 1].im = 0.0;
+            let _ = c2r.process(&mut out_spec, &mut time_frame);
+            for i in 0..n_fft {
+                acc_r[s + i] += time_frame[i] * fft_scale * window[i];
+            }
+        }
+
+        for i in 0..valid_len {
+            let denom = win_norm[pad + i].max(1e-6);
+            let pl = acc_l[pad + i] / denom;
+            let pr = acc_r[pad + i] / denom;
+            let w = chunk_blend[i];
+            out_l[start + i] += pl * w;
+            out_r[start + i] += pr * w;
+            weight_acc[start + i] += w;
+        }
+
+        on_chunk_progress(idx + 1, total_chunks);
+    }
+
+    let mut final_l = Vec::with_capacity(total_frames);
+    let mut final_r = Vec::with_capacity(total_frames);
+    for i in margin_pad..(margin_pad + total_frames) {
+        let w = weight_acc[i].max(1e-6);
+        final_l.push(out_l[i] / w);
+        final_r.push(out_r[i] / w);
+    }
+
+    Ok(StereoAudioBuffer::new(audio.sample_rate, final_l, final_r))
+}
+
 /// Runs the complete 3-Stage Local AI Separation Pipeline:
 /// 1. Instrumental vs. All Vocals
 /// 2. Backing Vocal vs. Lead Vocal
@@ -496,37 +806,121 @@ where
     // Stage 1: Instrumental & All Vocals
     let stage1_path = models_dir.join(&pipeline.stage1_inst_model.model_filename);
     let (mut sess1, _) = create_mdx_session(env, &stage1_path, device)?;
-    let instrumental = run_mdx_onnx_model(&mut sess1, audio, &pipeline.stage1_inst_model, |c, total| {
-        let pct = (c as f32 / total as f32) * 40.0;
-        on_progress(SeparationProgress {
-            stage_index: 1,
-            stage_name: format!("Stage 1/3: {}", pipeline.stage1_inst_model.model_filename),
-            chunk_index: c,
-            total_chunks: total,
-            overall_percent: pct,
-        });
-    })?;
-    let all_vocals = subtract_stereo_buffers(audio, &instrumental);
-
-    // Stage 2: Backing Vocal & Lead Vocal
-    let stage2_path = models_dir.join(&pipeline.stage2_karaoke_model.model_filename);
-    let (mut sess2, _) = create_mdx_session(env, &stage2_path, device)?;
-    let backing_vocal = run_mdx_onnx_model(
-        &mut sess2,
-        &all_vocals,
-        &pipeline.stage2_karaoke_model,
-        |c, total| {
-            let pct = 40.0 + (c as f32 / total as f32) * 35.0;
+    let (instrumental, all_vocals) = if pipeline.stage1_inst_model.model_filename == "htdemucs.onnx" {
+        let dml_res = run_htdemucs_onnx_model(&mut sess1, audio, |c, total| {
+            let pct = (c as f32 / total as f32) * 40.0;
             on_progress(SeparationProgress {
-                stage_index: 2,
-                stage_name: format!("Stage 2/3: {}", pipeline.stage2_karaoke_model.model_filename),
+                stage_index: 1,
+                stage_name: format!("Stage 1/3: {}", pipeline.stage1_inst_model.model_filename),
                 chunk_index: c,
                 total_chunks: total,
                 overall_percent: pct,
             });
-        },
-    )?;
-    let lead_with_reverb = subtract_stereo_buffers(&all_vocals, &backing_vocal);
+        });
+        match dml_res {
+            Ok(pair) => pair,
+            Err(_) if !matches!(device, ExecutionDevice::Cpu { .. }) => {
+                drop(sess1);
+                let (mut cpu_sess, _) =
+                    create_mdx_session(env, &stage1_path, ExecutionDevice::Cpu { intra_threads: 4 })?;
+                run_htdemucs_onnx_model(&mut cpu_sess, audio, |c, total| {
+                    let pct = (c as f32 / total as f32) * 40.0;
+                    on_progress(SeparationProgress {
+                        stage_index: 1,
+                        stage_name: format!("Stage 1/3 (CPU): {}", pipeline.stage1_inst_model.model_filename),
+                        chunk_index: c,
+                        total_chunks: total,
+                        overall_percent: pct,
+                    });
+                })?
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        let stage1_out = run_mdx_onnx_model(&mut sess1, audio, &pipeline.stage1_inst_model, |c, total| {
+            let pct = (c as f32 / total as f32) * 40.0;
+            on_progress(SeparationProgress {
+                stage_index: 1,
+                stage_name: format!("Stage 1/3: {}", pipeline.stage1_inst_model.model_filename),
+                chunk_index: c,
+                total_chunks: total,
+                overall_percent: pct,
+            });
+        })?;
+        if pipeline.stage1_inst_model.outputs_vocals {
+            let inst = subtract_stereo_buffers(audio, &stage1_out);
+            (inst, stage1_out)
+        } else {
+            let voc = subtract_stereo_buffers(audio, &stage1_out);
+            (stage1_out, voc)
+        }
+    };
+
+    // Stage 2: Backing Vocal & Lead Vocal
+    let stage2_path = models_dir.join(&pipeline.stage2_karaoke_model.model_filename);
+    let (mut sess2, _) = create_mdx_session(env, &stage2_path, device)?;
+    let (backing_vocal, lead_with_reverb) =
+        if pipeline.stage2_karaoke_model.model_filename == "mel_band_roformer_karaoke_aufr33_viperx.onnx" {
+            let dml_res = run_roformer_karaoke_onnx_model(
+                &mut sess2,
+                &all_vocals,
+                &pipeline.stage2_karaoke_model,
+                |c, total| {
+                    let pct = 40.0 + (c as f32 / total as f32) * 35.0;
+                    on_progress(SeparationProgress {
+                        stage_index: 2,
+                        stage_name: format!("Stage 2/3: {}", pipeline.stage2_karaoke_model.model_filename),
+                        chunk_index: c,
+                        total_chunks: total,
+                        overall_percent: pct,
+                    });
+                },
+            );
+            let lead = match dml_res {
+                Ok(l) => l,
+                Err(_) if !matches!(device, ExecutionDevice::Cpu { .. }) => {
+                    drop(sess2);
+                    let (mut cpu_sess, _) =
+                        create_mdx_session(env, &stage2_path, ExecutionDevice::Cpu { intra_threads: 4 })?;
+                    run_roformer_karaoke_onnx_model(
+                        &mut cpu_sess,
+                        &all_vocals,
+                        &pipeline.stage2_karaoke_model,
+                        |c, total| {
+                            let pct = 40.0 + (c as f32 / total as f32) * 35.0;
+                            on_progress(SeparationProgress {
+                                stage_index: 2,
+                                stage_name: format!("Stage 2/3 (CPU): {}", pipeline.stage2_karaoke_model.model_filename),
+                                chunk_index: c,
+                                total_chunks: total,
+                                overall_percent: pct,
+                            });
+                        },
+                    )?
+                }
+                Err(e) => return Err(e),
+            };
+            let backing = subtract_stereo_buffers(&all_vocals, &lead);
+            (backing, lead)
+        } else {
+            let backing = run_mdx_onnx_model(
+                &mut sess2,
+                &all_vocals,
+                &pipeline.stage2_karaoke_model,
+                |c, total| {
+                    let pct = 40.0 + (c as f32 / total as f32) * 35.0;
+                    on_progress(SeparationProgress {
+                        stage_index: 2,
+                        stage_name: format!("Stage 2/3: {}", pipeline.stage2_karaoke_model.model_filename),
+                        chunk_index: c,
+                        total_chunks: total,
+                        overall_percent: pct,
+                    });
+                },
+            )?;
+            let lead = subtract_stereo_buffers(&all_vocals, &backing);
+            (backing, lead)
+        };
 
     // Stage 3: De-Reverb (Dry Lead Vocal vs. Reverb Tail)
     let stage3_path = models_dir.join(&pipeline.stage3_dereverb_model.model_filename);
@@ -585,6 +979,7 @@ mod tests {
             dim_f: 513, // n_fft / 2 + 1 so no high frequencies are cropped
             dim_t: 32,
             compensate: 1.0,
+            outputs_vocals: false,
         };
 
         let chunk_len = chunk_sample_length(&cfg);
@@ -621,5 +1016,81 @@ mod tests {
         assert!((diff.left[0] - 0.5).abs() < 1e-6);
         assert!((diff.left[1] - (-0.3)).abs() < 1e-6);
         assert!((diff.right[2] - (-0.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_real_onnx_models_smoke() {
+        let models_dir = crate::model_manager::resolve_default_models_dir();
+        let env = init_ort_environment(None).expect("init ort env");
+
+        for name in [
+            "htdemucs.onnx",
+            "UVR-MDX-NET-Inst_HQ_1.onnx",
+            "UVR_MDXNET_KARA_2.onnx",
+            "Reverb_HQ_By_FoxJoy.onnx",
+            "mel-roformer.fp16.onnx",
+            "mel_band_roformer_karaoke_aufr33_viperx.onnx",
+        ] {
+            let p = models_dir.join(name);
+            if let Ok((sess, ep_name)) = create_mdx_session(&env, &p, ExecutionDevice::DirectMl { device_id: 0 }) {
+                println!("MODEL {} ({}):", name, ep_name);
+                for inp in sess.inputs() {
+                    println!("  IN  {:?}", inp);
+                }
+                for out in sess.outputs() {
+                    println!("  OUT {:?}", out);
+                }
+            } else {
+                println!("MODEL {} FAILED TO LOAD", name);
+            }
+        }
+
+        let dummy = StereoAudioBuffer::new(44_100, vec![0.01; 44_100 * 2], vec![0.01; 44_100 * 2]);
+        let fast_cfg = SeparationPipelineConfig::default_mdx_pipeline();
+        let fast_res = separate_3_stage_stems(
+            &env,
+            &models_dir,
+            &dummy,
+            &fast_cfg,
+            ExecutionDevice::DirectMl { device_id: 0 },
+            |_| {},
+        );
+        println!("FAST_MDX_DML => {:?}", fast_res.as_ref().map(|_| "OK"));
+
+        let pro_cfg = SeparationPipelineConfig::pro_roformer_pipeline();
+        let pro_res = separate_3_stage_stems(
+            &env,
+            &models_dir,
+            &dummy,
+            &pro_cfg,
+            ExecutionDevice::DirectMl { device_id: 0 },
+            |_| {},
+        );
+        println!("PRO_ROFORMER_DML => {:?}", pro_res.as_ref().map(|_| "OK"));
+
+        let htd_cfg = SeparationPipelineConfig::htdemucs_pipeline();
+        let htd_res = separate_3_stage_stems(
+            &env,
+            &models_dir,
+            &dummy,
+            &htd_cfg,
+            ExecutionDevice::DirectMl { device_id: 0 },
+            |_| {},
+        );
+        println!("HTDEMUCS_DML => {:?}", htd_res.as_ref().map(|_| "OK"));
+
+        let rof_kara_path = models_dir.join("mel_band_roformer_karaoke_aufr33_viperx.onnx");
+        if let Ok((mut sess_rk, _)) = create_mdx_session(&env, &rof_kara_path, ExecutionDevice::DirectMl { device_id: 0 }) {
+            let dummy_feat = ndarray::Array3::<f32>::zeros((1, 100, 4100));
+            let tref = TensorRef::from_array_view(&dummy_feat).unwrap();
+            match sess_rk.run(ort::inputs![tref]) {
+                Ok(outs) => {
+                    let v = outs[0].try_extract_array::<f32>().unwrap();
+                    println!("ROFORMER_KARA_OUT_SHAPE => {:?}", v.shape());
+                }
+                Err(e) => println!("ROFORMER_KARA_ERR => {}", e),
+            }
+        }
     }
 }

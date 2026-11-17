@@ -68,8 +68,10 @@ export const StudioToolbar: React.FC<StudioToolbarProps> = ({
 }) => {
   const requiredIds =
     qualityMode === 'fast_mdx'
-      ? ['uvr_mdx_inst_hq4', 'uvr_mdx_kara_2']
-      : ['mel_band_roformer_vocals', 'mel_band_roformer_karaoke'];
+      ? ['uvr_mdx_inst_hq1', 'uvr_mdx_kara_2']
+      : qualityMode === 'htdemucs'
+        ? ['htdemucs_4stems', 'mel_band_roformer_karaoke']
+        : ['uvr_mdx_inst_hq1', 'mel_band_roformer_karaoke'];
 
   const installedRequiredCount = requiredIds.filter(
     (id) => models.find((m) => m.id === id)?.installed
@@ -123,51 +125,7 @@ export const StudioToolbar: React.FC<StudioToolbarProps> = ({
           </div>
         </div>
 
-        {/* Part 2: Processing Model Selector */}
-        <div className="flex flex-wrap items-center gap-2 min-w-0">
-          <label
-            htmlFor="toolbar-model-select"
-            className="inline-flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400"
-          >
-            <Layers className="h-3.5 w-3.5 text-pink-400" />
-            <span>Model xử lý:</span>
-          </label>
-          <select
-            id="toolbar-model-select"
-            value={qualityMode}
-            onChange={(e) =>
-              onChangeQualityMode(e.target.value as SeparationQualityMode)
-            }
-            className="cursor-pointer rounded-xl border border-white/15 bg-[#080B14] px-3 py-1.5 text-xs font-semibold text-slate-100 focus:border-indigo-500 focus:outline-none"
-          >
-            <option value="fast_mdx">
-              UVR-MDX-NET HQ4 + KARA2 (Tách nhanh)
-            </option>
-            <option value="pro_roformer">
-              Mel-Band RoFormer + ViperX (Siêu nét)
-            </option>
-          </select>
-
-          <button
-            type="button"
-            onClick={onOpenModelManager}
-            title="Xem chi tiết hoặc tải/nhập file .ONNX cho model đang chọn"
-            className={`cursor-pointer inline-flex items-center gap-1 rounded-lg px-2 py-1 font-mono text-[10px] font-semibold transition-colors ${
-              isSelectedProfileReady
-                ? 'border border-emerald-500/35 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
-                : 'border border-amber-500/35 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25'
-            }`}
-          >
-            {isSelectedProfileReady && <CheckCircle2 className="h-3 w-3" />}
-            <span>
-              {isSelectedProfileReady
-                ? 'Đủ file .ONNX'
-                : `${installedRequiredCount}/${requiredIds.length} .ONNX`}
-            </span>
-          </button>
-        </div>
-
-        {/* Part 3: Settings (Manage Models) & Check for Updates */}
+        {/* Part 2: Settings (Manage Models) & Check for Updates */}
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"

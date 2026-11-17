@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
@@ -70,6 +70,53 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   const [isPickingFolder, setIsPickingFolder] = useState(false);
   const [folderWarning, setFolderWarning] = useState<string | null>(null);
   const [exportOutcome, setExportOutcome] = useState<ExportOutcome | null>(null);
+  const [renderPercent, setRenderPercent] = useState(0);
+  const [renderMessage, setRenderMessage] = useState('Đang chuẩn bị render...');
+
+  useEffect(() => {
+    if (!isExporting) return;
+
+    setRenderPercent(5);
+    setRenderMessage('Đang chuẩn bị dữ liệu âm thanh...');
+
+    let unlisten: (() => void) | undefined;
+    const tauriEvent = (
+      window as unknown as {
+        __TAURI__?: {
+          event?: {
+            listen: (
+              event: string,
+              handler: (ev: { payload: { percent: number; message: string } }) => void
+            ) => Promise<() => void>;
+          };
+        };
+      }
+    ).__TAURI__?.event;
+
+    if (tauriEvent?.listen) {
+      void tauriEvent
+        .listen('export-progress', (ev) => {
+          if (typeof ev.payload?.percent === 'number') {
+            setRenderPercent((prev) => Math.max(prev, ev.payload.percent));
+          }
+          if (ev.payload?.message) {
+            setRenderMessage(ev.payload.message);
+          }
+        })
+        .then((fn) => {
+          unlisten = fn;
+        });
+    }
+
+    const timer = window.setInterval(() => {
+      setRenderPercent((prev) => (prev < 92 ? Math.min(92, prev + 2) : prev));
+    }, 350);
+
+    return () => {
+      window.clearInterval(timer);
+      if (unlisten) unlisten();
+    };
+  }, [isExporting]);
 
   if (!isOpen) return null;
 
@@ -355,6 +402,21 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             </div>
           </button>
 
+          {isExporting && (
+            <div className="rounded-xl border border-indigo-500/35 bg-indigo-950/35 p-3.5">
+              <div className="mb-2 flex items-center justify-between text-xs">
+                <span className="font-semibold text-indigo-200">{renderMessage}</span>
+                <span className="font-mono font-bold text-emerald-300">{renderPercent}%</span>
+              </div>
+              <div className="h-2 w-full overflow-hidden rounded-full bg-slate-800">
+                <div
+                  className="h-full bg-gradient-to-r from-indigo-500 via-emerald-400 to-teal-300 transition-all duration-300"
+                  style={{ width: `${renderPercent}%` }}
+                />
+              </div>
+            </div>
+          )}
+
           {exportOutcome && exportOutcome.errorMessage && (
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-rose-500/35 bg-rose-500/15 px-4 py-2.5 text-xs text-rose-200">
               <div className="flex items-start gap-2 flex-1">
@@ -418,7 +480,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             className="cursor-pointer inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-5 py-2 text-xs font-bold text-slate-950 transition-colors hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Download className="h-4 w-4" />
-            {isExporting ? 'Đang Render...' : 'Bắt Đầu Xuất File'}
+            {isExporting ? `Đang Render (${renderPercent}%)...` : 'Bắt Đầu Xuất File'}
           </button>
         </div>
       </div>

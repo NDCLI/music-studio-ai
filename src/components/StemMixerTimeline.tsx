@@ -232,17 +232,17 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
 
         {/* AI Quality Selector & Trigger Button */}
         <div className="flex flex-wrap items-center gap-2.5">
-          <div className="inline-flex rounded-xl border border-white/10 bg-[#080B14] p-1">
+          <div className="inline-flex flex-wrap rounded-xl border border-white/10 bg-[#080B14] p-1 gap-1">
             <button
               type="button"
-              onClick={() => onChangeQualityMode('fast_mdx')}
+              onClick={() => onChangeQualityMode('htdemucs')}
               className={`cursor-pointer rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors duration-150 ${
-                qualityMode === 'fast_mdx'
+                qualityMode === 'htdemucs'
                   ? 'bg-indigo-600 text-white'
                   : 'text-slate-400 hover:text-white'
               }`}
             >
-              Chế Độ Nhanh
+              Combo 1: HTDemucs + RoFormer (Chuẩn Nhất)
             </button>
             <button
               type="button"
@@ -253,7 +253,18 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
                   : 'text-slate-400 hover:text-white'
               }`}
             >
-              Chất Lượng Cao (Siêu Nét)
+              Combo 2: Inst_HQ + RoFormer
+            </button>
+            <button
+              type="button"
+              onClick={() => onChangeQualityMode('fast_mdx')}
+              className={`cursor-pointer rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors duration-150 ${
+                qualityMode === 'fast_mdx'
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              Combo 3: Inst_HQ + MDX Karaoke 2 (Máy Yếu)
             </button>
           </div>
 
@@ -300,18 +311,28 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
                 Mở Quản Lý Model AI
               </button>
             )}
-            {onRunSpectralFallback && (
-              <button
-                type="button"
-                onClick={onRunSpectralFallback}
-                className="cursor-pointer rounded-lg border border-amber-400/50 bg-amber-500/20 px-3 py-1.5 text-xs font-semibold text-amber-100 hover:bg-amber-500/30"
-              >
-                Tách Tạm Bằng Lọc Phổ (Không cần .ONNX)
-              </button>
-            )}
           </div>
         </div>
       )}
+
+      {/* Prominent Error Banner when separation fails */}
+      {!separationStatus.isRunning &&
+        !separationStatus.isSeparated &&
+        !separationStatus.onnxPrereqMissing &&
+        separationStatus.stageMessage.startsWith('Lỗi') && (
+          <div
+            role="alert"
+            className="mt-4 flex items-start gap-2.5 rounded-xl border border-rose-500/45 bg-rose-500/15 p-3.5 text-xs text-rose-100"
+          >
+            <AlertCircle className="h-4 w-4 text-rose-400 shrink-0 mt-0.5" />
+            <div>
+              <div className="font-bold text-rose-300">Tách nhạc thất bại</div>
+              <p className="mt-0.5 text-[11px] text-rose-200/90 break-words">
+                {separationStatus.stageMessage}
+              </p>
+            </div>
+          </div>
+        )}
 
       {/* Live 3-Stage AI Separation Progress Bar (when running) */}
       {separationStatus.isRunning && (

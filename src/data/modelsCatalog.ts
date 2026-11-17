@@ -65,16 +65,16 @@ export const PITCH_ENGINES: PitchEngineInfo[] = [
 
 export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
   {
-    id: 'uvr_mdx_inst_hq4',
-    fileName: 'UVR-MDX-NET-Inst_HQ_4.onnx',
+    id: 'uvr_mdx_inst_hq1',
+    fileName: 'UVR-MDX-NET-Inst_HQ_1.onnx',
     taskTitle: 'Tầng 1: Tách Nhạc Nền & Tổng Vocal (Chế độ Nhanh)',
     architecture: 'MDX-Net (Hybrid Time-Frequency U-Net)',
-    sdrDb: '11.8 dB',
-    sizeMb: 56,
+    sdrDb: '12.0 dB',
+    sizeMb: 64,
     downloadUrl:
-      'https://huggingface.co/Politrees/UVR_resources/resolve/main/models/MDXNet/UVR-MDX-NET-Inst_HQ_4.onnx',
+      'https://huggingface.co/Politrees/UVR_resources/resolve/main/models/MDXNet/UVR-MDX-NET-Inst_HQ_1.onnx',
     fallbackUrls: [
-      'https://huggingface.co/aaatmy/uvr-mdx-net-onnx/resolve/main/UVR-MDX-NET-Inst_HQ_4.onnx',
+      'https://huggingface.co/seanghay/uvr_models/resolve/main/UVR-MDX-NET-Inst_HQ_1.onnx',
     ],
     sourceRepo: 'Politrees/UVR_resources',
     stftSpec: {
@@ -105,6 +105,26 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
       compensate: 1.0,
     },
     recommendedDevice: 'DirectML / CUDA GPU (VRAM ≥ 4GB)',
+    installed: false,
+  },
+  {
+    id: 'htdemucs_4stems',
+    fileName: 'htdemucs.onnx',
+    taskTitle: 'Tầng 1: Tách Beat 4-Stem Hybrid (HTDemucs)',
+    architecture: 'HTDemucs (Hybrid Time-Frequency Transformer)',
+    sdrDb: '11.6 dB',
+    sizeMb: 302,
+    downloadUrl:
+      'https://huggingface.co/StemSplitio/htdemucs-onnx/resolve/main/htdemucs.onnx',
+    sourceRepo: 'StemSplitio/htdemucs-onnx',
+    stftSpec: {
+      nFft: 4096,
+      hopLength: 1024,
+      dimF: 2048,
+      dimT: 256,
+      compensate: 1.0,
+    },
+    recommendedDevice: 'DirectML GPU / CPU Đa Luồng',
     installed: false,
   },
   {

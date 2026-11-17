@@ -27,12 +27,15 @@ use crate::dsp_pitch_time::{
 use crate::model_manager::{
     discover_onnxruntime_library, CachedModelStatus, ModelCatalogEntry, ModelManager,
 };
-use crate::youtube_loader::{parse_youtube_single_video_url, ParsedYouTubeTarget};
+use crate::youtube_loader::{
+    download_youtube_audio_file, parse_youtube_single_video_url, ParsedYouTubeTarget,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SeparationMode {
     FastMdx,
     ProRoformer,
+    HtDemucs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,13 +314,8 @@ pub fn handle_pick_onnx_file() -> Result<Option<String>, String> {
     }
 }
 
-/// Reads a local audio/video file up to 120 MB as Base64 for WebAudio preview decoding.
+/// Reads a local audio/video file as Base64 for WebAudio preview/fallback decoding without size limit.
 pub fn handle_read_file_base64(file_path: &str) -> Result<String, String> {
-    let meta = std::fs::metadata(file_path)
-        .map_err(|e| format!("Failed to read file metadata '{}': {}", file_path, e))?;
-    if meta.len() > 120 * 1024 * 1024 {
-        return Err("File vuot qua gioi han 120 MB cho phat preview truc tiep".to_string());
-    }
     let bytes = std::fs::read(file_path)
         .map_err(|e| format!("Failed to read file '{}': {}", file_path, e))?;
     Ok(encode_base64(&bytes))
@@ -689,6 +687,7 @@ pub fn handle_run_separation(
     let pipeline = match mode {
         SeparationMode::FastMdx => SeparationPipelineConfig::default_mdx_pipeline(),
         SeparationMode::ProRoformer => SeparationPipelineConfig::pro_roformer_pipeline(),
+        SeparationMode::HtDemucs => SeparationPipelineConfig::htdemucs_pipeline(),
     };
 
     let (track, models_dir, env) = {
@@ -752,9 +751,9 @@ pub fn handle_run_separation(
         instrumental: separated.instrumental.compute_waveform_peaks(140),
         reverb_tail: separated.reverb_tail.compute_waveform_peaks(140),
         execution_backend: if use_directml {
-            "AI ONNX (GPU / DirectML)".to_string()
+            "GPU".to_string()
         } else {
-            "AI ONNX (CPU đa luồng)".to_string()
+            "CPU".to_string()
         },
     };
 
@@ -775,6 +774,32 @@ pub fn handle_export_audio(
     stem_params: Vec<StemChannelParams>,
     limiter_enabled: bool,
 ) -> Result<ExportAudioResponse, String> {
+    handle_export_audio_with_progress(
+        state,
+        output_dir,
+        base_name,
+        target,
+        format,
+        stem_params,
+        limiter_enabled,
+        |_, _| {},
+    )
+}
+
+pub fn handle_export_audio_with_progress<F>(
+    state: &Arc<Mutex<StudioAppState>>,
+    output_dir: &str,
+    base_name: &str,
+    target: ExportTargetMode,
+    format: AudioExportFormat,
+    stem_params: Vec<StemChannelParams>,
+    limiter_enabled: bool,
+    mut on_progress: F,
+) -> Result<ExportAudioResponse, String>
+where
+    F: FnMut(u8, &str),
+{
+    on_progress(5, "Đang chuẩn bị dữ liệu âm thanh...");
     let guard = state
         .lock()
         .map_err(|_| "Failed to acquire studio state lock".to_string())?;
@@ -833,10 +858,12 @@ pub fn handle_export_audio(
                     (StemRole::Instrumental, "instrumental"),
                     (StemRole::ReverbTail, "reverb_tail"),
                 ];
-                for (role, suffix) in stem_names {
+                for (idx, (role, suffix)) in stem_names.iter().enumerate() {
+                    let pct = 15 + (idx as u8) * 20;
+                    on_progress(pct, &format!("Đang render stem {}/4 ({})...", idx + 1, suffix));
                     let filtered: Vec<StemTrackData> = tracks
                         .iter()
-                        .filter(|t| t.params.role == role)
+                        .filter(|t| t.params.role == *role)
                         .cloned()
                         .map(|mut t| {
                             t.params.muted = false;
@@ -846,12 +873,14 @@ pub fn handle_export_audio(
                         .collect();
                     let rendered =
                         render_stem_aware_master_mix(&filtered, &guard.pitch_speed, limiter_enabled);
+                    on_progress(pct + 15, &format!("Đang mã hóa & ghi file ({})...", suffix));
                     let out_path = out_root.join(format!("{}_{}.{}", base_name, suffix, ext));
                     export_audio_file(&out_path, &rendered, format)?;
                     exported_paths.push(out_path.display().to_string());
                 }
             }
             ExportTargetMode::KaraokeBacking => {
+                on_progress(20, "Đang xử lý Phase Vocoder & phối trộn Karaoke...");
                 let karaoke_tracks: Vec<StemTrackData> = tracks
                     .into_iter()
                     .map(|mut t| {
@@ -868,20 +897,25 @@ pub fn handle_export_audio(
                     &guard.pitch_speed,
                     limiter_enabled,
                 );
+                on_progress(82, "Đang mã hóa & ghi file xuất...");
                 let out_path = out_root.join(format!("{}_karaoke_with_backing.{}", base_name, ext));
                 export_audio_file(&out_path, &rendered, format)?;
                 exported_paths.push(out_path.display().to_string());
             }
             ExportTargetMode::MasterMix => {
+                on_progress(20, "Đang xử lý Phase Vocoder & phối trộn Master Mix...");
                 let rendered =
                     render_stem_aware_master_mix(&tracks, &guard.pitch_speed, limiter_enabled);
+                on_progress(82, "Đang mã hóa & ghi file xuất...");
                 let out_path = out_root.join(format!("{}.{}", base_name, ext));
                 export_audio_file(&out_path, &rendered, format)?;
                 exported_paths.push(out_path.display().to_string());
             }
         }
     } else if let Some(raw) = &guard.original_track {
+        on_progress(20, "Đang xử lý dịch tone / tốc độ (Phase Vocoder)...");
         let rendered = process_stereo_pitch_and_speed(raw, &guard.pitch_speed);
+        on_progress(82, "Đang mã hóa & ghi file xuất...");
         let out_path = out_root.join(format!("{}.{}", base_name, ext));
         export_audio_file(&out_path, &rendered, format)?;
         exported_paths.push(out_path.display().to_string());
@@ -889,6 +923,7 @@ pub fn handle_export_audio(
         return Err("No loaded audio track available to export".to_string());
     }
 
+    on_progress(100, "Xuất file hoàn tất!");
     Ok(ExportAudioResponse {
         exported_paths,
         format,
@@ -958,6 +993,30 @@ pub mod tauri_commands {
     #[tauri::command]
     pub fn ipc_parse_youtube_url(raw_url: String) -> Result<ParsedYouTubeTarget, String> {
         handle_parse_youtube(&raw_url)
+    }
+
+    #[tauri::command]
+    pub async fn ipc_download_youtube_audio(
+        state: tauri::State<'_, Arc<Mutex<StudioAppState>>>,
+        raw_url: String,
+    ) -> Result<String, String> {
+        let parsed = handle_parse_youtube(&raw_url)?;
+        let models_dir = {
+            let guard = state
+                .lock()
+                .map_err(|_| "Failed to acquire studio state lock".to_string())?;
+            guard.model_manager.models_dir().to_path_buf()
+        };
+        tauri::async_runtime::spawn_blocking(move || {
+            let path = download_youtube_audio_file(
+                &parsed.canonical_watch_url,
+                &parsed.video_id,
+                &models_dir,
+            )?;
+            Ok(path.display().to_string())
+        })
+        .await
+        .map_err(|e| format!("YouTube download worker panicked: {}", e))?
     }
 
     #[tauri::command]
@@ -1065,6 +1124,7 @@ pub mod tauri_commands {
 
     #[tauri::command]
     pub async fn ipc_export_audio(
+        app: tauri::AppHandle,
         state: tauri::State<'_, Arc<Mutex<StudioAppState>>>,
         output_dir: String,
         base_name: String,
@@ -1073,9 +1133,10 @@ pub mod tauri_commands {
         stem_params: Vec<StemChannelParams>,
         limiter_enabled: bool,
     ) -> Result<ExportAudioResponse, String> {
+        use tauri::Emitter;
         let state_arc = Arc::clone(state.inner());
         tauri::async_runtime::spawn_blocking(move || {
-            handle_export_audio(
+            handle_export_audio_with_progress(
                 &state_arc,
                 &output_dir,
                 &base_name,
@@ -1083,6 +1144,12 @@ pub mod tauri_commands {
                 format,
                 stem_params,
                 limiter_enabled,
+                |percent, message| {
+                    let _ = app.emit(
+                        "export-progress",
+                        serde_json::json!({ "percent": percent, "message": message }),
+                    );
+                },
             )
         })
         .await
@@ -1122,7 +1189,7 @@ mod tests {
         assert!((ratio - 2.0).abs() < 1e-5);
 
         let overview = handle_list_models(&state).expect("list models");
-        assert_eq!(overview.catalog.len(), 6);
+        assert_eq!(overview.catalog.len(), 7);
 
         let default_export = resolve_default_export_dir();
         assert!(default_export.ends_with("Music Studio AI"));

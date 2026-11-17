@@ -238,9 +238,36 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
           </div>
         </div>
 
-        {/* Models Cards */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-3">
-          {models.map((m) => (
+        {/* Models Cards Grouped by Function */}
+        <div className="flex-1 overflow-y-auto p-6 space-y-6">
+          {[
+            {
+              title: 'Nhóm 1: Tách Nhạc Nền & Tổng Vocal (Tầng 1)',
+              subtitle: 'Tách beat (Instrumental) và tổng giọng hát (All Vocals)',
+              ids: ['htdemucs_4stems', 'uvr_mdx_inst_hq1', 'mel_band_roformer_vocals'],
+            },
+            {
+              title: 'Nhóm 2: Tách Vocal Chính & Giọng Bè (Tầng 2)',
+              subtitle: 'Tách riêng giọng hát chính (Lead) và giọng bè (Backing Harmony)',
+              ids: ['mel_band_roformer_karaoke', 'uvr_mdx_kara_2'],
+            },
+            {
+              title: 'Nhóm 3: Lọc Tiếng Vang & Dịch Cao Độ (Tầng 3 & Pitch)',
+              subtitle: 'Khử tiếng vang phòng (De-Reverb) và ước lượng cao độ F0',
+              ids: ['reverb_hq_foxjoy', 'rmvpe_f0'],
+            },
+          ].map((group) => {
+            const groupModels = models.filter((m) => group.ids.includes(m.id));
+            if (groupModels.length === 0) return null;
+            return (
+              <div key={group.title} className="space-y-3">
+                <div className="border-b border-white/10 pb-2">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-300">
+                    {group.title}
+                  </h3>
+                  <p className="text-[11px] text-slate-400">{group.subtitle}</p>
+                </div>
+                {groupModels.map((m) => (
             <div
               key={m.id}
               className="rounded-xl border border-white/10 bg-[#080B14]/90 p-4 transition-colors hover:border-white/20"
@@ -383,6 +410,9 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
               )}
             </div>
           ))}
+              </div>
+            );
+          })}
         </div>
 
         {/* Footer */}

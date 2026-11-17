@@ -100,6 +100,7 @@ fn main() {
             tauri_commands::ipc_read_file_base64,
             tauri_commands::ipc_prepare_preview_wav_b64,
             tauri_commands::ipc_parse_youtube_url,
+            tauri_commands::ipc_download_youtube_audio,
             tauri_commands::ipc_update_pitch_speed,
             tauri_commands::ipc_list_models,
             tauri_commands::ipc_download_model,

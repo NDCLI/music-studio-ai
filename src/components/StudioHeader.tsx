@@ -14,6 +14,7 @@ interface StudioHeaderProps {
   song: SongMetadata | null;
   semitones: number;
   speed: number;
+  isSeparated?: boolean;
   onSelectAudioFile: (file: File) => void;
   onRequestOpenTrack?: () => void;
   onOpenYouTubeModal: () => void;
@@ -24,6 +25,7 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
   song,
   semitones,
   speed,
+  isSeparated = false,
   onSelectAudioFile,
   onRequestOpenTrack,
   onOpenYouTubeModal,
@@ -53,17 +55,24 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
 
   const renderSourceBadge = () => {
     if (!song) return null;
+    if (isSeparated) {
+      return (
+        <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-emerald-300">
+          ĐÃ TÁCH
+        </span>
+      );
+    }
     if (song.sourceType === 'video_file') {
       return (
         <span className="inline-flex items-center gap-1 rounded bg-amber-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-amber-300">
           <Film className="h-3 w-3" />
-          VIDEO AUDIO
+          VIDEO GỐC
         </span>
       );
     }
     return (
-      <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-emerald-300">
-        AUDIO THỰC TẾ
+      <span className="rounded bg-indigo-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-indigo-300">
+        BẢN GỐC
       </span>
     );
   };

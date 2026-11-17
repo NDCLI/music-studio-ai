@@ -125,17 +125,26 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<StereoAudioBuffer, S
         .map_err(|e| format!("Unsupported or corrupted container format: {}", e))?;
 
     let mut format = probed.format;
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or_else(|| "No supported audio track found in container".to_string())?;
+    let codecs = symphonia::default::get_codecs();
+    let mut selected = None;
+    for t in format.tracks() {
+        if t.codec_params.codec == CODEC_TYPE_NULL {
+            continue;
+        }
+        if let Ok(dec) = codecs.make(&t.codec_params, &DecoderOptions::default()) {
+            selected = Some((
+                t.id,
+                t.codec_params.sample_rate.unwrap_or(STUDIO_SAMPLE_RATE),
+                dec,
+            ));
+            break;
+        }
+    }
 
-    let track_id = track.id;
-    let src_sample_rate = track.codec_params.sample_rate.unwrap_or(STUDIO_SAMPLE_RATE);
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| format!("Failed to initialize codec decoder: {}", e))?;
+    let (track_id, src_sample_rate, mut decoder) = selected.ok_or_else(|| {
+        "Failed to initialize codec decoder: unsupported feature: core (codec):unsupported codec"
+            .to_string()
+    })?;
 
     let mut left_channel = Vec::new();
     let mut right_channel = Vec::new();

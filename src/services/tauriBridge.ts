@@ -116,6 +116,11 @@ export function mapPitchSettingsToRust(
 /**
  * Synchronizes Pitch & Speed DSP parameters with the Rust backend when inside Tauri Desktop.
  */
+export async function downloadYouTubeAudioViaRust(rawUrl: string): Promise<string | null> {
+  if (!isTauriDesktopRuntime()) return null;
+  return invokeRustCommand<string>('ipc_download_youtube_audio', { rawUrl });
+}
+
 export async function syncPitchSpeedToRustBackend(
   settings: PitchSpeedSettings
 ): Promise<number | null> {
@@ -271,7 +276,7 @@ export async function preparePreviewWavViaRust(): Promise<ArrayBuffer> {
 }
 
 export async function runSeparationViaRustBackend(
-  mode: 'FastMdx' | 'ProRoformer',
+  mode: 'FastMdx' | 'ProRoformer' | 'HtDemucs',
   useDirectml = true
 ): Promise<RustSeparationStemsPeaks> {
   return invokeRustCommand<RustSeparationStemsPeaks>('ipc_run_separation', {

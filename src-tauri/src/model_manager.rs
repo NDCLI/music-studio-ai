@@ -89,23 +89,24 @@ pub fn resolve_default_models_dir() -> PathBuf {
 pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
     vec![
         ModelCatalogEntry {
-            id: "uvr_mdx_inst_hq4".to_string(),
-            file_name: "UVR-MDX-NET-Inst_HQ_4.onnx".to_string(),
+            id: "uvr_mdx_inst_hq1".to_string(),
+            file_name: "UVR-MDX-NET-Inst_HQ_1.onnx".to_string(),
             role: ModelRole::InstrumentalSeparator,
             task_title: "Stage 1: Instrumental & All Vocals (Fast MDX-Net)".to_string(),
             architecture: "MDX-Net (Hybrid Time-Frequency U-Net)".to_string(),
-            sdr_label: "11.8 dB".to_string(),
-            approx_size_mb: 56,
-            download_url: "https://huggingface.co/Politrees/UVR_resources/resolve/main/models/MDXNet/UVR-MDX-NET-Inst_HQ_4.onnx".to_string(),
+            sdr_label: "12.0 dB".to_string(),
+            approx_size_mb: 64,
+            download_url: "https://huggingface.co/Politrees/UVR_resources/resolve/main/models/MDXNet/UVR-MDX-NET-Inst_HQ_1.onnx".to_string(),
             expected_sha256: None,
             stft_spec: StftModelConfig {
-                model_filename: "UVR-MDX-NET-Inst_HQ_4.onnx".to_string(),
+                model_filename: "UVR-MDX-NET-Inst_HQ_1.onnx".to_string(),
                 sample_rate: 44_100,
-                n_fft: 5120,
+                n_fft: 6144,
                 hop_length: 1024,
-                dim_f: 2560,
+                dim_f: 3072,
                 dim_t: 256,
                 compensate: 1.019,
+                outputs_vocals: false,
             },
         },
         ModelCatalogEntry {
@@ -121,11 +122,33 @@ pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
             stft_spec: StftModelConfig {
                 model_filename: "mel-roformer.fp16.onnx".to_string(),
                 sample_rate: 44_100,
+                n_fft: 2048,
+                hop_length: 441,
+                dim_f: 1025,
+                dim_t: 801,
+                compensate: 1.0,
+                outputs_vocals: true,
+            },
+        },
+        ModelCatalogEntry {
+            id: "htdemucs_4stems".to_string(),
+            file_name: "htdemucs.onnx".to_string(),
+            role: ModelRole::InstrumentalSeparator,
+            task_title: "Stage 1: Hybrid Transformer Demucs (4-Stem Beat + Vocal)".to_string(),
+            architecture: "HTDemucs (Hybrid Time-Frequency Transformer)".to_string(),
+            sdr_label: "11.6 dB".to_string(),
+            approx_size_mb: 302,
+            download_url: "https://huggingface.co/StemSplitio/htdemucs-onnx/resolve/main/htdemucs.onnx".to_string(),
+            expected_sha256: None,
+            stft_spec: StftModelConfig {
+                model_filename: "htdemucs.onnx".to_string(),
+                sample_rate: 44_100,
                 n_fft: 4096,
                 hop_length: 1024,
                 dim_f: 2048,
-                dim_t: 352,
+                dim_t: 256,
                 compensate: 1.0,
+                outputs_vocals: false,
             },
         },
         ModelCatalogEntry {
@@ -146,6 +169,7 @@ pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
                 dim_f: 2048,
                 dim_t: 256,
                 compensate: 1.065,
+                outputs_vocals: false,
             },
         },
         ModelCatalogEntry {
@@ -166,6 +190,7 @@ pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
                 dim_f: 2048,
                 dim_t: 352,
                 compensate: 1.0,
+                outputs_vocals: false,
             },
         },
         ModelCatalogEntry {
@@ -184,8 +209,9 @@ pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
                 n_fft: 7680,
                 hop_length: 1024,
                 dim_f: 3072,
-                dim_t: 256,
+                dim_t: 512,
                 compensate: 1.028,
+                outputs_vocals: false,
             },
         },
         ModelCatalogEntry {
@@ -206,6 +232,7 @@ pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
                 dim_f: 512,
                 dim_t: 128,
                 compensate: 1.0,
+                outputs_vocals: false,
             },
         },
     ]
@@ -524,8 +551,18 @@ impl ModelManager {
         };
 
         let dest = self.model_path(&target_filename);
-        let copied_bytes = fs::copy(src, &dest)
-            .map_err(|e| format!("Failed to copy model to cache '{}': {}", dest.display(), e))?;
+        let same_file = match (fs::canonicalize(src), fs::canonicalize(&dest)) {
+            (Ok(s), Ok(d)) => s == d,
+            _ => false,
+        };
+        let copied_bytes = if same_file {
+            fs::metadata(&dest)
+                .map(|m| m.len())
+                .map_err(|e| format!("Failed to read model metadata '{}': {}", dest.display(), e))?
+        } else {
+            fs::copy(src, &dest)
+                .map_err(|e| format!("Failed to copy model to cache '{}': {}", dest.display(), e))?
+        };
 
         Ok(CachedModelStatus {
             id: resolved_id,
@@ -634,6 +671,11 @@ pub fn discover_onnxruntime_library() -> Option<PathBuf> {
         return Some(cwd_runtime);
     }
 
+    let models_dir_dll = resolve_default_models_dir().join(dll_name);
+    if models_dir_dll.is_file() {
+        return Some(models_dir_dll);
+    }
+
     None
 }
 
@@ -652,10 +694,10 @@ mod tests {
         fs::write(&sample_src, &payload).expect("write dummy onnx");
 
         let status = manager
-            .import_local_onnx_model(&sample_src, Some("uvr_mdx_inst_hq4"))
+            .import_local_onnx_model(&sample_src, Some("uvr_mdx_inst_hq1"))
             .expect("import valid onnx");
         assert!(status.installed);
-        assert_eq!(status.file_name, "UVR-MDX-NET-Inst_HQ_4.onnx");
+        assert_eq!(status.file_name, "UVR-MDX-NET-Inst_HQ_1.onnx");
         assert_eq!(status.size_bytes, payload.len() as u64);
         assert_eq!(status.sha256_hex.as_ref().map(|s| s.len()), Some(64));
 
