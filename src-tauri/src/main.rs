@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(feature = "desktop-tauri", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 //! Single-Binary Rust Entrypoint for Music Studio AI.
 //! Integrates:
 //! - Stage 2: Core Audio & Video Track Demuxer (`MP3`/`WAV`/`FLAC`/`MP4`/`MKV`/`WEBM`) + Multi-Stem Mixer

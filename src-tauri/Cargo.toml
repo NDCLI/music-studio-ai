@@ -13,7 +13,10 @@ path = "src/main.rs"
 # Default mode keeps build footprint minimal on corporate machines with AhnLab.
 # Enable `--features desktop-tauri` when packaging the full Tauri v2 desktop installer (.msi / .exe).
 default = []
-desktop-tauri = ["dep:tauri"]
+desktop-tauri = ["dep:tauri", "dep:tauri-build"]
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true }
 
 [dependencies]
 # Pure-Rust audio & video container demuxing (MP3, WAV, FLAC, OGG, M4A, MP4, MKV, WEBM, MOV)

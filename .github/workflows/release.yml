@@ -1,0 +1,65 @@
+name: Release Music Studio AI (Windows MSI & NSIS)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release-windows:
+    runs-on: windows-latest
+    env:
+      CARGO_BUILD_JOBS: 4
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build UI bundle
+        run: npm run build
+
+      - name: Run Rust unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build Tauri v2 MSI & NSIS Installers and Publish Release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'Music Studio AI v__VERSION__'
+          releaseBody: |
+            ## Music Studio AI v__VERSION__ (Rust + Local ONNX)
+
+            ### Tính năng chính
+            - **Nâng Hạ Tone (±12 semitones, ±50 cents) & Chỉnh Tốc Độ (0.25x – 2.00x)** thời gian thực có bảo toàn **Formant** chống méo giọng & khóa **Transient** giữ nảy tiếng trống.
+            - **Tách 4 Kênh 3 Tầng Local AI (ONNX Runtime DirectML/CPU):** Nhạc nền (`UVR-MDX-NET-Inst_HQ_4.onnx` / `Mel-Band RoFormer`), Vocal chính & Giọng bè (`UVR_MDXNET_KARA_2.onnx`), Khử vang (`Reverb_HQ_By_FoxJoy.onnx`).
+            - **Đa nguồn đầu vào:** File nhạc (`MP3`, `WAV`, `FLAC`, `OGG`, `M4A`), File Video (`MP4`, `MKV`, `WEBM`, `MOV`), và nạp trực tiếp link YouTube (tự động lọc chỉ lấy bài đang phát khi dán link Playlist).
+            - **Xuất đa định dạng Lossless:** `WAV 24-bit PCM`, `WAV 32-bit Float`, `WAV 16-bit CD`, và `FLAC 24-bit Lossless`.
+
+            ### Bộ cài đi kèm
+            - Trình cài đặt Windows chuẩn **`.msi`** (WiX Toolset) và **`.exe`** (NSIS Setup).
+          releaseDraft: false
+          prerelease: false
+          args: --features desktop-tauri
