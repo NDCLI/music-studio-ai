@@ -653,6 +653,12 @@ pub fn discover_onnxruntime_library() -> Option<PathBuf> {
         "libonnxruntime.so"
     };
 
+    let models_dir = resolve_default_models_dir();
+    let models_dir_dll = models_dir.join(dll_name);
+    if models_dir_dll.is_file() && models_dir.join("onnxruntime_providers_cuda.dll").is_file() {
+        return Some(models_dir_dll);
+    }
+
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(parent) = exe_path.parent() {
             let direct = parent.join(dll_name);
@@ -671,7 +677,6 @@ pub fn discover_onnxruntime_library() -> Option<PathBuf> {
         return Some(cwd_runtime);
     }
 
-    let models_dir_dll = resolve_default_models_dir().join(dll_name);
     if models_dir_dll.is_file() {
         return Some(models_dir_dll);
     }

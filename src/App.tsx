@@ -175,6 +175,7 @@ export const App: React.FC = () => {
 
   const [qualityMode, setQualityMode] =
     useState<SeparationQualityMode>('htdemucs');
+  const [enableDereverb, setEnableDereverb] = useState<boolean>(false);
   const [activePreset, setActivePreset] =
     useState<SeparationPresetId>('full_mix');
   const [separationStatus, setSeparationStatus] =
@@ -967,7 +968,9 @@ export const App: React.FC = () => {
           ? ['uvr_mdx_inst_hq1', 'mel_band_roformer_karaoke']
           : qualityMode === 'htdemucs'
             ? ['htdemucs_4stems', 'mel_band_roformer_karaoke']
-            : ['uvr_mdx_inst_hq1', 'uvr_mdx_kara_2'];
+            : qualityMode === 'htdemucs_mdx_kara'
+              ? ['htdemucs_4stems', 'uvr_mdx_kara_2']
+              : ['uvr_mdx_inst_hq1', 'uvr_mdx_kara_2'];
 
       const overview = await listModelsViaRustBackend().catch(() => null);
       const installedMap = new Map(
@@ -1023,8 +1026,14 @@ export const App: React.FC = () => {
           ? 'ProRoformer'
           : qualityMode === 'htdemucs'
             ? 'HtDemucs'
-            : 'FastMdx';
-      const res = await runSeparationViaRustBackend(rustMode, useGpu);
+            : qualityMode === 'htdemucs_mdx_kara'
+              ? 'HtDemucsMdxKara'
+              : 'FastMdx';
+      const res = await runSeparationViaRustBackend(
+        rustMode,
+        useGpu,
+        enableDereverb
+      );
       const wavRes = await getSeparatedStemsWavViaRust();
 
       const [lead, backing, inst, rev] = await Promise.all([
@@ -1543,9 +1552,11 @@ export const App: React.FC = () => {
               currentTimeSec={currentTimeSec}
               durationSec={song?.durationSec ?? 0}
               qualityMode={qualityMode}
+              enableDereverb={enableDereverb}
               activePreset={activePreset}
               separationStatus={separationStatus}
               onChangeQualityMode={setQualityMode}
+              onToggleDereverb={setEnableDereverb}
               onRunSeparation={() => void handleRunSeparation()}
               onOpenModelManager={() => setIsModelModalOpen(true)}
               onApplyPreset={handleApplyPreset}

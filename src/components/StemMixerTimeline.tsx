@@ -123,9 +123,11 @@ interface StemMixerTimelineProps {
   currentTimeSec: number;
   durationSec: number;
   qualityMode: SeparationQualityMode;
+  enableDereverb: boolean;
   activePreset: SeparationPresetId;
   separationStatus: SeparationStageStatus;
   onChangeQualityMode: (mode: SeparationQualityMode) => void;
+  onToggleDereverb: (enabled: boolean) => void;
   onRunSeparation: () => void;
   onRunSpectralFallback?: () => void;
   onOpenModelManager?: () => void;
@@ -166,9 +168,11 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
   currentTimeSec,
   durationSec,
   qualityMode,
+  enableDereverb,
   activePreset,
   separationStatus,
   onChangeQualityMode,
+  onToggleDereverb,
   onRunSeparation,
   onRunSpectralFallback,
   onOpenModelManager,
@@ -230,43 +234,100 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
           </div>
         </div>
 
-        {/* AI Quality Selector & Trigger Button */}
+        {/* AI Role-Based Model Selectors & Trigger Button */}
         <div className="flex flex-wrap items-center gap-2.5">
-          <div className="inline-flex flex-wrap rounded-xl border border-white/10 bg-[#080B14] p-1 gap-1">
+          {/* Stage 1: Instrumental / Beat Model */}
+          <div className="inline-flex items-center rounded-xl border border-white/10 bg-[#080B14] p-1 gap-1">
+            <span className="px-2 text-[11px] font-semibold text-emerald-400">
+              Nhạc nền:
+            </span>
             <button
               type="button"
-              onClick={() => onChangeQualityMode('htdemucs')}
-              className={`cursor-pointer rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors duration-150 ${
-                qualityMode === 'htdemucs'
-                  ? 'bg-indigo-600 text-white'
+              onClick={() =>
+                onChangeQualityMode(
+                  qualityMode === 'fast_mdx' || qualityMode === 'htdemucs_mdx_kara'
+                    ? 'htdemucs_mdx_kara'
+                    : 'htdemucs'
+                )
+              }
+              className={`cursor-pointer rounded-lg px-2.5 py-1 text-xs font-semibold transition-colors duration-150 ${
+                qualityMode === 'htdemucs' || qualityMode === 'htdemucs_mdx_kara'
+                  ? 'bg-emerald-600 text-white'
                   : 'text-slate-400 hover:text-white'
               }`}
             >
-              Combo 1: HTDemucs + RoFormer (Chuẩn Nhất)
+              HTDemucs
             </button>
             <button
               type="button"
-              onClick={() => onChangeQualityMode('pro_roformer')}
-              className={`cursor-pointer rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors duration-150 ${
-                qualityMode === 'pro_roformer'
-                  ? 'bg-indigo-600 text-white'
+              onClick={() =>
+                onChangeQualityMode(
+                  qualityMode === 'fast_mdx' || qualityMode === 'htdemucs_mdx_kara'
+                    ? 'fast_mdx'
+                    : 'pro_roformer'
+                )
+              }
+              className={`cursor-pointer rounded-lg px-2.5 py-1 text-xs font-semibold transition-colors duration-150 ${
+                qualityMode === 'pro_roformer' || qualityMode === 'fast_mdx'
+                  ? 'bg-emerald-600 text-white'
                   : 'text-slate-400 hover:text-white'
               }`}
             >
-              Combo 2: Inst_HQ + RoFormer
-            </button>
-            <button
-              type="button"
-              onClick={() => onChangeQualityMode('fast_mdx')}
-              className={`cursor-pointer rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors duration-150 ${
-                qualityMode === 'fast_mdx'
-                  ? 'bg-indigo-600 text-white'
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              Combo 3: Inst_HQ + MDX Karaoke 2 (Máy Yếu)
+              Inst_HQ
             </button>
           </div>
+
+          {/* Stage 2: Backing Vocal / Harmony Model */}
+          <div className="inline-flex items-center rounded-xl border border-white/10 bg-[#080B14] p-1 gap-1">
+            <span className="px-2 text-[11px] font-semibold text-amber-400">
+              Tách bè:
+            </span>
+            <button
+              type="button"
+              onClick={() =>
+                onChangeQualityMode(
+                  qualityMode === 'htdemucs' || qualityMode === 'htdemucs_mdx_kara'
+                    ? 'htdemucs'
+                    : 'pro_roformer'
+                )
+              }
+              className={`cursor-pointer rounded-lg px-2.5 py-1 text-xs font-semibold transition-colors duration-150 ${
+                qualityMode === 'htdemucs' || qualityMode === 'pro_roformer'
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              RoFormer
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                onChangeQualityMode(
+                  qualityMode === 'htdemucs' || qualityMode === 'htdemucs_mdx_kara'
+                    ? 'htdemucs_mdx_kara'
+                    : 'fast_mdx'
+                )
+              }
+              className={`cursor-pointer rounded-lg px-2.5 py-1 text-xs font-semibold transition-colors duration-150 ${
+                qualityMode === 'fast_mdx' || qualityMode === 'htdemucs_mdx_kara'
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              MDX Karaoke 2
+            </button>
+          </div>
+
+          {/* Optional Stage 3: De-Reverb toggle */}
+          <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl border border-white/10 bg-[#080B14] px-2.5 py-1.5 text-xs text-slate-300 hover:text-white">
+            <input
+              type="checkbox"
+              checked={enableDereverb}
+              onChange={(e) => onToggleDereverb(e.target.checked)}
+              className="h-3.5 w-3.5 accent-cyan-500"
+            />
+            <span>Lọc Vang</span>
+          </label>
 
           <button
             type="button"
@@ -282,7 +343,7 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
             ) : (
               <>
                 <Sparkles className="h-4 w-4" />
-                <span>Tách Nhạc AI (3 Tầng)</span>
+                <span>{enableDereverb ? 'Tách Nhạc AI (3 Tầng)' : 'Tách Beat + Vocal + Bè'}</span>
               </>
             )}
           </button>

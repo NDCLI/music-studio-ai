@@ -289,12 +289,14 @@ export async function preparePreviewWavViaRust(): Promise<ArrayBuffer> {
 }
 
 export async function runSeparationViaRustBackend(
-  mode: 'FastMdx' | 'ProRoformer' | 'HtDemucs',
-  useDirectml = true
+  mode: 'FastMdx' | 'ProRoformer' | 'HtDemucs' | 'HtDemucsMdxKara',
+  useDirectml = true,
+  enableDereverb = false
 ): Promise<RustSeparationStemsPeaks> {
   return invokeRustCommand<RustSeparationStemsPeaks>('ipc_run_separation', {
     mode,
     useDirectml,
+    enableDereverb,
   });
 }
 

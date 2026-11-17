@@ -71,7 +71,9 @@ export const StudioToolbar: React.FC<StudioToolbarProps> = ({
       ? ['uvr_mdx_inst_hq1', 'uvr_mdx_kara_2']
       : qualityMode === 'htdemucs'
         ? ['htdemucs_4stems', 'mel_band_roformer_karaoke']
-        : ['uvr_mdx_inst_hq1', 'mel_band_roformer_karaoke'];
+        : qualityMode === 'htdemucs_mdx_kara'
+          ? ['htdemucs_4stems', 'uvr_mdx_kara_2']
+          : ['uvr_mdx_inst_hq1', 'mel_band_roformer_karaoke'];
 
   const installedRequiredCount = requiredIds.filter(
     (id) => models.find((m) => m.id === id)?.installed

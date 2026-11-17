@@ -53,6 +53,8 @@ pub struct SeparationPipelineConfig {
     pub stage1_inst_model: StftModelConfig,
     pub stage2_karaoke_model: StftModelConfig,
     pub stage3_dereverb_model: StftModelConfig,
+    #[serde(default)]
+    pub enable_dereverb: bool,
 }
 
 impl SeparationPipelineConfig {
@@ -89,10 +91,11 @@ impl SeparationPipelineConfig {
                 compensate: 1.028,
                 outputs_vocals: false,
             },
+            enable_dereverb: false,
         }
     }
 
-    /// Combo 2: UVR-MDX-NET-Inst_HQ_1 + Mel-Band RoFormer Karaoke + De-Reverb.
+    /// Combo 2: UVR-MDX-NET-Inst_HQ_1 + Mel-Band RoFormer Karaoke + optional De-Reverb.
     pub fn pro_roformer_pipeline() -> Self {
         Self {
             stage1_inst_model: StftModelConfig {
@@ -113,7 +116,8 @@ impl SeparationPipelineConfig {
                 dim_f: 1025,
                 dim_t: 400,
                 compensate: 1.0,
-                outputs_vocals: true,
+                // mel_band_roformer_karaoke outputs the Karaoke/Backing Vocal stem (lead removed)
+                outputs_vocals: false,
             },
             stage3_dereverb_model: StftModelConfig {
                 model_filename: "Reverb_HQ_By_FoxJoy.onnx".to_string(),
@@ -125,10 +129,11 @@ impl SeparationPipelineConfig {
                 compensate: 1.028,
                 outputs_vocals: false,
             },
+            enable_dereverb: false,
         }
     }
 
-    /// Combo 1: HTDemucs + Mel-Band RoFormer Karaoke + De-Reverb (highest accuracy).
+    /// Combo 1: HTDemucs + Mel-Band RoFormer Karaoke + optional De-Reverb (highest accuracy).
     pub fn htdemucs_pipeline() -> Self {
         Self {
             stage1_inst_model: StftModelConfig {
@@ -149,7 +154,8 @@ impl SeparationPipelineConfig {
                 dim_f: 1025,
                 dim_t: 400,
                 compensate: 1.0,
-                outputs_vocals: true,
+                // mel_band_roformer_karaoke outputs the Karaoke/Backing Vocal stem (lead removed)
+                outputs_vocals: false,
             },
             stage3_dereverb_model: StftModelConfig {
                 model_filename: "Reverb_HQ_By_FoxJoy.onnx".to_string(),
@@ -161,7 +167,15 @@ impl SeparationPipelineConfig {
                 compensate: 1.028,
                 outputs_vocals: false,
             },
+            enable_dereverb: false,
         }
+    }
+
+    /// Hybrid Combo: HTDemucs (Stage 1 Beat) + MDX Karaoke 2 (Stage 2 Backing Vocal) + optional De-Reverb.
+    pub fn htdemucs_mdx_kara_pipeline() -> Self {
+        let mut cfg = Self::htdemucs_pipeline();
+        cfg.stage2_karaoke_model = Self::default_mdx_pipeline().stage2_karaoke_model;
+        cfg
     }
 }
 
@@ -171,6 +185,7 @@ pub struct SeparatedStems {
     pub backing_vocal: StereoAudioBuffer,
     pub instrumental: StereoAudioBuffer,
     pub reverb_tail: StereoAudioBuffer,
+    pub execution_backend: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +204,19 @@ pub fn init_ort_environment(custom_dll_path: Option<&Path>) -> Result<Environmen
         .map(|p| p.to_path_buf())
         .or_else(discover_onnxruntime_library);
 
+    if let Some(ref dll_path) = resolved_dll {
+        if let Some(dll_dir) = dll_path.parent() {
+            let current_path = std::env::var_os("PATH").unwrap_or_default();
+            let mut paths: Vec<std::path::PathBuf> = std::env::split_paths(&current_path).collect();
+            if !paths.iter().any(|p| p == dll_dir) {
+                paths.insert(0, dll_dir.to_path_buf());
+                if let Ok(joined) = std::env::join_paths(paths) {
+                    std::env::set_var("PATH", joined);
+                }
+            }
+        }
+    }
+
     let builder = match resolved_dll {
         Some(path) => ort::init_from(&path)
             .map_err(|e| format!("Failed to dynamically load ONNX Runtime at '{}': {}", path.display(), e))?,
@@ -202,7 +230,30 @@ pub fn init_ort_environment(custom_dll_path: Option<&Path>) -> Result<Environmen
         .map_err(|e| format!("Failed to build ONNX Runtime environment: {}", e))
 }
 
-/// Creates an ONNX inference session configured for DirectML GPU acceleration with CPU fallback.
+fn has_cuda_provider_library() -> bool {
+    let cuda_dll = if cfg!(target_os = "windows") {
+        "onnxruntime_providers_cuda.dll"
+    } else {
+        "libonnxruntime_providers_cuda.so"
+    };
+    if let Some(ort_path) = discover_onnxruntime_library() {
+        if let Some(dir) = ort_path.parent() {
+            if dir.join(cuda_dll).is_file() {
+                return true;
+            }
+        }
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for entry in std::env::split_paths(&path_var) {
+            if entry.join(cuda_dll).is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Creates an ONNX inference session configured for CUDA/DirectML GPU acceleration with CPU fallback.
 pub fn create_mdx_session<P: AsRef<Path>>(
     env: &Environment,
     model_path: P,
@@ -215,6 +266,29 @@ pub fn create_mdx_session<P: AsRef<Path>>(
 
     match device {
         ExecutionDevice::DirectMl { device_id } => {
+            // 1. Try NVIDIA CUDA GPU first if onnxruntime_providers_cuda.dll is present
+            if has_cuda_provider_library() {
+                let cuda_attempt = Session::builder(env)
+                    .map_err(|e| e.to_string())?
+                    .with_execution_providers([
+                        ep::CUDA::default()
+                            .with_device_id(device_id)
+                            .build()
+                            .error_on_failure(),
+                    ])
+                    .map_err(|e| e.to_string())?
+                    .commit_from_file(path_ref);
+
+                match cuda_attempt {
+                    Ok(session) => return Ok((session, "CUDA GPU")),
+                    Err(_e) => {
+                        #[cfg(test)]
+                        println!("CUDA EP registration error: {}", _e);
+                    }
+                }
+            }
+
+            // 2. Fallback to DirectML GPU
             let dml_attempt = Session::builder(env)
                 .map_err(|e| e.to_string())?
                 // DirectML recommends disabling parallel execution & memory pattern for graph stability
@@ -233,20 +307,33 @@ pub fn create_mdx_session<P: AsRef<Path>>(
                 return Ok((session, "DirectML GPU (with CPU fallback)"));
             }
 
-            // Fallback to pure CPU EP if DirectML could not bind on this host
+            // 3. Fallback to pure multi-threaded CPU EP if GPU could not bind on this host
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8);
             let cpu_session = Session::builder(env)
+                .map_err(|e| e.to_string())?
+                .with_intra_threads(threads)
                 .map_err(|e| e.to_string())?
                 .with_execution_providers([ep::CPU::default().build()])
                 .map_err(|e| e.to_string())?
                 .commit_from_file(path_ref)
                 .map_err(|e| format!("Failed to load ONNX session '{}': {}", path_ref.display(), e))?;
 
-            Ok((cpu_session, "CPU Execution Provider (DirectML unavailable)"))
+            Ok((cpu_session, "CPU Execution Provider (GPU unavailable)"))
         }
         ExecutionDevice::Cpu { intra_threads } => {
+            let auto_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8);
+            let threads = if intra_threads == 0 {
+                auto_threads
+            } else {
+                intra_threads.max(1)
+            };
             let session = Session::builder(env)
                 .map_err(|e| e.to_string())?
-                .with_intra_threads(intra_threads.max(1))
+                .with_intra_threads(threads)
                 .map_err(|e| e.to_string())?
                 .with_execution_providers([ep::CPU::default().build()])
                 .map_err(|e| e.to_string())?
@@ -803,9 +890,13 @@ pub fn separate_3_stage_stems<F>(
 where
     F: FnMut(SeparationProgress),
 {
+    let auto_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+
     // Stage 1: Instrumental & All Vocals
     let stage1_path = models_dir.join(&pipeline.stage1_inst_model.model_filename);
-    let (mut sess1, _) = create_mdx_session(env, &stage1_path, device)?;
+    let (mut sess1, mut active_backend) = create_mdx_session(env, &stage1_path, device)?;
     let (instrumental, all_vocals) = if pipeline.stage1_inst_model.model_filename == "htdemucs.onnx" {
         let dml_res = run_htdemucs_onnx_model(&mut sess1, audio, |c, total| {
             let pct = (c as f32 / total as f32) * 40.0;
@@ -821,8 +912,14 @@ where
             Ok(pair) => pair,
             Err(_) if !matches!(device, ExecutionDevice::Cpu { .. }) => {
                 drop(sess1);
-                let (mut cpu_sess, _) =
-                    create_mdx_session(env, &stage1_path, ExecutionDevice::Cpu { intra_threads: 4 })?;
+                let (mut cpu_sess, cpu_ep) = create_mdx_session(
+                    env,
+                    &stage1_path,
+                    ExecutionDevice::Cpu {
+                        intra_threads: auto_threads,
+                    },
+                )?;
+                active_backend = cpu_ep;
                 run_htdemucs_onnx_model(&mut cpu_sess, audio, |c, total| {
                     let pct = (c as f32 / total as f32) * 40.0;
                     on_progress(SeparationProgress {
@@ -858,7 +955,10 @@ where
 
     // Stage 2: Backing Vocal & Lead Vocal
     let stage2_path = models_dir.join(&pipeline.stage2_karaoke_model.model_filename);
-    let (mut sess2, _) = create_mdx_session(env, &stage2_path, device)?;
+    let (mut sess2, ep2) = create_mdx_session(env, &stage2_path, device)?;
+    if active_backend.contains("CPU") || ep2.contains("CUDA") {
+        active_backend = ep2;
+    }
     let (backing_vocal, lead_with_reverb) =
         if pipeline.stage2_karaoke_model.model_filename == "mel_band_roformer_karaoke_aufr33_viperx.onnx" {
             let dml_res = run_roformer_karaoke_onnx_model(
@@ -876,12 +976,18 @@ where
                     });
                 },
             );
-            let lead = match dml_res {
-                Ok(l) => l,
+            let model_out = match dml_res {
+                Ok(out) => out,
                 Err(_) if !matches!(device, ExecutionDevice::Cpu { .. }) => {
                     drop(sess2);
-                    let (mut cpu_sess, _) =
-                        create_mdx_session(env, &stage2_path, ExecutionDevice::Cpu { intra_threads: 4 })?;
+                    let (mut cpu_sess, cpu_ep) = create_mdx_session(
+                        env,
+                        &stage2_path,
+                        ExecutionDevice::Cpu {
+                            intra_threads: auto_threads,
+                        },
+                    )?;
+                    active_backend = cpu_ep;
                     run_roformer_karaoke_onnx_model(
                         &mut cpu_sess,
                         &all_vocals,
@@ -900,8 +1006,14 @@ where
                 }
                 Err(e) => return Err(e),
             };
-            let backing = subtract_stereo_buffers(&all_vocals, &lead);
-            (backing, lead)
+            if pipeline.stage2_karaoke_model.outputs_vocals {
+                let backing = subtract_stereo_buffers(&all_vocals, &model_out);
+                (backing, model_out)
+            } else {
+                // mel_band_roformer_karaoke_aufr33_viperx outputs Karaoke/Backing Vocal (lead removed)
+                let lead = subtract_stereo_buffers(&all_vocals, &model_out);
+                (model_out, lead)
+            }
         } else {
             let backing = run_mdx_onnx_model(
                 &mut sess2,
@@ -922,9 +1034,9 @@ where
             (backing, lead)
         };
 
-    // Stage 3: De-Reverb (Dry Lead Vocal vs. Reverb Tail)
+    // Stage 3: Optional De-Reverb (Dry Lead Vocal vs. Reverb Tail)
     let stage3_path = models_dir.join(&pipeline.stage3_dereverb_model.model_filename);
-    let (lead_vocal, reverb_tail) = if stage3_path.is_file() {
+    let (lead_vocal, reverb_tail) = if pipeline.enable_dereverb && stage3_path.is_file() {
         let (mut sess3, _) = create_mdx_session(env, &stage3_path, device)?;
         let dry_lead = run_mdx_onnx_model(
             &mut sess3,
@@ -948,7 +1060,7 @@ where
         let empty_reverb = StereoAudioBuffer::new(audio.sample_rate, silent.clone(), silent);
         on_progress(SeparationProgress {
             stage_index: 3,
-            stage_name: "Stage 3/3: Skipped De-Reverb (optional model not cached)".to_string(),
+            stage_name: "Stage 3/3: Skipped De-Reverb (Beat + Vocal + Bè mode)".to_string(),
             chunk_index: 1,
             total_chunks: 1,
             overall_percent: 100.0,
@@ -961,6 +1073,7 @@ where
         backing_vocal,
         instrumental,
         reverb_tail,
+        execution_backend: active_backend.to_string(),
     })
 }
 
@@ -1016,6 +1129,17 @@ mod tests {
         assert!((diff.left[0] - 0.5).abs() < 1e-6);
         assert!((diff.left[1] - (-0.3)).abs() < 1e-6);
         assert!((diff.right[2] - (-0.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cuda_ep_registration() {
+        let models_dir = crate::model_manager::resolve_default_models_dir();
+        let env = init_ort_environment(None).expect("init ort env");
+        let p = models_dir.join("UVR-MDX-NET-Inst_HQ_1.onnx");
+        if p.is_file() {
+            let (_sess, ep_name) = create_mdx_session(&env, &p, ExecutionDevice::DirectMl { device_id: 0 }).expect("session");
+            println!("ACTIVE_EP => {}", ep_name);
+        }
     }
 
     #[test]

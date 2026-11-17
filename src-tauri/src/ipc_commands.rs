@@ -36,6 +36,7 @@ pub enum SeparationMode {
     FastMdx,
     ProRoformer,
     HtDemucs,
+    HtDemucsMdxKara,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -683,12 +684,15 @@ pub fn handle_run_separation(
     state: &Arc<Mutex<StudioAppState>>,
     mode: SeparationMode,
     use_directml: bool,
+    enable_dereverb: Option<bool>,
 ) -> Result<SeparationStemPeaksResponse, String> {
-    let pipeline = match mode {
+    let mut pipeline = match mode {
         SeparationMode::FastMdx => SeparationPipelineConfig::default_mdx_pipeline(),
         SeparationMode::ProRoformer => SeparationPipelineConfig::pro_roformer_pipeline(),
         SeparationMode::HtDemucs => SeparationPipelineConfig::htdemucs_pipeline(),
+        SeparationMode::HtDemucsMdxKara => SeparationPipelineConfig::htdemucs_mdx_kara_pipeline(),
     };
+    pipeline.enable_dereverb = enable_dereverb.unwrap_or(false);
 
     let (track, models_dir, env) = {
         let mut guard = state
@@ -740,7 +744,7 @@ pub fn handle_run_separation(
     let device = if use_directml {
         ExecutionDevice::DirectMl { device_id: 0 }
     } else {
-        ExecutionDevice::Cpu { intra_threads: 4 }
+        ExecutionDevice::Cpu { intra_threads: 0 }
     };
 
     let separated = separate_3_stage_stems(&env, &models_dir, &track, &pipeline, device, |_| {})?;
@@ -750,11 +754,7 @@ pub fn handle_run_separation(
         backing_vocal: separated.backing_vocal.compute_waveform_peaks(140),
         instrumental: separated.instrumental.compute_waveform_peaks(140),
         reverb_tail: separated.reverb_tail.compute_waveform_peaks(140),
-        execution_backend: if use_directml {
-            "GPU".to_string()
-        } else {
-            "CPU".to_string()
-        },
+        execution_backend: separated.execution_backend.clone(),
     };
 
     let mut guard = state
@@ -1103,10 +1103,11 @@ pub mod tauri_commands {
         state: tauri::State<'_, Arc<Mutex<StudioAppState>>>,
         mode: SeparationMode,
         use_directml: bool,
+        enable_dereverb: Option<bool>,
     ) -> Result<SeparationStemPeaksResponse, String> {
         let state_arc = Arc::clone(state.inner());
         tauri::async_runtime::spawn_blocking(move || {
-            handle_run_separation(&state_arc, mode, use_directml)
+            handle_run_separation(&state_arc, mode, use_directml, enable_dereverb)
         })
         .await
         .map_err(|e| format!("Separation worker panicked: {}", e))?
@@ -1360,7 +1361,7 @@ mod tests {
         let preview_b64 = handle_prepare_preview_wav_b64(&state).expect("prepare preview wav");
         assert!(!preview_b64.is_empty());
 
-        let sep_err = handle_run_separation(&state, SeparationMode::FastMdx, false)
+        let sep_err = handle_run_separation(&state, SeparationMode::FastMdx, false, Some(false))
             .expect_err("should fail clearly when .onnx models are missing");
         assert!(sep_err.starts_with("ONNX_PREREQ_MISSING:"));
 
