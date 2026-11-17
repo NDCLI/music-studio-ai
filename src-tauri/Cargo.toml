@@ -1,0 +1,32 @@
+[package]
+name = "music-studio-ai"
+version = "0.1.0"
+description = "Rust Music Studio AI: Formant-Preserving Pitch/Speed Shifter & Local ONNX Stem Separation"
+edition = "2021"
+
+# Single-Binary architecture to prevent AhnLab endpoint security from scanning multiple executables
+[[bin]]
+name = "music-studio-ai"
+path = "src/main.rs"
+
+[dependencies]
+# Pure-Rust audio decoding and WAV/FLAC export (no external ffmpeg.exe sidecar needed)
+symphonia = { version = "0.5", features = ["mp3", "wav", "flac", "ogg", "aac", "isomp4"] }
+hound = "3.5"
+rubato = "0.15"
+
+# Pure-Rust FFT and multi-dimensional tensor processing for STFT & Phase Vocoder
+rustfft = "6.2"
+realfft = "3.3"
+ndarray = "0.16"
+rayon = "1.10"
+
+# Low-latency audio playback and lock-free ring buffer
+cpal = "0.15"
+rtrb = "0.3"
+
+# ONNX Runtime with load-dynamic (uses Microsoft-signed onnxruntime.dll + DirectML)
+ort = { version = "2.0.0-rc.9", default-features = false, features = ["load-dynamic", "directml"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
