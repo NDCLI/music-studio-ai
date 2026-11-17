@@ -15,6 +15,17 @@ import {
   importLocalOnnxModel,
   listCachedModelsFromDb,
 } from './services/modelStorage';
+import {
+  clearBrowserExportDirHandle,
+  ensureDirectoryWritePermission,
+  isEmbeddedFrame,
+  loadBrowserExportDirHandle,
+  pickBrowserDirectoryHandle,
+  pickSaveFileHandle,
+  supportsSaveFilePicker,
+  type BrowserDirectoryHandle,
+  type BrowserFileHandle,
+} from './services/exportStorage';
 import { separateAudioBuffer3Stage } from './services/stemSeparator';
 import {
   base64ToArrayBuffer,
@@ -51,19 +62,7 @@ import {
 } from './types/studio';
 
 const EXPORT_DIR_STORAGE_KEY = 'music_studio_export_dir';
-
-interface BrowserWritableFileStream {
-  write: (data: Blob) => Promise<void>;
-  close: () => Promise<void>;
-}
-
-interface BrowserDirectoryHandle {
-  name: string;
-  getFileHandle: (
-    name: string,
-    options?: { create?: boolean }
-  ) => Promise<{ createWritable: () => Promise<BrowserWritableFileStream> }>;
-}
+const EXPORT_MODE_STORAGE_KEY = 'music_studio_browser_export_mode';
 
 const VIDEO_EXTENSIONS = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'm4v'];
 
@@ -191,6 +190,17 @@ export const App: React.FC = () => {
   });
   const [browserDirHandle, setBrowserDirHandle] =
     useState<BrowserDirectoryHandle | null>(null);
+  const [browserExportMode, setBrowserExportMode] = useState<
+    'downloads' | 'directory' | 'save_as'
+  >(() => {
+    try {
+      const saved = localStorage.getItem(EXPORT_MODE_STORAGE_KEY);
+      if (saved === 'save_as' && supportsSaveFilePicker()) return 'save_as';
+    } catch {
+      // Ignore storage access errors
+    }
+    return 'downloads';
+  });
 
   const audioEngineRef = useRef<StudioPreviewAudioEngine | null>(null);
   const dropzoneFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -221,6 +231,13 @@ export const App: React.FC = () => {
           if (dir) setDefaultExportDir(dir);
         })
         .catch(() => {});
+    } else {
+      void loadBrowserExportDirHandle().then((restoredHandle) => {
+        if (restoredHandle) {
+          setBrowserDirHandle(restoredHandle);
+          setBrowserExportMode((prev) => (prev === 'save_as' ? 'save_as' : 'directory'));
+        }
+      });
     }
 
     void Promise.all([
@@ -447,12 +464,19 @@ export const App: React.FC = () => {
 
   const activeDesktopExportDir = customExportDir ?? defaultExportDir;
   const isDesktopRuntime = isTauriDesktopRuntime();
+  const browserSaveAsCapable = !isDesktopRuntime && supportsSaveFilePicker();
+  const embeddedFrame = !isDesktopRuntime && isEmbeddedFrame();
+
   const exportFolderLabel = isDesktopRuntime
     ? activeDesktopExportDir ?? '%USERPROFILE%\\Music\\Music Studio AI'
-    : browserDirHandle?.name ?? 'Thư mục Downloads (Mặc định của trình duyệt)';
+    : browserExportMode === 'save_as'
+      ? 'Mở hộp thoại Save As để chọn nơi lưu mỗi lần xuất'
+      : browserDirHandle
+        ? browserDirHandle.name
+        : 'Thư mục Downloads (Mặc định của trình duyệt)';
   const isCustomExportFolder = isDesktopRuntime
     ? Boolean(customExportDir)
-    : Boolean(browserDirHandle);
+    : browserExportMode === 'save_as' || Boolean(browserDirHandle);
   const canOpenExportFolder = isDesktopRuntime && Boolean(activeDesktopExportDir);
 
   const handlePickExportFolder = async (): Promise<string | null> => {
@@ -469,25 +493,56 @@ export const App: React.FC = () => {
       return null;
     }
 
-    const picker = (
-      window as unknown as {
-        showDirectoryPicker?: (opts?: { mode?: 'read' | 'readwrite' }) => Promise<BrowserDirectoryHandle>;
-      }
-    ).showDirectoryPicker;
-
-    if (typeof picker !== 'function') {
-      return 'Trình duyệt hiện tại không hỗ trợ chọn thư mục trực tiếp; file xuất sẽ tải về thư mục Downloads mặc định.';
-    }
-
     try {
-      const handle = await picker({ mode: 'readwrite' });
+      const handle = await pickBrowserDirectoryHandle();
       setBrowserDirHandle(handle);
+      setBrowserExportMode('directory');
+      try {
+        localStorage.setItem(EXPORT_MODE_STORAGE_KEY, 'directory');
+      } catch {
+        // Ignore storage errors
+      }
       return null;
     } catch (err) {
+      if (err instanceof Error && err.message === 'UNSUPPORTED_DIRECTORY_PICKER') {
+        if (embeddedFrame) {
+          return 'Trang đang mở trong khung xem trước nên trình duyệt chặn chọn thư mục trên ổ đĩa (file xuất vẫn vào Downloads). Hãy bấm "Mở Tab Riêng" ở bên phải hoặc bật app Desktop.';
+        }
+        if (supportsSaveFilePicker()) {
+          return 'Trình duyệt không hỗ trợ chọn thư mục cố định. Hãy bấm "Lưu Qua Save As" bên cạnh để tự chọn thư mục khi xuất!';
+        }
+        return 'Trình duyệt hiện tại không hỗ trợ chọn thư mục trực tiếp (chỉ dùng được trên Chrome/Edge); file sẽ tải về Downloads.';
+      }
+      if (err instanceof Error && err.message === 'PERMISSION_DENIED') {
+        return 'Bạn chưa cấp quyền ghi file vào thư mục vừa chọn, nên chưa thể lưu vào đó.';
+      }
+      if (err instanceof DOMException && err.name === 'SecurityError') {
+        return embeddedFrame
+          ? 'Khung xem trước (iframe) chặn quyền chọn thư mục trên ổ đĩa. Hãy bấm "Mở Tab Riêng" để mở trực tiếp trên Chrome/Edge.'
+          : 'Trình duyệt chặn chọn thư mục ở chế độ hiện tại. Hãy thử nút "Lưu Qua Save As".';
+      }
+      if (
+        (err instanceof DOMException && err.name === 'InvalidStateError') ||
+        (err instanceof Error && err.message.includes('already active'))
+      ) {
+        return 'Trình duyệt đang có một hộp thoại chọn tệp/thư mục mở ẩn ở nền (kiểm tra Taskbar / Alt+Tab để đóng nó hoặc bấm F5 tải lại trang), sau đó ưu tiên chọn "Lưu Qua Save As" nếu muốn lưu ra Desktop.';
+      }
       if (err instanceof DOMException && err.name === 'AbortError') {
+        if (!browserDirHandle && browserExportMode !== 'save_as') {
+          return 'Chưa chọn được thư mục mới. Lưu ý: Chrome/Edge không cho chọn trực tiếp Desktop/Documents bằng nút Chọn Thư Mục — hãy tạo 1 thư mục con riêng (vd: D:\\NhacXuat) hoặc bấm "Lưu Qua Save As".';
+        }
         return null;
       }
       return err instanceof Error ? err.message : 'Không thể truy cập thư mục đã chọn.';
+    }
+  };
+
+  const handleEnableSaveAsMode = () => {
+    setBrowserExportMode('save_as');
+    try {
+      localStorage.setItem(EXPORT_MODE_STORAGE_KEY, 'save_as');
+    } catch {
+      // Ignore storage errors
     }
   };
 
@@ -502,6 +557,13 @@ export const App: React.FC = () => {
       return;
     }
     setBrowserDirHandle(null);
+    setBrowserExportMode('downloads');
+    void clearBrowserExportDirHandle();
+    try {
+      localStorage.removeItem(EXPORT_MODE_STORAGE_KEY);
+    } catch {
+      // Ignore storage errors
+    }
   };
 
   const handleOpenExportFolder = () => {
@@ -580,6 +642,63 @@ export const App: React.FC = () => {
       };
     }
 
+    // Acquire browser directory permission or single-file Save As handle immediately while user activation is active
+    let prePickedSaveHandle: BrowserFileHandle | null = null;
+    let selectedDirHandle: BrowserDirectoryHandle | null = browserDirHandle;
+    if (!isDesktopRuntime && browserExportMode === 'save_as') {
+      try {
+        if (target === 'all_stems') {
+          if (!selectedDirHandle) {
+            selectedDirHandle = await pickBrowserDirectoryHandle();
+            setBrowserDirHandle(selectedDirHandle);
+          }
+          const ok = await ensureDirectoryWritePermission(selectedDirHandle, true);
+          if (!ok) {
+            throw new Error('Trình duyệt từ chối quyền ghi vào thư mục đã chọn.');
+          }
+        } else {
+          const ext = format === 'flac' ? 'flac' : 'wav';
+          const expectedName =
+            target === 'karaoke_backing'
+              ? `${baseName}_karaoke_with_backing.${ext}`
+              : `${baseName}.${ext}`;
+          prePickedSaveHandle = await pickSaveFileHandle(expectedName, format);
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          return {
+            files: [],
+            destinationLabel: exportFolderLabel,
+            savedToLocalFolder: false,
+            errorMessage: 'Đã hủy hộp thoại chọn nơi lưu — chưa ghi file.',
+          };
+        }
+        if (
+          (err instanceof DOMException && err.name === 'InvalidStateError') ||
+          (err instanceof Error && err.message.includes('already active'))
+        ) {
+          return {
+            files: [],
+            destinationLabel: exportFolderLabel,
+            savedToLocalFolder: false,
+            errorMessage:
+              'Hộp thoại chọn thư mục trước đó vẫn đang mở ẩn trong trình duyệt (`File picker already active`). Hãy nhấn Alt+Tab đóng hộp thoại cũ hoặc nhấn F5 tải lại trang, rồi bấm trực tiếp "Lưu Qua Save As".',
+          };
+        }
+        throw err;
+      }
+    } else if (!isDesktopRuntime && browserExportMode === 'directory') {
+      if (!selectedDirHandle) {
+        throw new Error('Không tìm thấy quyền thư mục đã chọn. Vui lòng bấm "Chọn Thư Mục..." lại.');
+      }
+      const permitted = await ensureDirectoryWritePermission(selectedDirHandle, true);
+      if (!permitted) {
+        throw new Error(
+          `Chưa được cấp quyền ghi vào thư mục "${selectedDirHandle.name}". Hãy bấm "Chọn Thư Mục..." lại để cấp quyền.`
+        );
+      }
+    }
+
     const outputs = engine.renderExportAudioFiles(
       baseName,
       stems,
@@ -602,10 +721,21 @@ export const App: React.FC = () => {
       };
     }
 
-    if (browserDirHandle) {
+    if (prePickedSaveHandle && outputs.length === 1) {
+      const writable = await prePickedSaveHandle.createWritable();
+      await writable.write(outputs[0].blob);
+      await writable.close();
+      return {
+        files: [prePickedSaveHandle.name],
+        destinationLabel: 'vị trí Save As đã chọn',
+        savedToLocalFolder: true,
+      };
+    }
+
+    if (selectedDirHandle) {
       const savedNames: string[] = [];
       for (const item of outputs) {
-        const fileHandle = await browserDirHandle.getFileHandle(item.fileName, {
+        const fileHandle = await selectedDirHandle.getFileHandle(item.fileName, {
           create: true,
         });
         const writable = await fileHandle.createWritable();
@@ -615,7 +745,7 @@ export const App: React.FC = () => {
       }
       return {
         files: savedNames,
-        destinationLabel: `thư mục "${browserDirHandle.name}"`,
+        destinationLabel: `thư mục "${selectedDirHandle.name}"`,
         savedToLocalFolder: true,
       };
     }
@@ -1289,8 +1419,12 @@ export const App: React.FC = () => {
           settings={pitchSpeed}
           exportFolderLabel={exportFolderLabel}
           isCustomExportFolder={isCustomExportFolder}
+          isSaveAsMode={!isDesktopRuntime && browserExportMode === 'save_as'}
+          supportsSaveAs={browserSaveAsCapable}
+          isInIframe={embeddedFrame}
           canOpenExportFolder={canOpenExportFolder}
           onPickExportFolder={handlePickExportFolder}
+          onEnableSaveAsMode={browserSaveAsCapable ? handleEnableSaveAsMode : undefined}
           onResetExportFolder={handleResetExportFolder}
           onOpenExportFolder={handleOpenExportFolder}
           onClose={() => setIsExportModalOpen(false)}

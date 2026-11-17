@@ -3,6 +3,7 @@ import {
   AlertCircle,
   CheckCircle2,
   Download,
+  ExternalLink,
   FileAudio,
   FolderOpen,
   RotateCcw,
@@ -29,8 +30,12 @@ interface ExportModalProps {
   settings: PitchSpeedSettings;
   exportFolderLabel: string;
   isCustomExportFolder: boolean;
+  isSaveAsMode?: boolean;
+  supportsSaveAs?: boolean;
+  isInIframe?: boolean;
   canOpenExportFolder: boolean;
   onPickExportFolder: () => Promise<string | null>;
+  onEnableSaveAsMode?: () => void;
   onResetExportFolder: () => void;
   onOpenExportFolder: () => void;
   onClose: () => void;
@@ -47,8 +52,12 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   settings,
   exportFolderLabel,
   isCustomExportFolder,
+  isSaveAsMode = false,
+  supportsSaveAs = false,
+  isInIframe = false,
   canOpenExportFolder,
   onPickExportFolder,
+  onEnableSaveAsMode,
   onResetExportFolder,
   onOpenExportFolder,
   onClose,
@@ -210,25 +219,69 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             <label className="block text-xs font-bold uppercase tracking-wider text-slate-300 mb-2">
               3. Thư mục lưu file xuất
             </label>
-            <div className="rounded-xl border border-white/10 bg-[#080B14] p-3">
+            <div
+              className={`rounded-xl border p-3 transition-colors ${
+                isCustomExportFolder
+                  ? 'border-emerald-500/40 bg-emerald-500/5'
+                  : 'border-white/10 bg-[#080B14]'
+              }`}
+            >
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="min-w-0 flex-1">
-                  <div className="text-[11px] text-slate-400">
-                    {isCustomExportFolder ? 'Thư mục đã chọn:' : 'Thư mục mặc định:'}
+                  <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                    <span className="text-slate-400">
+                      {isCustomExportFolder ? 'Nơi lưu đã chọn:' : 'Mặc định hiện tại:'}
+                    </span>
+                    <span
+                      className={`rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold ${
+                        isCustomExportFolder
+                          ? 'bg-emerald-500/20 text-emerald-300'
+                          : 'bg-slate-800 text-slate-400'
+                      }`}
+                    >
+                      {isSaveAsMode
+                        ? 'Hỏi nơi lưu (Save As)'
+                        : isCustomExportFolder
+                          ? 'Ghi trực tiếp (không qua Downloads)'
+                          : 'Downloads trình duyệt'}
+                    </span>
                   </div>
                   <div
                     title={exportFolderLabel}
-                    className="mt-0.5 truncate font-mono text-xs font-semibold text-white"
+                    className="mt-1 truncate font-mono text-xs font-semibold text-white"
                   >
                     {exportFolderLabel}
                   </div>
                 </div>
-                <div className="flex items-center gap-1.5 shrink-0">
+                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                  {supportsSaveAs && onEnableSaveAsMode && (
+                    <button
+                      type="button"
+                      disabled={isPickingFolder || isExporting}
+                      onClick={() => {
+                        setFolderWarning(null);
+                        onEnableSaveAsMode();
+                      }}
+                      title="Khuyên dùng trên trình duyệt: Mở hộp thoại Save As khi xuất để lưu vào Desktop, Documents hoặc bất kỳ thư mục nào"
+                      className={`cursor-pointer inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                        isSaveAsMode
+                          ? 'border-emerald-400/60 bg-emerald-500/20 text-emerald-200'
+                          : 'border-indigo-500/40 bg-indigo-500/15 text-indigo-200 hover:bg-indigo-500/25'
+                      }`}
+                    >
+                      <span>Lưu Qua Save As</span>
+                    </button>
+                  )}
                   <button
                     type="button"
-                    disabled={isPickingFolder}
+                    disabled={isPickingFolder || isExporting}
                     onClick={handlePickFolder}
-                    className="cursor-pointer inline-flex items-center gap-1.5 rounded-lg border border-indigo-500/40 bg-indigo-500/15 px-3 py-1.5 text-xs font-semibold text-indigo-200 transition-colors hover:bg-indigo-500/25 disabled:opacity-60"
+                    title={
+                      supportsSaveAs
+                        ? 'Chọn thư mục con cố định (trình duyệt không hỗ trợ chọn trực tiếp Desktop/Documents)'
+                        : 'Chọn thư mục lưu file'
+                    }
+                    className="cursor-pointer inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-slate-800/80 px-3 py-1.5 text-xs font-semibold text-slate-200 transition-colors hover:border-indigo-400/50 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     <FolderOpen className="h-3.5 w-3.5" />
                     <span>{isPickingFolder ? 'Đang Mở...' : 'Chọn Thư Mục...'}</span>
@@ -236,9 +289,13 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                   {isCustomExportFolder && (
                     <button
                       type="button"
-                      onClick={onResetExportFolder}
+                      disabled={isPickingFolder || isExporting}
+                      onClick={() => {
+                        setFolderWarning(null);
+                        onResetExportFolder();
+                      }}
                       title="Quay lại thư mục mặc định"
-                      className="cursor-pointer inline-flex items-center gap-1 rounded-lg border border-white/10 bg-slate-800/80 px-2.5 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-700 hover:text-white"
+                      className="cursor-pointer inline-flex items-center gap-1 rounded-lg border border-white/10 bg-slate-800/80 px-2.5 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-700 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       <RotateCcw className="h-3.5 w-3.5" />
                       <span>Mặc Định</span>
@@ -246,10 +303,28 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                   )}
                 </div>
               </div>
+              {supportsSaveAs && (
+                <p className="mt-2 text-[11px] text-slate-400">
+                  Mẹo: Muốn lưu trực tiếp ra <strong>Desktop</strong> hoặc <strong>Documents</strong> trên trình duyệt, hãy chọn <strong>Lưu Qua Save As</strong> (Chrome chặn chọn trực tiếp thư mục hệ thống trong <em>Chọn Thư Mục...</em>).
+                </p>
+              )}
               {folderWarning && (
-                <div className="mt-2 flex items-start gap-1.5 text-[11px] text-amber-300">
-                  <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
-                  <span>{folderWarning}</span>
+                <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
+                  <div className="flex items-start gap-1.5 flex-1">
+                    <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5 text-amber-400" />
+                    <span>{folderWarning}</span>
+                  </div>
+                  {isInIframe && typeof window !== 'undefined' && (
+                    <a
+                      href={window.location.href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 rounded-md border border-amber-400/40 bg-amber-500/20 px-2.5 py-1 font-semibold text-amber-100 hover:bg-amber-500/30 shrink-0"
+                    >
+                      <span>Mở Tab Riêng</span>
+                      <ExternalLink className="h-3 w-3" />
+                    </a>
+                  )}
                 </div>
               )}
             </div>
@@ -281,9 +356,21 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           </button>
 
           {exportOutcome && exportOutcome.errorMessage && (
-            <div className="flex items-start gap-2 rounded-xl border border-rose-500/35 bg-rose-500/15 px-4 py-2.5 text-xs text-rose-200">
-              <AlertCircle className="h-4 w-4 text-rose-400 shrink-0 mt-0.5" />
-              <span>Không thể lưu file: {exportOutcome.errorMessage}</span>
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-rose-500/35 bg-rose-500/15 px-4 py-2.5 text-xs text-rose-200">
+              <div className="flex items-start gap-2 flex-1">
+                <AlertCircle className="h-4 w-4 text-rose-400 shrink-0 mt-0.5" />
+                <span>Không thể lưu file: {exportOutcome.errorMessage}</span>
+              </div>
+              {(exportOutcome.errorMessage.includes('File picker already active') ||
+                exportOutcome.errorMessage.includes('F5')) && (
+                <button
+                  type="button"
+                  onClick={() => window.location.reload()}
+                  className="cursor-pointer rounded-lg border border-rose-400/40 bg-rose-500/25 px-2.5 py-1 text-[11px] font-bold text-white hover:bg-rose-500/40 shrink-0"
+                >
+                  Tải Lại Trang
+                </button>
+              )}
             </div>
           )}
 
@@ -326,9 +413,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           </button>
           <button
             type="button"
-            disabled={isExporting}
+            disabled={isExporting || isPickingFolder}
             onClick={handleStartExport}
-            className="cursor-pointer inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-5 py-2 text-xs font-bold text-slate-950 transition-colors hover:bg-emerald-400 disabled:opacity-60"
+            className="cursor-pointer inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-5 py-2 text-xs font-bold text-slate-950 transition-colors hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Download className="h-4 w-4" />
             {isExporting ? 'Đang Render...' : 'Bắt Đầu Xuất File'}
