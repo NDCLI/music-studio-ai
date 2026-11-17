@@ -1,7 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   AudioWaveform,
-  Cpu,
   Download,
   Film,
   FolderOpen,
@@ -15,12 +14,9 @@ interface StudioHeaderProps {
   song: SongMetadata | null;
   semitones: number;
   speed: number;
-  installedModelCount: number;
-  totalModelCount: number;
   onSelectAudioFile: (file: File) => void;
   onRequestOpenTrack?: () => void;
   onOpenYouTubeModal: () => void;
-  onOpenModelManager: () => void;
   onOpenExportModal: () => void;
 }
 
@@ -28,12 +24,9 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
   song,
   semitones,
   speed,
-  installedModelCount,
-  totalModelCount,
   onSelectAudioFile,
   onRequestOpenTrack,
   onOpenYouTubeModal,
-  onOpenModelManager,
   onOpenExportModal,
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -204,20 +197,6 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
           >
             <Play className="h-3 w-3 fill-current text-rose-400" />
             <span>{isScrolled ? 'YouTube' : 'Lọc Link YouTube'}</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={onOpenModelManager}
-            className={`cursor-pointer inline-flex items-center gap-1.5 rounded-xl border border-indigo-500/30 bg-indigo-500/10 text-xs font-semibold text-indigo-300 transition-colors duration-200 hover:bg-indigo-500/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
-              isScrolled ? 'px-2.5 py-1.5' : 'px-3 py-2'
-            }`}
-          >
-            <Cpu className="h-3.5 w-3.5 text-indigo-400" />
-            <span>{isScrolled ? 'AI' : 'Model AI'}</span>
-            <span className="rounded-md bg-indigo-500/30 px-1.5 py-0.5 font-mono text-[10px] text-white">
-              {installedModelCount}/{totalModelCount}
-            </span>
           </button>
 
           <button

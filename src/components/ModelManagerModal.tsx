@@ -7,18 +7,26 @@ import {
   Cpu,
   Download,
   ExternalLink,
+  FolderOpen,
   FolderPlus,
   Loader2,
   Pause,
+  RefreshCw,
+  Settings,
   Trash2,
   X,
 } from 'lucide-react';
-import { LocalAiModelSpec } from '../types/studio';
+import { ComputeDeviceMode, LocalAiModelSpec } from '../types/studio';
 import { openExternalUrl } from '../services/tauriBridge';
 
 interface ModelManagerModalProps {
   isOpen: boolean;
   models: LocalAiModelSpec[];
+  computeDevice?: ComputeDeviceMode;
+  onChangeComputeDevice?: (device: ComputeDeviceMode) => void;
+  modelsDir?: string | null;
+  onOpenModelsFolder?: () => void;
+  onOpenUpdateCheck?: () => void;
   onClose: () => void;
   onDownloadModel: (modelId: string) => void;
   onPauseDownload: (modelId: string) => void;
@@ -35,6 +43,11 @@ function formatBytesMb(bytes?: number): string {
 export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
   isOpen,
   models,
+  computeDevice = 'auto',
+  onChangeComputeDevice,
+  modelsDir,
+  onOpenModelsFolder,
+  onOpenUpdateCheck,
   onClose,
   onDownloadModel,
   onPauseDownload,
@@ -45,6 +58,7 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [importTargetId, setImportTargetId] = useState<string | null>(null);
   const [copiedModelId, setCopiedModelId] = useState<string | null>(null);
+  const [copiedDir, setCopiedDir] = useState(false);
 
   if (!isOpen) return null;
 
@@ -124,6 +138,104 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
           >
             <X className="h-4 w-4" />
           </button>
+        </div>
+
+        {/* Settings Strip: Compute Device, Cache Folder & App Update */}
+        <div className="border-b border-white/10 bg-[#080B14]/75 px-6 py-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <span className="inline-flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-300">
+                <Settings className="h-3.5 w-3.5 text-indigo-400" />
+                <span>Cài Đặt Model &amp; Xử Lý</span>
+              </span>
+
+              {onChangeComputeDevice && (
+                <div
+                  role="radiogroup"
+                  aria-label="Thiết bị suy luận mặc định"
+                  className="inline-flex items-center rounded-lg border border-white/10 bg-[#0F1424] p-0.5"
+                >
+                  {(
+                    [
+                      { id: 'auto', label: 'AUTO' },
+                      { id: 'gpu', label: 'GPU (DirectML)' },
+                      { id: 'cpu', label: 'CPU' },
+                    ] as const
+                  ).map((opt) => {
+                    const active = computeDevice === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        role="radio"
+                        aria-checked={active}
+                        onClick={() => onChangeComputeDevice(opt.id)}
+                        className={`cursor-pointer rounded-md px-2.5 py-1 font-mono text-[11px] font-bold transition-colors ${
+                          active
+                            ? 'bg-indigo-600 text-white shadow'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="inline-flex max-w-[340px] items-center gap-1.5 rounded-lg border border-white/10 bg-[#0F1424] px-2.5 py-1 text-[11px] text-slate-300">
+                <span className="text-slate-500">Thư mục:</span>
+                <span
+                  className="truncate font-mono text-[10px] text-slate-200"
+                  title={modelsDir || 'Bộ nhớ đệm trình duyệt (IndexedDB Offline)'}
+                >
+                  {modelsDir || 'IndexedDB Offline (Web)'}
+                </span>
+                {modelsDir && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void navigator.clipboard?.writeText(modelsDir);
+                      setCopiedDir(true);
+                      window.setTimeout(() => setCopiedDir(false), 1800);
+                    }}
+                    title="Sao chép đường dẫn thư mục model"
+                    className="cursor-pointer rounded p-0.5 text-slate-400 hover:bg-white/10 hover:text-white"
+                  >
+                    {copiedDir ? (
+                      <Check className="h-3 w-3 text-emerald-400" />
+                    ) : (
+                      <Copy className="h-3 w-3" />
+                    )}
+                  </button>
+                )}
+              </div>
+
+              {modelsDir && onOpenModelsFolder && (
+                <button
+                  type="button"
+                  onClick={onOpenModelsFolder}
+                  className="cursor-pointer inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-slate-800/80 px-2.5 py-1 text-[11px] font-semibold text-slate-200 transition-colors hover:bg-slate-700 hover:text-white"
+                >
+                  <FolderOpen className="h-3.5 w-3.5 text-amber-400" />
+                  <span>Mở Thư Mục</span>
+                </button>
+              )}
+
+              {onOpenUpdateCheck && (
+                <button
+                  type="button"
+                  onClick={onOpenUpdateCheck}
+                  className="cursor-pointer inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/20"
+                >
+                  <RefreshCw className="h-3.5 w-3.5 text-emerald-400" />
+                  <span>Kiểm Tra Cập Nhật</span>
+                </button>
+              )}
+            </div>
+          </div>
         </div>
 
         {/* Models Cards */}

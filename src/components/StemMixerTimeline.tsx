@@ -197,7 +197,7 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
   return (
     <section
       aria-label="AI Stem Separation and Multi-Stem Mixer"
-      className="mx-4 mt-4 mb-6 rounded-2xl border border-white/10 bg-[#0F1424]/90 p-5 shadow-2xl backdrop-blur-xl"
+      className="mx-4 mt-3 mb-6 rounded-2xl border border-white/10 bg-[#0F1424]/90 p-5 shadow-2xl backdrop-blur-xl"
     >
       {/* Top Bar: AI Stem Separation Pipeline Controls */}
       <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-4">

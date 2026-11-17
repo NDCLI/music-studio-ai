@@ -1,10 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { AlertCircle, CheckCircle2, FolderOpen, Upload, X } from 'lucide-react';
 import { StudioHeader } from './components/StudioHeader';
+import { StudioToolbar } from './components/StudioToolbar';
 import { TransportBar } from './components/TransportBar';
 import { PitchSpeedDeck } from './components/PitchSpeedDeck';
 import { StemMixerTimeline } from './components/StemMixerTimeline';
+import { WorkspaceTabs, type StudioWorkspaceTab } from './components/WorkspaceTabs';
 import { ModelManagerModal } from './components/ModelManagerModal';
+import { UpdateModal } from './components/UpdateModal';
 import { ExportModal, ExportFormat, ExportOutcome, ExportTarget } from './components/ExportModal';
 import { YouTubeImportModal } from './components/YouTubeImportModal';
 import { LOCAL_AI_MODELS } from './data/modelsCatalog';
@@ -50,6 +53,11 @@ import {
   syncPitchSpeedToRustBackend,
 } from './services/tauriBridge';
 import {
+  checkForAppUpdates,
+  type AppUpdateCheckResult,
+} from './services/updateChecker';
+import {
+  ComputeDeviceMode,
   LocalAiModelSpec,
   PitchSpeedSettings,
   SeparationPresetId,
@@ -63,6 +71,8 @@ import {
 
 const EXPORT_DIR_STORAGE_KEY = 'music_studio_export_dir';
 const EXPORT_MODE_STORAGE_KEY = 'music_studio_browser_export_mode';
+const ACTIVE_TAB_STORAGE_KEY = 'music_studio_active_workspace_tab';
+const COMPUTE_DEVICE_STORAGE_KEY = 'music_studio_compute_device';
 
 const VIDEO_EXTENSIONS = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'm4v'];
 
@@ -176,9 +186,71 @@ export const App: React.FC = () => {
     });
 
   const [models, setModels] = useState<LocalAiModelSpec[]>(LOCAL_AI_MODELS);
+  const [modelsDir, setModelsDir] = useState<string | null>(null);
+  const [computeDevice, setComputeDevice] = useState<ComputeDeviceMode>(() => {
+    try {
+      const saved = localStorage.getItem(COMPUTE_DEVICE_STORAGE_KEY);
+      if (saved === 'auto' || saved === 'gpu' || saved === 'cpu') return saved;
+    } catch {
+      // Ignore storage read errors
+    }
+    return 'auto';
+  });
+
+  const handleChangeComputeDevice = (device: ComputeDeviceMode) => {
+    setComputeDevice(device);
+    try {
+      localStorage.setItem(COMPUTE_DEVICE_STORAGE_KEY, device);
+    } catch {
+      // Ignore storage write errors
+    }
+  };
+
   const [isYouTubeModalOpen, setIsYouTubeModalOpen] = useState(false);
   const [isModelModalOpen, setIsModelModalOpen] = useState(false);
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+  const [isUpdateModalOpen, setIsUpdateModalOpen] = useState(false);
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
+  const [updateCheckResult, setUpdateCheckResult] = useState<AppUpdateCheckResult | null>(null);
+  const [updateCheckError, setUpdateCheckError] = useState<string | null>(null);
+
+  const handleCheckForUpdates = async () => {
+    setIsUpdateModalOpen(true);
+    setIsCheckingUpdate(true);
+    setUpdateCheckError(null);
+    try {
+      const result = await checkForAppUpdates();
+      setUpdateCheckResult(result);
+    } catch (err) {
+      setUpdateCheckError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsCheckingUpdate(false);
+    }
+  };
+
+  const handleOpenModelsFolder = () => {
+    if (modelsDir && isTauriDesktopRuntime()) {
+      void openLocalFolderViaRust(modelsDir).catch(() => {});
+    }
+  };
+  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<StudioWorkspaceTab>(() => {
+    try {
+      const saved = localStorage.getItem(ACTIVE_TAB_STORAGE_KEY);
+      if (saved === 'pitch_speed' || saved === 'separation') return saved;
+    } catch {
+      // Ignore storage read errors
+    }
+    return 'separation';
+  });
+
+  const handleChangeWorkspaceTab = (tab: StudioWorkspaceTab) => {
+    setActiveWorkspaceTab(tab);
+    try {
+      localStorage.setItem(ACTIVE_TAB_STORAGE_KEY, tab);
+    } catch {
+      // Ignore storage write errors
+    }
+  };
 
   const [defaultExportDir, setDefaultExportDir] = useState<string | null>(null);
   const [customExportDir, setCustomExportDir] = useState<string | null>(() => {
@@ -244,6 +316,9 @@ export const App: React.FC = () => {
       listCachedModelsFromDb().catch(() => ({} as Record<string, { sizeBytes: number; sha256Hex: string; source: 'huggingface' | 'local_import' }>)),
       listModelsViaRustBackend().catch(() => null),
     ]).then(([dbMap, rustOverview]) => {
+      if (rustOverview?.models_dir) {
+        setModelsDir(rustOverview.models_dir);
+      }
       const rustMap = new Map(
         (rustOverview?.cached_status ?? []).map((item) => [item.id, item])
       );
@@ -862,18 +937,25 @@ export const App: React.FC = () => {
 
     if (isTauriDesktopRuntime()) {
       const startedAt = performance.now();
+      const useGpu = computeDevice !== 'cpu';
+      const deviceLabel =
+        computeDevice === 'cpu'
+          ? 'CPU đa luồng'
+          : computeDevice === 'gpu'
+            ? 'GPU (DirectML)'
+            : 'AUTO (Ưu tiên GPU)';
       setSeparationToast(null);
       setSeparationStatus({
         isRunning: true,
         isSeparated: false,
         currentStage: 1,
         progressPercent: 15,
-        stageMessage: 'Đang chạy suy luận 3 tầng AI ONNX cục bộ...',
+        stageMessage: `Đang chạy suy luận 3 tầng AI ONNX (${deviceLabel})...`,
       });
 
       try {
         const rustMode = qualityMode === 'pro_roformer' ? 'ProRoformer' : 'FastMdx';
-        const res = await runSeparationViaRustBackend(rustMode, true);
+        const res = await runSeparationViaRustBackend(rustMode, useGpu);
         const wavRes = await getSeparatedStemsWavViaRust();
 
         const [lead, backing, inst, rev] = await Promise.all([
@@ -1283,13 +1365,26 @@ export const App: React.FC = () => {
         song={song}
         semitones={pitchSpeed.semitones}
         speed={pitchSpeed.speed}
-        installedModelCount={installedCount}
-        totalModelCount={models.length}
         onSelectAudioFile={handleSelectAudioFile}
         onRequestOpenTrack={isTauriDesktopRuntime() ? () => void handleDesktopOpenTrack() : undefined}
         onOpenYouTubeModal={() => setIsYouTubeModalOpen(true)}
-        onOpenModelManager={() => setIsModelModalOpen(true)}
         onOpenExportModal={() => setIsExportModalOpen(true)}
+      />
+
+      {/* 1B. Studio Toolbar: Compute Device, Model & App Settings/Update */}
+      <StudioToolbar
+        computeDevice={computeDevice}
+        onChangeComputeDevice={handleChangeComputeDevice}
+        qualityMode={qualityMode}
+        onChangeQualityMode={setQualityMode}
+        models={models}
+        installedModelCount={installedCount}
+        isCheckingUpdate={isCheckingUpdate}
+        updateAvailableVersion={
+          updateCheckResult?.hasUpdate ? updateCheckResult.latestVersion : null
+        }
+        onOpenModelManager={() => setIsModelModalOpen(true)}
+        onCheckForUpdates={() => void handleCheckForUpdates()}
       />
 
       {/* Real Track Loader Dropzone when empty or error occurred */}
@@ -1360,35 +1455,56 @@ export const App: React.FC = () => {
         onToggleLimiter={() => setLimiterEnabled(!limiterEnabled)}
       />
 
-      {/* 3. Main Pitch Shifting & Speed Control Deck */}
+      {/* 3. Studio Workspace Tabs & Active Feature Panel */}
       <main className="flex-1">
-        <PitchSpeedDeck
-          settings={pitchSpeed}
-          originalKey={song?.originalKey ?? '--'}
-          originalBpm={song?.originalBpm ?? 0}
-          onUpdateSettings={handleUpdatePitchSpeed}
-          onResetPitchSpeed={handleResetPitchSpeed}
+        <WorkspaceTabs
+          activeTab={activeWorkspaceTab}
+          onChangeTab={handleChangeWorkspaceTab}
+          hasLoadedTrack={hasLoadedTrack}
+          separationStatus={separationStatus}
+          pitchSpeed={pitchSpeed}
         />
 
-        {/* 4. Local AI Stem Separation & 4-Track Waveform Mixer */}
-        <StemMixerTimeline
-          hasLoadedTrack={hasLoadedTrack}
-          stems={stems}
-          currentTimeSec={currentTimeSec}
-          durationSec={song?.durationSec ?? 0}
-          qualityMode={qualityMode}
-          activePreset={activePreset}
-          separationStatus={separationStatus}
-          onChangeQualityMode={setQualityMode}
-          onRunSeparation={() => void handleRunSeparation()}
-          onRunSpectralFallback={() => void runSpectralSeparation()}
-          onOpenModelManager={() => setIsModelModalOpen(true)}
-          onApplyPreset={handleApplyPreset}
-          onToggleMute={handleToggleMute}
-          onToggleSolo={handleToggleSolo}
-          onChangeStemVolume={handleChangeStemVolume}
-          onSeek={handleSeek}
-        />
+        {activeWorkspaceTab === 'separation' ? (
+          <div
+            id="panel-separation"
+            role="tabpanel"
+            aria-labelledby="tab-separation"
+          >
+            <StemMixerTimeline
+              hasLoadedTrack={hasLoadedTrack}
+              stems={stems}
+              currentTimeSec={currentTimeSec}
+              durationSec={song?.durationSec ?? 0}
+              qualityMode={qualityMode}
+              activePreset={activePreset}
+              separationStatus={separationStatus}
+              onChangeQualityMode={setQualityMode}
+              onRunSeparation={() => void handleRunSeparation()}
+              onRunSpectralFallback={() => void runSpectralSeparation()}
+              onOpenModelManager={() => setIsModelModalOpen(true)}
+              onApplyPreset={handleApplyPreset}
+              onToggleMute={handleToggleMute}
+              onToggleSolo={handleToggleSolo}
+              onChangeStemVolume={handleChangeStemVolume}
+              onSeek={handleSeek}
+            />
+          </div>
+        ) : (
+          <div
+            id="panel-pitch-speed"
+            role="tabpanel"
+            aria-labelledby="tab-pitch-speed"
+          >
+            <PitchSpeedDeck
+              settings={pitchSpeed}
+              originalKey={song?.originalKey ?? '--'}
+              originalBpm={song?.originalBpm ?? 0}
+              onUpdateSettings={handleUpdatePitchSpeed}
+              onResetPitchSpeed={handleResetPitchSpeed}
+            />
+          </div>
+        )}
       </main>
 
       {/* Modals */}
@@ -1400,6 +1516,16 @@ export const App: React.FC = () => {
       <ModelManagerModal
         isOpen={isModelModalOpen}
         models={models}
+        computeDevice={computeDevice}
+        onChangeComputeDevice={handleChangeComputeDevice}
+        modelsDir={modelsDir}
+        onOpenModelsFolder={
+          isTauriDesktopRuntime() && modelsDir ? handleOpenModelsFolder : undefined
+        }
+        onOpenUpdateCheck={() => {
+          setIsModelModalOpen(false);
+          void handleCheckForUpdates();
+        }}
         onClose={() => setIsModelModalOpen(false)}
         onDownloadModel={handleDownloadModel}
         onPauseDownload={handlePauseDownload}
@@ -1410,6 +1536,15 @@ export const App: React.FC = () => {
             : undefined
         }
         onDeleteCachedModel={handleDeleteCachedModel}
+      />
+
+      <UpdateModal
+        isOpen={isUpdateModalOpen}
+        isChecking={isCheckingUpdate}
+        result={updateCheckResult}
+        errorMsg={updateCheckError}
+        onCheckAgain={() => void handleCheckForUpdates()}
+        onClose={() => setIsUpdateModalOpen(false)}
       />
 
       {song && (

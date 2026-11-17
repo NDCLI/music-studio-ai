@@ -752,9 +752,9 @@ pub fn handle_run_separation(
         instrumental: separated.instrumental.compute_waveform_peaks(140),
         reverb_tail: separated.reverb_tail.compute_waveform_peaks(140),
         execution_backend: if use_directml {
-            "ONNX Runtime DirectML GPU (ort load-dynamic)".to_string()
+            "AI ONNX (GPU / DirectML)".to_string()
         } else {
-            "ONNX Runtime CPU Multi-Threaded (ort load-dynamic)".to_string()
+            "AI ONNX (CPU đa luồng)".to_string()
         },
     };
 

@@ -43,7 +43,7 @@ export const PitchSpeedDeck: React.FC<PitchSpeedDeckProps> = ({
   return (
     <section
       aria-label="Pitch Shifting and Time Stretching Studio Deck"
-      className="mx-4 mt-3 grid grid-cols-1 gap-4 lg:grid-cols-12"
+      className="mx-4 mt-3 mb-6 grid grid-cols-1 gap-4 lg:grid-cols-12"
     >
       {/* LEFT DECK (7 cols): PITCH SHIFTER & FORMANT PRESERVATION */}
       <div className="lg:col-span-7 rounded-2xl border border-white/10 bg-[#0F1424]/90 p-5 shadow-xl backdrop-blur-xl">

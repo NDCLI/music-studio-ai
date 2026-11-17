@@ -11,6 +11,8 @@ export type SeparationPresetId =
 
 export type SeparationQualityMode = 'fast_mdx' | 'pro_roformer';
 
+export type ComputeDeviceMode = 'auto' | 'gpu' | 'cpu';
+
 export type TrackSourceType =
   | 'studio_demo'
   | 'audio_file'
