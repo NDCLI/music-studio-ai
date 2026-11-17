@@ -1155,6 +1155,128 @@ pub mod tauri_commands {
         .await
         .map_err(|e| format!("Export worker panicked: {}", e))?
     }
+
+    #[tauri::command]
+    pub async fn ipc_download_and_install_update(
+        app: tauri::AppHandle,
+        installer_url: String,
+        file_name: String,
+    ) -> Result<(), String> {
+        use std::io::{Read, Write};
+        use tauri::Emitter;
+
+        let trimmed_url = installer_url.trim().to_string();
+        if !trimmed_url.starts_with("https://") {
+            return Err("Invalid update URL".to_string());
+        }
+
+        let safe_name: String = file_name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let target_name = if safe_name.is_empty() {
+            "MusicStudioAI-update-setup.exe".to_string()
+        } else {
+            safe_name
+        };
+
+        let app_for_dl = app.clone();
+        let installer_path = tauri::async_runtime::spawn_blocking(move || -> Result<PathBuf, String> {
+            let update_dir = std::env::temp_dir().join("music_studio_updates");
+            std::fs::create_dir_all(&update_dir)
+                .map_err(|e| format!("Failed to create update directory: {}", e))?;
+            let dest = update_dir.join(&target_name);
+            let part = update_dir.join(format!("{}.part", target_name));
+
+            let agent = ureq::Agent::new_with_defaults();
+            let mut resp = agent
+                .get(&trimmed_url)
+                .call()
+                .map_err(|e| format!("Không tải được bản cập nhật: {}", e))?;
+
+            let total_bytes = resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+
+            let mut file = std::fs::File::create(&part)
+                .map_err(|e| format!("Không tạo được file tạm: {}", e))?;
+            let mut reader = resp.body_mut().as_reader();
+            let mut buf = [0_u8; 64 * 1024];
+            let mut downloaded = 0_u64;
+            let mut last_pct = 0_u8;
+
+            loop {
+                let n = reader
+                    .read(&mut buf)
+                    .map_err(|e| format!("Lỗi đọc dữ liệu cập nhật: {}", e))?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n])
+                    .map_err(|e| format!("Lỗi ghi file cập nhật: {}", e))?;
+                downloaded += n as u64;
+
+                let pct = total_bytes
+                    .filter(|&t| t > 0)
+                    .map(|t| ((downloaded as f64 / t as f64) * 100.0).min(99.0) as u8)
+                    .unwrap_or(50);
+                if pct != last_pct {
+                    last_pct = pct;
+                    let _ = app_for_dl.emit(
+                        "update-progress",
+                        serde_json::json!({
+                            "percent": pct,
+                            "downloadedBytes": downloaded,
+                            "totalBytes": total_bytes
+                        }),
+                    );
+                }
+            }
+
+            file.flush().map_err(|e| e.to_string())?;
+            drop(file);
+            if dest.exists() {
+                let _ = std::fs::remove_file(&dest);
+            }
+            std::fs::rename(&part, &dest)
+                .map_err(|e| format!("Không hoàn tất file cập nhật: {}", e))?;
+
+            let _ = app_for_dl.emit(
+                "update-progress",
+                serde_json::json!({
+                    "percent": 100,
+                    "downloadedBytes": downloaded,
+                    "totalBytes": total_bytes
+                }),
+            );
+            Ok(dest)
+        })
+        .await
+        .map_err(|e| format!("Update worker panicked: {}", e))??;
+
+        let is_msi = installer_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.eq_ignore_ascii_case("msi"))
+            .unwrap_or(false);
+
+        if is_msi {
+            std::process::Command::new("msiexec")
+                .arg("/i")
+                .arg(&installer_path)
+                .spawn()
+                .map_err(|e| format!("Không thể khởi chạy bộ cài MSI: {}", e))?;
+        } else {
+            std::process::Command::new(&installer_path)
+                .spawn()
+                .map_err(|e| format!("Không thể khởi chạy bộ cài EXE: {}", e))?;
+        }
+
+        app.exit(0);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

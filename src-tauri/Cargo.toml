@@ -1,6 +1,6 @@
 [package]
 name = "music-studio-ai"
-version = "0.1.2"
+version = "0.1.3"
 description = "Rust Music Studio AI: Formant-Preserving Pitch/Speed Shifter & Local ONNX Stem Separation"
 edition = "2021"
 

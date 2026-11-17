@@ -1,15 +1,20 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   CheckCircle2,
   Cpu,
   Download,
   ExternalLink,
+  Loader2,
   RefreshCw,
   X,
   AlertCircle,
 } from 'lucide-react';
 import { APP_VERSION, AppUpdateCheckResult } from '../services/updateChecker';
-import { openExternalUrl } from '../services/tauriBridge';
+import {
+  downloadAndInstallUpdateViaRust,
+  isTauriDesktopRuntime,
+  openExternalUrl,
+} from '../services/tauriBridge';
 
 interface UpdateModalProps {
   isOpen: boolean;
@@ -28,7 +33,64 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
   onCheckAgain,
   onClose,
 }) => {
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [updatePercent, setUpdatePercent] = useState(0);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isUpdating) return;
+    let unlisten: (() => void) | undefined;
+    const tauriEvent = (
+      window as unknown as {
+        __TAURI__?: {
+          event?: {
+            listen: (
+              event: string,
+              handler: (ev: { payload: { percent: number } }) => void
+            ) => Promise<() => void>;
+          };
+        };
+      }
+    ).__TAURI__?.event;
+
+    if (tauriEvent?.listen) {
+      void tauriEvent
+        .listen('update-progress', (ev) => {
+          if (typeof ev.payload?.percent === 'number') {
+            setUpdatePercent(ev.payload.percent);
+          }
+        })
+        .then((fn) => {
+          unlisten = fn;
+        });
+    }
+
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [isUpdating]);
+
   if (!isOpen) return null;
+
+  const handleDirectUpdate = async () => {
+    if (!result?.installerUrl) return;
+    if (!isTauriDesktopRuntime()) {
+      void openExternalUrl(result.installerUrl);
+      return;
+    }
+    setUpdateError(null);
+    setUpdatePercent(0);
+    setIsUpdating(true);
+    try {
+      await downloadAndInstallUpdateViaRust(
+        result.installerUrl,
+        result.installerName ?? `MusicStudioAI-v${result.latestVersion}-setup.exe`
+      );
+    } catch (err) {
+      setUpdateError(err instanceof Error ? err.message : String(err));
+      setIsUpdating(false);
+    }
+  };
 
   const formattedDate = result?.publishedAt
     ? new Date(result.publishedAt).toLocaleString('vi-VN')
@@ -106,15 +168,52 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
                       {result.releaseNotes}
                     </p>
                   )}
+                  {isUpdating && (
+                    <div className="rounded-lg bg-black/30 p-2.5 space-y-1.5">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-amber-200 font-semibold">
+                          Đang tải bản cập nhật &amp; chuẩn bị cài đặt...
+                        </span>
+                        <span className="font-mono font-bold text-amber-300">
+                          {updatePercent}%
+                        </span>
+                      </div>
+                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                        <div
+                          className="h-full bg-amber-400 transition-all duration-200"
+                          style={{ width: `${updatePercent}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                  {updateError && (
+                    <p className="text-[11px] text-rose-300">
+                      Lỗi cập nhật: {updateError}
+                    </p>
+                  )}
                   <div className="flex flex-wrap items-center gap-2 pt-1">
                     {result.installerUrl && (
                       <button
                         type="button"
-                        onClick={() => void openExternalUrl(result.installerUrl!)}
-                        className="cursor-pointer inline-flex items-center gap-1.5 rounded-lg bg-amber-400 px-3.5 py-1.5 text-xs font-bold text-slate-950 hover:bg-amber-300"
+                        disabled={isUpdating}
+                        onClick={() => void handleDirectUpdate()}
+                        className="cursor-pointer inline-flex items-center gap-1.5 rounded-lg bg-amber-400 px-3.5 py-1.5 text-xs font-bold text-slate-950 hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-60"
                       >
-                        <Download className="h-3.5 w-3.5" />
-                        <span>Tải bộ cài ({result.installerName ?? '.exe'})</span>
+                        {isUpdating ? (
+                          <>
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            <span>Đang cập nhật ({updatePercent}%)...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Download className="h-3.5 w-3.5" />
+                            <span>
+                              {isTauriDesktopRuntime()
+                                ? `Cập Nhật Ngay (v${result.latestVersion})`
+                                : `Tải bộ cài (${result.installerName ?? '.exe'})`}
+                            </span>
+                          </>
+                        )}
                       </button>
                     )}
                     <button

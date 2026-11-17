@@ -114,6 +114,7 @@ fn main() {
             tauri_commands::ipc_run_separation,
             tauri_commands::ipc_export_separated_stems_b64,
             tauri_commands::ipc_export_audio,
+            tauri_commands::ipc_download_and_install_update,
         ])
         .run(tauri::generate_context!())
         .expect("Failed to start Music Studio AI desktop runtime");

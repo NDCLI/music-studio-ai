@@ -121,6 +121,19 @@ export async function downloadYouTubeAudioViaRust(rawUrl: string): Promise<strin
   return invokeRustCommand<string>('ipc_download_youtube_audio', { rawUrl });
 }
 
+export async function downloadAndInstallUpdateViaRust(
+  installerUrl: string,
+  fileName: string
+): Promise<void> {
+  if (!isTauriDesktopRuntime()) {
+    throw new Error('Cập nhật trực tiếp chỉ khả dụng trên bản Desktop (.exe).');
+  }
+  await invokeRustCommand<void>('ipc_download_and_install_update', {
+    installerUrl,
+    fileName,
+  });
+}
+
 export async function syncPitchSpeedToRustBackend(
   settings: PitchSpeedSettings
 ): Promise<number | null> {
