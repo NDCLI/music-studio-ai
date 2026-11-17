@@ -3,9 +3,11 @@ import {
   AudioWaveform,
   Cpu,
   Download,
+  Film,
   FolderOpen,
   Layers,
   Music2,
+  Play,
   ShieldCheck,
   Sparkles,
 } from 'lucide-react';
@@ -19,6 +21,7 @@ interface StudioHeaderProps {
   installedModelCount: number;
   totalModelCount: number;
   onSelectAudioFile: (file: File) => void;
+  onOpenYouTubeModal: () => void;
   onOpenModelManager: () => void;
   onOpenExportModal: () => void;
 }
@@ -30,6 +33,7 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
   installedModelCount,
   totalModelCount,
   onSelectAudioFile,
+  onOpenYouTubeModal,
   onOpenModelManager,
   onOpenExportModal,
 }) => {
@@ -41,6 +45,38 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
     const file = e.target.files?.[0];
     if (file) {
       onSelectAudioFile(file);
+    }
+  };
+
+  const renderSourceBadge = () => {
+    switch (song.sourceType) {
+      case 'youtube_single':
+        return (
+          <span className="rounded bg-rose-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-rose-300">
+            {song.youtubeInfo?.wasInPlaylist
+              ? `YT SINGLE (#${song.youtubeInfo.playlistIndex ?? 1} IN LIST)`
+              : 'YOUTUBE SINGLE'}
+          </span>
+        );
+      case 'video_file':
+        return (
+          <span className="inline-flex items-center gap-1 rounded bg-amber-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-amber-300">
+            <Film className="h-3 w-3" />
+            VIDEO AUDIO (MP4/MKV)
+          </span>
+        );
+      case 'audio_file':
+        return (
+          <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-emerald-300">
+            LOCAL AUDIO
+          </span>
+        );
+      default:
+        return (
+          <span className="rounded bg-indigo-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-indigo-300">
+            STUDIO DEMO
+          </span>
+        );
     }
   };
 
@@ -63,7 +99,7 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
               </span>
             </div>
             <p className="text-xs text-slate-400">
-              Nâng Hạ Tone Bảo Toàn Formant &bull; Tách Nhạc Nền, Vocal Chính &amp; Bè (Local ONNX)
+              Nâng Hạ Tone Bảo Toàn Formant &bull; Tách Nhạc Nền, Vocal Chính &amp; Bè (Audio / Video MP4, MKV / YouTube)
             </p>
           </div>
         </div>
@@ -71,11 +107,14 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
         {/* Active Song Info & Key/BPM Telemetry */}
         <div className="flex flex-wrap items-center gap-3 rounded-xl border border-white/10 bg-[#080B14]/80 px-4 py-2">
           <Music2 className="h-4 w-4 text-indigo-400" />
-          <div className="min-w-[160px]">
-            <div className="text-xs font-semibold text-slate-100 truncate max-w-[220px]">
-              {song.title}
+          <div className="min-w-[175px]">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-semibold text-slate-100 truncate max-w-[200px]">
+                {song.title}
+              </span>
+              {renderSourceBadge()}
             </div>
-            <div className="font-mono text-[11px] text-slate-400">
+            <div className="font-mono text-[11px] text-slate-400 truncate max-w-[260px]">
               {song.fileName} &bull; {(song.sampleRate / 1000).toFixed(1)}kHz Stereo
             </div>
           </div>
@@ -116,11 +155,11 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
         </div>
 
         {/* Right Studio Actions */}
-        <div className="flex items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2">
           <input
             ref={fileInputRef}
             type="file"
-            accept="audio/*,.mp3,.wav,.flac,.ogg,.m4a"
+            accept="audio/*,video/*,.mp3,.wav,.flac,.ogg,.m4a,.aac,.opus,.mp4,.mkv,.webm,.mov,.avi,.m4v"
             onChange={handleFileChange}
             className="hidden"
           />
@@ -128,10 +167,21 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
+            title="Hỗ trợ cả file Nhạc (MP3, WAV, FLAC, M4A) và file Video (MP4, MKV, WEBM, MOV)"
             className="cursor-pointer inline-flex items-center gap-2 rounded-xl border border-white/15 bg-slate-800/80 px-3.5 py-2 text-xs font-semibold text-slate-200 transition-colors duration-200 hover:border-indigo-400/50 hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
           >
             <FolderOpen className="h-4 w-4 text-indigo-400" />
-            Mở File Nhạc
+            Mở Nhạc / Video (MP4, MKV)
+          </button>
+
+          <button
+            type="button"
+            onClick={onOpenYouTubeModal}
+            title="Dán link YouTube hoặc Playlist YouTube (Tự động chỉ lấy bài đang phát)"
+            className="cursor-pointer inline-flex items-center gap-2 rounded-xl border border-rose-500/35 bg-rose-500/15 px-3.5 py-2 text-xs font-semibold text-rose-200 transition-colors duration-200 hover:bg-rose-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500"
+          >
+            <Play className="h-3.5 w-3.5 fill-current text-rose-400" />
+            Nạp Link YouTube
           </button>
 
           <button
@@ -162,7 +212,7 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
         <div className="flex items-center gap-4">
           <span className="inline-flex items-center gap-1.5 text-slate-300">
             <span className="h-2 w-2 rounded-full bg-emerald-400" />
-            Engine: <strong className="font-mono text-white">ONNX Runtime (ort load-dynamic) + Pure-Rust FFT</strong>
+            Nguồn đầu vào: <strong className="font-mono text-white">MP3/WAV/FLAC + Video MP4/MKV/WEBM + YouTube (Single Track)</strong>
           </span>
           <span className="hidden sm:inline-flex items-center gap-1.5">
             <Layers className="h-3.5 w-3.5 text-indigo-400" />

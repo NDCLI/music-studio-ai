@@ -10,8 +10,9 @@ name = "music-studio-ai"
 path = "src/main.rs"
 
 [dependencies]
-# Pure-Rust audio decoding and WAV/FLAC export (no external ffmpeg.exe sidecar needed)
-symphonia = { version = "0.5", features = ["mp3", "wav", "flac", "ogg", "aac", "isomp4"] }
+# Pure-Rust audio & video container demuxing (MP3, WAV, FLAC, OGG, M4A, MP4, MKV, WEBM, MOV)
+# No external ffmpeg.exe sidecar needed
+symphonia = { version = "0.5", features = ["mp3", "wav", "flac", "ogg", "vorbis", "aac", "isomp4", "mkv", "pcm"] }
 hound = "3.5"
 rubato = "0.15"
 

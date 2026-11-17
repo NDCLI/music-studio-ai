@@ -5,11 +5,13 @@ import { PitchSpeedDeck } from './components/PitchSpeedDeck';
 import { StemMixerTimeline } from './components/StemMixerTimeline';
 import { ModelManagerModal } from './components/ModelManagerModal';
 import { ExportModal } from './components/ExportModal';
+import { YouTubeImportModal } from './components/YouTubeImportModal';
 import { LOCAL_AI_MODELS } from './data/modelsCatalog';
 import {
   generateStemPeaks,
   StudioPreviewAudioEngine,
 } from './services/audioSynthesizer';
+import { YouTubeTrackResolvedInfo } from './services/youtubeParser';
 import {
   LocalAiModelSpec,
   PitchSpeedSettings,
@@ -19,7 +21,17 @@ import {
   SongMetadata,
   StemId,
   StemTrackState,
+  TrackSourceType,
 } from './types/studio';
+
+const VIDEO_EXTENSIONS = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'm4v'];
+
+function detectFileSourceType(file: File): TrackSourceType {
+  if (file.type.startsWith('video/')) return 'video_file';
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+  if (VIDEO_EXTENSIONS.includes(ext)) return 'video_file';
+  return 'audio_file';
+}
 
 const INITIAL_STEMS: StemTrackState[] = [
   {
@@ -91,6 +103,7 @@ export const App: React.FC = () => {
     originalBpm: 124,
     originalKey: 'Am',
     isCustomFile: false,
+    sourceType: 'studio_demo',
   });
 
   const [pitchSpeed, setPitchSpeed] = useState<PitchSpeedSettings>({
@@ -127,6 +140,7 @@ export const App: React.FC = () => {
     });
 
   const [models, setModels] = useState<LocalAiModelSpec[]>(LOCAL_AI_MODELS);
+  const [isYouTubeModalOpen, setIsYouTubeModalOpen] = useState(false);
   const [isModelModalOpen, setIsModelModalOpen] = useState(false);
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
 
@@ -195,12 +209,14 @@ export const App: React.FC = () => {
       setIsPlaying(false);
     }
 
+    const sourceType = detectFileSourceType(file);
+
     try {
       const decoded = await engine.loadAudioFile(file);
       const cleanTitle = file.name.replace(/\.[^/.]+$/, '');
       setSong({
         title: cleanTitle,
-        artist: 'Local Audio Track',
+        artist: sourceType === 'video_file' ? 'Video Audio Track' : 'Local Audio Track',
         fileName: file.name,
         sampleRate: decoded.sampleRate,
         channels: decoded.channels,
@@ -208,6 +224,7 @@ export const App: React.FC = () => {
         originalBpm: decoded.detectedBpm,
         originalKey: decoded.detectedKey,
         isCustomFile: true,
+        sourceType,
       });
 
       setStems((prev) =>
@@ -224,8 +241,46 @@ export const App: React.FC = () => {
         title: cleanTitle,
         fileName: file.name,
         isCustomFile: true,
+        sourceType,
       }));
     }
+  };
+
+  const handleImportYouTubeTrack = (info: YouTubeTrackResolvedInfo) => {
+    const engine = audioEngineRef.current;
+    if (engine && isPlaying) {
+      engine.stop();
+      setIsPlaying(false);
+    }
+
+    setSong({
+      title: info.title,
+      artist: info.authorName,
+      fileName: `yt_${info.parsed.videoId}.m4a`,
+      sampleRate: 44100,
+      channels: 2,
+      durationSec: info.durationSec,
+      originalBpm: info.detectedBpm,
+      originalKey: info.detectedKey,
+      isCustomFile: false,
+      sourceType: 'youtube_single',
+      youtubeInfo: {
+        videoId: info.parsed.videoId,
+        canonicalUrl: info.parsed.canonicalWatchUrl,
+        wasInPlaylist: info.parsed.wasInPlaylist,
+        ignoredPlaylistId: info.parsed.ignoredPlaylistId,
+        playlistIndex: info.parsed.playlistIndex,
+        thumbnailUrl: info.thumbnailUrl,
+      },
+    });
+
+    setStems((prev) =>
+      prev.map((s) => ({
+        ...s,
+        peaks: info.peaks[s.id] ?? s.peaks,
+      }))
+    );
+    setCurrentTimeSec(info.parsed.startTimeSec ?? 0);
   };
 
   const handleTriggerWavDownload = (outputFileName: string) => {
@@ -420,6 +475,7 @@ export const App: React.FC = () => {
         installedModelCount={installedCount}
         totalModelCount={models.length}
         onSelectAudioFile={handleSelectAudioFile}
+        onOpenYouTubeModal={() => setIsYouTubeModalOpen(true)}
         onOpenModelManager={() => setIsModelModalOpen(true)}
         onOpenExportModal={() => setIsExportModalOpen(true)}
       />
@@ -472,6 +528,12 @@ export const App: React.FC = () => {
       </main>
 
       {/* Modals */}
+      <YouTubeImportModal
+        isOpen={isYouTubeModalOpen}
+        onClose={() => setIsYouTubeModalOpen(false)}
+        onImportYouTubeTrack={handleImportYouTubeTrack}
+      />
+
       <ModelManagerModal
         isOpen={isModelModalOpen}
         models={models}

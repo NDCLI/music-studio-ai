@@ -11,6 +11,12 @@ export type SeparationPresetId =
 
 export type SeparationQualityMode = 'fast_mdx' | 'pro_roformer';
 
+export type TrackSourceType =
+  | 'studio_demo'
+  | 'audio_file'
+  | 'video_file'
+  | 'youtube_single';
+
 export interface StemTrackState {
   id: StemId;
   name: string;
@@ -46,6 +52,15 @@ export interface SongMetadata {
   originalBpm: number;
   originalKey: string; // e.g. 'Am'
   isCustomFile: boolean;
+  sourceType: TrackSourceType;
+  youtubeInfo?: {
+    videoId: string;
+    canonicalUrl: string;
+    wasInPlaylist: boolean;
+    ignoredPlaylistId?: string;
+    playlistIndex?: number;
+    thumbnailUrl?: string;
+  };
 }
 
 export interface LocalAiModelSpec {

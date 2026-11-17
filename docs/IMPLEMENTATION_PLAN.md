@@ -58,11 +58,19 @@ Khi chạy model `.onnx` bằng Rust, ứng dụng không đưa trực tiếp fi
 
 ---
 
-### 1.3. Sơ Đồ Pipeline Tách Nhạc 3 Tầng (Multi-Stage Separation Pipeline)
+### 1.3. Sơ Đồ Pipeline Đa Nguồn Đầu Vào (Audio / Video MP4, MKV / YouTube Single Track) & Tách Nhạc 3 Tầng
+
+Ứng dụng hỗ trợ **3 nhóm nguồn đầu vào trực tiếp**:
+1. **File Âm Thanh (`MP3`, `WAV`, `FLAC`, `OGG`, `M4A`, `AAC`, `OPUS`)**
+2. **File Video (`MP4`, `MKV`, `WEBM`, `MOV`, `AVI`, `M4V`)**: Tự động bóc tách rãnh âm thanh (Audio Demuxing) bằng `symphonia` (`isomp4` + `mkv` demuxers) mà không cần gọi `ffmpeg.exe`.
+3. **Link YouTube Trực Tiếp (Hỗ trợ cả Link Playlist nhưng CHỈ LẤY BÀI ĐANG PHÁT)**:
+   - Khi người dùng dán link dạng `https://www.youtube.com/watch?v=kJQP7kiw5Fk&list=PLMC9KNkIncKtP...&index=3` hoặc `https://youtu.be/kJQP7kiw5Fk?list=RD...`, bộ phân tích `youtube_loader.rs` / `youtubeParser.ts` sẽ **tự động loại bỏ tham số `list=` (`--no-playlist`)**, chỉ giữ lại duy nhất mã bài đang phát `v=kJQP7kiw5Fk` để nạp nhanh vào bàn trộn mà không tải nhầm cả danh sách phát.
 
 ```mermaid
 flowchart TD
-    Raw["🎵 File Nhạc Gốc (MP3 / WAV / FLAC / M4A)"] --> Decode["Giải mã sang PCM f32 44.1kHz Stereo<br/>(Crate: `symphonia` + `rubato`)"]
+    InAudio["🎵 File Nhạc (MP3 / WAV / FLAC / M4A)"] --> Decode["Giải mã & Bóc tách Audio sang PCM f32 44.1kHz Stereo<br/>(Crate: `symphonia` [isomp4, mkv, aac, mp3] + `rubato`)"]
+    InVideo["🎬 File Video (MP4 / MKV / WEBM / MOV)"] --> Decode
+    InYT["▶️ Link YouTube / Playlist URL<br/>(Tự lọc `v=` bài đang phát, bỏ `list=`)"] --> Decode
     Decode --> Chunk["Chia đoạn 6 giây có gối đầu 50% (Overlap-Add)<br/>+ Biến đổi STFT (`rustfft`)"]
     
     Chunk --> M1["Model Tầng 1: `UVR-MDX-NET-Inst_HQ_4.onnx`<br/>(hoặc `Mel-Band-RoFormer`)"]

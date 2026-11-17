@@ -20,6 +20,19 @@ use symphonia::core::probe::Hint;
 
 pub const STUDIO_SAMPLE_RATE: u32 = 44_100;
 
+/// Supported audio and video container extensions for demuxing audio tracks.
+pub const SUPPORTED_AUDIO_EXTENSIONS: &[&str] = &["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"];
+pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "webm", "mov", "m4v", "avi"];
+
+/// Returns true if the file path has a video container extension (`mp4`, `mkv`, `webm`, `mov`, `avi`).
+pub fn is_video_container_path<P: AsRef<Path>>(path: P) -> bool {
+    path.as_ref()
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 /// Represents a decoded stereo audio buffer normalized to [-1.0, 1.0] at 44.1 kHz.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StereoAudioBuffer {
