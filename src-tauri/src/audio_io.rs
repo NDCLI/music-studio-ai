@@ -1,8 +1,9 @@
-//! Pure-Rust Audio I/O Module (`symphonia` + `rubato` + `hound`).
-//! Decodes MP3, WAV, FLAC, OGG, and M4A/AAC into stereo 44.1 kHz f32 buffers
-//! without spawning external `ffmpeg.exe` processes (preventing AhnLab scan lag).
+//! Pure-Rust Audio & Video Container I/O Module (`symphonia` + `rubato` + `hound` + Pure-Rust FLAC).
+//! Decodes MP3, WAV, FLAC, OGG, M4A, MP4, MKV, WEBM, and MOV into stereo 44.1 kHz f32 buffers
+//! and exports WAV (16/24-bit PCM, 32-bit Float) and Lossless FLAC without external `ffmpeg.exe`.
 
 use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use hound::{SampleFormat, WavSpec, WavWriter};
@@ -93,6 +94,7 @@ impl StereoAudioBuffer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadedTrackSummary {
     pub file_name: String,
+    pub is_video_source: bool,
     pub sample_rate: u32,
     pub channels: usize,
     pub duration_sec: f64,
@@ -101,11 +103,11 @@ pub struct LoadedTrackSummary {
     pub waveform_peaks: Vec<f32>,
 }
 
-/// Decodes an audio file from disk using Pure-Rust `symphonia` and resamples to 44.1 kHz stereo.
+/// Decodes an audio or video file from disk using Pure-Rust `symphonia` and resamples to 44.1 kHz stereo.
 pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<StereoAudioBuffer, String> {
     let path_ref = path.as_ref();
     let file = File::open(path_ref)
-        .map_err(|e| format!("Failed to open audio file '{}': {}", path_ref.display(), e))?;
+        .map_err(|e| format!("Failed to open audio/video file '{}': {}", path_ref.display(), e))?;
 
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -120,7 +122,7 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<StereoAudioBuffer, S
             &FormatOptions::default(),
             &MetadataOptions::default(),
         )
-        .map_err(|e| format!("Unsupported or corrupted audio format: {}", e))?;
+        .map_err(|e| format!("Unsupported or corrupted container format: {}", e))?;
 
     let mut format = probed.format;
     let track = format
@@ -232,7 +234,6 @@ pub fn resample_stereo_buffer(
         pos += chunk_size;
     }
 
-    // Handle remaining tail frames with zero padding
     if pos < total_frames {
         let remain = total_frames - pos;
         let mut tail_l = vec![0.0_f32; chunk_size];
@@ -253,38 +254,54 @@ pub fn resample_stereo_buffer(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WavExportBitDepth {
-    Pcm24Bit,
-    Float32Bit,
+pub enum AudioExportFormat {
+    Wav16Bit,
+    Wav24Bit,
+    Wav32Float,
+    Flac24BitLossless,
 }
 
-/// Exports a processed stereo buffer to disk as 24-bit PCM or 32-bit Float WAV.
-pub fn export_wav_file<P: AsRef<Path>>(
+/// Exports a processed stereo buffer in WAV (16/24-bit PCM, 32-bit Float) or Lossless 24-bit FLAC.
+pub fn export_audio_file<P: AsRef<Path>>(
     path: P,
     buffer: &StereoAudioBuffer,
-    bit_depth: WavExportBitDepth,
+    format: AudioExportFormat,
 ) -> Result<(), String> {
-    let spec = match bit_depth {
-        WavExportBitDepth::Pcm24Bit => WavSpec {
-            channels: 2,
-            sample_rate: buffer.sample_rate,
-            bits_per_sample: 24,
-            sample_format: SampleFormat::Int,
-        },
-        WavExportBitDepth::Float32Bit => WavSpec {
-            channels: 2,
-            sample_rate: buffer.sample_rate,
-            bits_per_sample: 32,
-            sample_format: SampleFormat::Float,
-        },
+    match format {
+        AudioExportFormat::Wav16Bit => export_wav_internal(path, buffer, 16, SampleFormat::Int),
+        AudioExportFormat::Wav24Bit => export_wav_internal(path, buffer, 24, SampleFormat::Int),
+        AudioExportFormat::Wav32Float => export_wav_internal(path, buffer, 32, SampleFormat::Float),
+        AudioExportFormat::Flac24BitLossless => export_flac_24bit_file(path, buffer),
+    }
+}
+
+fn export_wav_internal<P: AsRef<Path>>(
+    path: P,
+    buffer: &StereoAudioBuffer,
+    bits_per_sample: u16,
+    sample_format: SampleFormat,
+) -> Result<(), String> {
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: buffer.sample_rate,
+        bits_per_sample,
+        sample_format,
     };
 
     let mut writer = WavWriter::create(path.as_ref(), spec)
         .map_err(|e| format!("Failed to create WAV file: {}", e))?;
 
     let frames = buffer.num_frames();
-    match bit_depth {
-        WavExportBitDepth::Pcm24Bit => {
+    match (bits_per_sample, sample_format) {
+        (16, SampleFormat::Int) => {
+            for i in 0..frames {
+                let l = (buffer.left[i].clamp(-1.0, 1.0) * 32_767.0) as i16;
+                let r = (buffer.right[i].clamp(-1.0, 1.0) * 32_767.0) as i16;
+                writer.write_sample(l).map_err(|e| e.to_string())?;
+                writer.write_sample(r).map_err(|e| e.to_string())?;
+            }
+        }
+        (24, SampleFormat::Int) => {
             let max_i24 = 8_388_607.0_f32;
             for i in 0..frames {
                 let l = (buffer.left[i].clamp(-1.0, 1.0) * max_i24) as i32;
@@ -293,7 +310,7 @@ pub fn export_wav_file<P: AsRef<Path>>(
                 writer.write_sample(r).map_err(|e| e.to_string())?;
             }
         }
-        WavExportBitDepth::Float32Bit => {
+        _ => {
             for i in 0..frames {
                 writer
                     .write_sample(buffer.left[i].clamp(-1.0, 1.0))
@@ -308,4 +325,177 @@ pub fn export_wav_file<P: AsRef<Path>>(
     writer
         .finalize()
         .map_err(|e| format!("Failed to finalize WAV file: {}", e))
+}
+
+/// Encodes and writes a valid 24-bit Stereo Lossless FLAC file (`fLaC` + STREAMINFO + VERBATIM frames)
+/// in Pure Rust without external binaries.
+pub fn export_flac_24bit_file<P: AsRef<Path>>(
+    path: P,
+    buffer: &StereoAudioBuffer,
+) -> Result<(), String> {
+    let bytes = encode_flac_24bit_bytes(buffer);
+    let file = File::create(path.as_ref())
+        .map_err(|e| format!("Failed to create FLAC file '{}': {}", path.as_ref().display(), e))?;
+    let mut writer = BufWriter::new(file);
+    writer
+        .write_all(&bytes)
+        .map_err(|e| format!("Failed to write FLAC data: {}", e))?;
+    writer
+        .flush()
+        .map_err(|e| format!("Failed to flush FLAC file: {}", e))
+}
+
+/// Produces a complete, spec-compliant 24-bit Stereo FLAC byte stream.
+pub fn encode_flac_24bit_bytes(buffer: &StereoAudioBuffer) -> Vec<u8> {
+    let total_frames = buffer.num_frames();
+    let max_block_size: usize = 4096;
+    let min_block_size: u16 = total_frames.clamp(16, max_block_size) as u16;
+    let sample_rate = buffer.sample_rate.clamp(1, 655_350);
+
+    let mut out = Vec::with_capacity(42 + total_frames * 6 + 1024);
+
+    // 1. Magic marker "fLaC"
+    out.extend_from_slice(b"fLaC");
+
+    // 2. Last metadata block (STREAMINFO, type 0, length 34 bytes)
+    out.push(0x80);
+    out.extend_from_slice(&[0x00, 0x00, 0x22]);
+
+    out.extend_from_slice(&min_block_size.to_be_bytes());
+    out.extend_from_slice(&(max_block_size as u16).to_be_bytes());
+    out.extend_from_slice(&[0x00, 0x00, 0x00]); // min_frame_size unknown
+    out.extend_from_slice(&[0x00, 0x00, 0x00]); // max_frame_size unknown
+
+    // 20 bits sample rate | 3 bits (channels - 1) | 5 bits (bps - 1) | 36 bits total_samples
+    let packed: u64 = ((sample_rate as u64) << 44)
+        | (1_u64 << 41) // 2 channels -> 2 - 1 = 1
+        | (23_u64 << 36) // 24-bit -> 24 - 1 = 23
+        | ((total_frames as u64) & 0x0F_FFFF_FFFF);
+    out.extend_from_slice(&packed.to_be_bytes());
+    out.extend_from_slice(&[0_u8; 16]); // Uncomputed MD5 allowed by FLAC spec
+
+    // 3. Encode Verbatim Stereo Audio Frames (variable-blocksize strategy = 1)
+    let mut start = 0usize;
+    let max_i24 = 8_388_607.0_f32;
+
+    while start < total_frames {
+        let block_len = (total_frames - start).min(max_block_size);
+        let frame_start_offset = out.len();
+
+        // Sync code 0x3FFE + reserved 0 + variable-blocksize bit 1 => 0xFF, 0xF9
+        out.push(0xFF);
+        out.push(0xF9);
+        // Block size 0b0111 (16-bit (n-1) at end of header) | Sample rate 0b0000 (from STREAMINFO)
+        out.push(0x70);
+        // Channel assignment 0b0001 (independent L/R) | Sample size 0b110 (24-bit) | reserved 0
+        out.push(0x1C);
+
+        // UTF-8 coded starting sample index
+        encode_utf8_uint64(start as u64, &mut out);
+
+        // 16-bit (block_size - 1) big-endian
+        out.extend_from_slice(&((block_len - 1) as u16).to_be_bytes());
+
+        // Header CRC-8
+        let crc8 = flac_crc8(&out[frame_start_offset..]);
+        out.push(crc8);
+
+        // Left Subframe: VERBATIM (0x02) + raw 24-bit big-endian signed samples
+        out.push(0x02);
+        for i in start..(start + block_len) {
+            let sample = (buffer.left[i].clamp(-1.0, 1.0) * max_i24).round() as i32;
+            let bytes = sample.to_be_bytes();
+            out.extend_from_slice(&bytes[1..4]);
+        }
+
+        // Right Subframe: VERBATIM (0x02) + raw 24-bit big-endian signed samples
+        out.push(0x02);
+        for i in start..(start + block_len) {
+            let sample = (buffer.right[i].clamp(-1.0, 1.0) * max_i24).round() as i32;
+            let bytes = sample.to_be_bytes();
+            out.extend_from_slice(&bytes[1..4]);
+        }
+
+        // Frame CRC-16
+        let crc16 = flac_crc16(&out[frame_start_offset..]);
+        out.extend_from_slice(&crc16.to_be_bytes());
+
+        start += block_len;
+    }
+
+    out
+}
+
+fn encode_utf8_uint64(val: u64, out: &mut Vec<u8>) {
+    if val < 0x80 {
+        out.push(val as u8);
+    } else if val < 0x800 {
+        out.push(0xC0 | ((val >> 6) as u8));
+        out.push(0x80 | ((val & 0x3F) as u8));
+    } else if val < 0x1_0000 {
+        out.push(0xE0 | ((val >> 12) as u8));
+        out.push(0x80 | (((val >> 6) & 0x3F) as u8));
+        out.push(0x80 | ((val & 0x3F) as u8));
+    } else if val < 0x20_0000 {
+        out.push(0xF0 | ((val >> 18) as u8));
+        out.push(0x80 | (((val >> 12) & 0x3F) as u8));
+        out.push(0x80 | (((val >> 6) & 0x3F) as u8));
+        out.push(0x80 | ((val & 0x3F) as u8));
+    } else {
+        out.push(0xF8 | ((val >> 24) as u8));
+        out.push(0x80 | (((val >> 18) & 0x3F) as u8));
+        out.push(0x80 | (((val >> 12) & 0x3F) as u8));
+        out.push(0x80 | (((val >> 6) & 0x3F) as u8));
+        out.push(0x80 | ((val & 0x3F) as u8));
+    }
+}
+
+fn flac_crc8(data: &[u8]) -> u8 {
+    let mut crc = 0_u8;
+    for &b in data {
+        crc ^= b;
+        for _ in 0..8 {
+            if (crc & 0x80) != 0 {
+                crc = (crc << 1) ^ 0x07;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
+fn flac_crc16(data: &[u8]) -> u16 {
+    let mut crc = 0_u16;
+    for &b in data {
+        crc ^= (b as u16) << 8;
+        for _ in 0..8 {
+            if (crc & 0x8000) != 0 {
+                crc = (crc << 1) ^ 0x8005;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_flac_24bit_stream_encoding_structure() {
+        let frames = 512usize;
+        let left: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let right: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.05).cos() * 0.5).collect();
+        let buf = StereoAudioBuffer::new(44_100, left, right);
+
+        let flac_bytes = encode_flac_24bit_bytes(&buf);
+        assert!(flac_bytes.starts_with(b"fLaC"));
+        assert_eq!(flac_bytes[4], 0x80); // Last metadata block + STREAMINFO
+        assert_eq!(&flac_bytes[5..8], &[0x00, 0x00, 0x22]); // 34 bytes STREAMINFO
+        assert_eq!(&flac_bytes[42..44], &[0xFF, 0xF9]); // FLAC audio frame sync + variable block
+        assert!(flac_bytes.len() > 42 + frames * 6);
+    }
 }

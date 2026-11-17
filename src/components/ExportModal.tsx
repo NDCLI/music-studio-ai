@@ -8,8 +8,9 @@ import {
 } from 'lucide-react';
 import { PitchSpeedSettings, SongMetadata } from '../types/studio';
 import { computeTransposedKey } from '../data/modelsCatalog';
+import { BrowserAudioExportFormat } from '../services/dspEngine';
 
-export type ExportFormat = 'wav24' | 'wav32f' | 'flac' | 'mp3_320';
+export type ExportFormat = BrowserAudioExportFormat;
 export type ExportTarget = 'master_mix' | 'all_stems' | 'karaoke_backing';
 
 interface ExportModalProps {
@@ -17,7 +18,11 @@ interface ExportModalProps {
   song: SongMetadata;
   settings: PitchSpeedSettings;
   onClose: () => void;
-  onTriggerExport: (baseName: string, target: ExportTarget) => string[];
+  onTriggerExport: (
+    baseName: string,
+    target: ExportTarget,
+    format: ExportFormat
+  ) => string[];
 }
 
 export const ExportModal: React.FC<ExportModalProps> = ({
@@ -44,7 +49,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     setIsExporting(true);
     setExportedFiles([]);
     window.setTimeout(() => {
-      const files = onTriggerExport(baseName, target);
+      const files = onTriggerExport(baseName, target, format);
       setIsExporting(false);
       setExportedFiles(files);
     }, 350);
@@ -100,7 +105,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 {
                   id: 'all_stems',
                   title: 'Xuất rời từng kênh (4 Files: Vocal chính, Bè, Nhạc nền, Reverb)',
-                  desc: 'Tải xuống 4 file WAV độc lập để đưa vào DAW hoặc mix chuyên sâu',
+                  desc: 'Tải xuống 4 file âm thanh độc lập để đưa vào DAW hoặc mix chuyên sâu',
                 },
                 {
                   id: 'karaoke_backing',
@@ -128,20 +133,20 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           {/* Audio Format Selection */}
           <div>
             <label className="block text-xs font-bold uppercase tracking-wider text-slate-300 mb-2">
-              2. Định dạng &amp; Chất lượng (Crate `hound` / Browser WAV Renderer)
+              2. Định dạng Xuất Chuẩn Pure-Rust / Lossless (`hound` + Pure FLAC)
             </label>
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
               {[
                 { id: 'wav24', label: 'WAV 24-bit PCM' },
                 { id: 'wav32f', label: 'WAV 32-bit Float' },
-                { id: 'flac', label: 'FLAC Lossless' },
-                { id: 'mp3_320', label: 'MP3 320 kbps' },
+                { id: 'wav16', label: 'WAV 16-bit CD' },
+                { id: 'flac', label: 'FLAC 24-bit Lossless' },
               ].map((fmt) => (
                 <button
                   key={fmt.id}
                   type="button"
                   onClick={() => setFormat(fmt.id as ExportFormat)}
-                  className={`cursor-pointer rounded-xl border py-2.5 text-center font-mono text-xs font-semibold transition-colors ${
+                  className={`cursor-pointer rounded-xl border py-2.5 px-2 text-center font-mono text-[11px] font-semibold transition-colors ${
                     format === fmt.id
                       ? 'border-emerald-400 bg-emerald-500/20 text-emerald-300'
                       : 'border-white/10 bg-[#080B14] text-slate-300 hover:border-white/25'
@@ -182,9 +187,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/15 px-4 py-2.5 text-xs font-semibold text-emerald-300 space-y-1">
               <div className="flex items-center gap-2">
                 <CheckCircle2 className="h-4 w-4 shrink-0" />
-                <span>Đã xuất và tải xuống {exportedFiles.length} file WAV:</span>
+                <span>Đã xuất và tải xuống {exportedFiles.length} file ({format.toUpperCase()}):</span>
               </div>
-              <div className="font-mono text-[11px] text-emerald-200 pl-6">
+              <div className="font-mono text-[11px] text-emerald-200 pl-6 break-all">
                 {exportedFiles.join(', ')}
               </div>
             </div>

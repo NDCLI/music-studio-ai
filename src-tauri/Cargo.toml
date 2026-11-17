@@ -9,6 +9,12 @@ edition = "2021"
 name = "music-studio-ai"
 path = "src/main.rs"
 
+[features]
+# Default mode keeps build footprint minimal on corporate machines with AhnLab.
+# Enable `--features desktop-tauri` when packaging the full Tauri v2 desktop installer (.msi / .exe).
+default = []
+desktop-tauri = ["dep:tauri"]
+
 [dependencies]
 # Pure-Rust audio & video container demuxing (MP3, WAV, FLAC, OGG, M4A, MP4, MKV, WEBM, MOV)
 # No external ffmpeg.exe sidecar needed
@@ -32,6 +38,9 @@ ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "
 # Stage 4 Model Manager: HuggingFace HTTPS download (Windows SChannel native-tls, zero ring/openssl C build) & SHA-256 verification
 ureq = { version = "3.1", default-features = false, features = ["native-tls"] }
 sha2 = "0.10"
+
+# Optional Tauri v2 Desktop Runtime (activated during desktop packaging with `--features desktop-tauri`)
+tauri = { version = "2", optional = true }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

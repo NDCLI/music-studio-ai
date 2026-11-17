@@ -1,0 +1,1 @@
+# Keep models directory tracked in Git for Tauri bundle resources while ignoring downloaded .onnx binaries

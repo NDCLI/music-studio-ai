@@ -4,7 +4,7 @@ import { TransportBar } from './components/TransportBar';
 import { PitchSpeedDeck } from './components/PitchSpeedDeck';
 import { StemMixerTimeline } from './components/StemMixerTimeline';
 import { ModelManagerModal } from './components/ModelManagerModal';
-import { ExportModal, ExportTarget } from './components/ExportModal';
+import { ExportModal, ExportFormat, ExportTarget } from './components/ExportModal';
 import { YouTubeImportModal } from './components/YouTubeImportModal';
 import { LOCAL_AI_MODELS } from './data/modelsCatalog';
 import {
@@ -18,6 +18,7 @@ import {
   listCachedModelsFromDb,
 } from './services/modelStorage';
 import { separateAudioBuffer3Stage } from './services/stemSeparator';
+import { syncPitchSpeedToRustBackend } from './services/tauriBridge';
 import { YouTubeTrackResolvedInfo } from './services/youtubeParser';
 import {
   LocalAiModelSpec,
@@ -143,7 +144,8 @@ export const App: React.FC = () => {
       isSeparated: true,
       currentStage: 3,
       progressPercent: 100,
-      stageMessage: 'Sẵn sàng 4 rãnh Demo đa kênh (Mở file Nhạc/Video để tách phổ thực tế)',
+      stageMessage:
+        'Sẵn sàng 4 rãnh Demo đa kênh (Mở file Nhạc/Video để tách phổ thực tế)',
       executionBackend: '4 Stems Active',
     });
 
@@ -162,7 +164,6 @@ export const App: React.FC = () => {
   useEffect(() => {
     audioEngineRef.current = new StudioPreviewAudioEngine();
 
-    // Sync offline cached ONNX models from IndexedDB on startup
     void listCachedModelsFromDb()
       .then((cachedMap) => {
         setModels((prev) =>
@@ -321,11 +322,21 @@ export const App: React.FC = () => {
     setCurrentTimeSec(info.parsed.startTimeSec ?? 0);
   };
 
-  const handleTriggerExport = (baseName: string, target: ExportTarget): string[] => {
+  const handleTriggerExport = (
+    baseName: string,
+    target: ExportTarget,
+    format: ExportFormat
+  ): string[] => {
     const engine = audioEngineRef.current;
     if (!engine) return [];
 
-    const outputs = engine.renderExportWavFiles(baseName, stems, pitchSpeed, target);
+    const outputs = engine.renderExportAudioFiles(
+      baseName,
+      stems,
+      pitchSpeed,
+      target,
+      format
+    );
     const names: string[] = [];
 
     for (const item of outputs) {
@@ -344,16 +355,24 @@ export const App: React.FC = () => {
   };
 
   const handleUpdatePitchSpeed = (partial: Partial<PitchSpeedSettings>) => {
-    setPitchSpeed((prev) => ({ ...prev, ...partial }));
+    setPitchSpeed((prev) => {
+      const next = { ...prev, ...partial };
+      void syncPitchSpeedToRustBackend(next);
+      return next;
+    });
   };
 
   const handleResetPitchSpeed = () => {
-    setPitchSpeed((prev) => ({
-      ...prev,
-      semitones: 0,
-      cents: 0,
-      speed: 1.0,
-    }));
+    setPitchSpeed((prev) => {
+      const next = {
+        ...prev,
+        semitones: 0,
+        cents: 0,
+        speed: 1.0,
+      };
+      void syncPitchSpeedToRustBackend(next);
+      return next;
+    });
   };
 
   const handleRunSeparation = async () => {
@@ -375,7 +394,6 @@ export const App: React.FC = () => {
         : 'mel_band_roformer_karaoke_aufr33_viperx.onnx';
     };
 
-    // Real 3-stage STFT separation over user's decoded audio/video file
     if (customBuffer && engine) {
       setSeparationStatus({
         isRunning: true,
@@ -420,7 +438,6 @@ export const App: React.FC = () => {
       return;
     }
 
-    // Fallback stage simulation when on built-in synthetic demo track
     const stage1Model =
       qualityMode === 'fast_mdx'
         ? 'UVR-MDX-NET-Inst_HQ_4.onnx (n_fft=5120, dim_f=2560)'

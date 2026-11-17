@@ -5,9 +5,10 @@ import {
   StemTrackState,
 } from '../types/studio';
 import {
+  BrowserAudioExportFormat,
   detectBpmFromBuffer,
   detectMusicalKeyFromBuffer,
-  encodeStereoWavBlob,
+  encodeStereoAudioBlob,
 } from './dspEngine';
 
 /**
@@ -68,8 +69,9 @@ export function extractPeaksFromBuffer(buffer: AudioBuffer, count = 140): number
 }
 
 /**
- * Stage 2, 3 & 5 Real-time Multi-Stem & Granular Formant Pitch/Time Engine.
- * Supports synthesized preview, raw decoded audio/video playback, and truly separated 4-stem buffers.
+ * Stage 2, 3, 5 & 6 Real-time Multi-Stem & Granular Formant Pitch/Time Engine.
+ * Supports synthesized preview, raw decoded audio/video playback, separated 4-stem buffers,
+ * and multi-format lossless export (WAV 16/24-bit, WAV 32-bit Float, FLAC 24-bit).
  */
 export class StudioPreviewAudioEngine {
   private ctx: AudioContext | null = null;
@@ -270,7 +272,6 @@ export class StudioPreviewAudioEngine {
         let sumR = 0;
 
         if (sep) {
-          // Sample-accurate mixing from the 4 genuinely separated STFT stem buffers
           if (leadGain > 0.001) {
             sumL += (sep.lead_vocal.left[idxA] * winA + sep.lead_vocal.left[idxB] * winB) * leadGain;
             sumR += (sep.lead_vocal.right[idxA] * winA + sep.lead_vocal.right[idxB] * winB) * leadGain;
@@ -343,26 +344,33 @@ export class StudioPreviewAudioEngine {
   }
 
   /**
-   * Renders one or multiple downloadable WAV files according to the selected export target.
+   * Renders one or multiple downloadable WAV / FLAC files according to the selected export target & format.
    */
-  public renderExportWavFiles(
+  public renderExportAudioFiles(
     baseName: string,
     stems: StemTrackState[],
     settings: PitchSpeedSettings,
-    target: 'master_mix' | 'all_stems' | 'karaoke_backing'
+    target: 'master_mix' | 'all_stems' | 'karaoke_backing',
+    format: BrowserAudioExportFormat
   ): { fileName: string; blob: Blob }[] {
+    const ext = format === 'flac' ? 'flac' : 'wav';
+
     if (target === 'all_stems') {
-      const stemOrder: StemId[] = ['lead_vocal', 'backing_vocal', 'instrumental', 'reverb_tail'];
+      const stemOrder: StemId[] = [
+        'lead_vocal',
+        'backing_vocal',
+        'instrumental',
+        'reverb_tail',
+      ];
       return stemOrder.map((stemId) => {
         const soloedStems = stems.map((s) => ({
           ...s,
           muted: s.id !== stemId,
           solo: s.id === stemId,
         }));
-        const blob = this.renderSingleMixBlob(soloedStems, settings);
         return {
-          fileName: `${baseName}_${stemId}.wav`,
-          blob,
+          fileName: `${baseName}_${stemId}.${ext}`,
+          blob: this.renderSingleMixBlob(soloedStems, settings, format),
         };
       });
     }
@@ -375,23 +383,24 @@ export class StudioPreviewAudioEngine {
       }));
       return [
         {
-          fileName: `${baseName}_karaoke_with_backing.wav`,
-          blob: this.renderSingleMixBlob(karaokeStems, settings),
+          fileName: `${baseName}_karaoke_with_backing.${ext}`,
+          blob: this.renderSingleMixBlob(karaokeStems, settings, format),
         },
       ];
     }
 
     return [
       {
-        fileName: `${baseName}.wav`,
-        blob: this.renderSingleMixBlob(stems, settings),
+        fileName: `${baseName}.${ext}`,
+        blob: this.renderSingleMixBlob(stems, settings, format),
       },
     ];
   }
 
   private renderSingleMixBlob(
     stems: StemTrackState[],
-    settings: PitchSpeedSettings
+    settings: PitchSpeedSettings,
+    format: BrowserAudioExportFormat
   ): Blob {
     const sampleRate = this.customBuffer?.sampleRate ?? 44100;
     const anySolo = stems.some((s) => s.solo);
@@ -430,7 +439,7 @@ export class StudioPreviewAudioEngine {
           sep.reverb_tail.right[srcIdx] * reverbGain;
       }
 
-      return encodeStereoWavBlob(outL, outR, sampleRate);
+      return encodeStereoAudioBlob(outL, outR, sampleRate, format);
     }
 
     if (this.customBuffer) {
@@ -459,7 +468,7 @@ export class StudioPreviewAudioEngine {
         outR[i] = mid * leadGain * 0.7 - side * backingGain + (r - mid * 0.5) * instGain;
       }
 
-      return encodeStereoWavBlob(outL, outR, sampleRate);
+      return encodeStereoAudioBlob(outL, outR, sampleRate, format);
     }
 
     const durationSec = 8;
@@ -484,7 +493,7 @@ export class StudioPreviewAudioEngine {
       outR[i] = sLead - sBack * 0.5 + sInst;
     }
 
-    return encodeStereoWavBlob(outL, outR, sampleRate);
+    return encodeStereoAudioBlob(outL, outR, sampleRate, format);
   }
 
   private playSynthesizedMultiStemStep(

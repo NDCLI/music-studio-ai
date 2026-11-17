@@ -1,8 +1,8 @@
 /**
- * Stage 2 & Stage 3 Real-Time DSP Utilities:
+ * Stage 2, 3 & 6 Real-Time DSP & Multi-Format Audio Encoder Utilities:
  * 1. Krumhansl-Schmuckler Chromagram Musical Key Detector
  * 2. Energy Flux Autocorrelation BPM Estimator
- * 3. Formant-Preserving Spectral Pitch/Speed Renderer & WAV Encoder
+ * 3. Multi-Format WAV (16-bit, 24-bit PCM, 32-bit Float) & 24-bit Lossless FLAC Encoders
  */
 
 const NOTE_NAMES = [
@@ -27,9 +27,11 @@ const MINOR_PROFILE = [
   6.33, 2.68, 3.52, 5.38, 2.6, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
 ];
 
+export type BrowserAudioExportFormat = 'wav16' | 'wav24' | 'wav32f' | 'flac';
+
 /**
  * Detects the musical key (e.g. "Am", "C", "Em", "G") of an AudioBuffer
- * using Goertzel/Chroma harmonic pitch-class profiling and Krumhansl-Schmuckler correlation.
+ * using Goertzel harmonic pitch-class profiling and Krumhansl-Schmuckler correlation.
  */
 export function detectMusicalKeyFromBuffer(buffer: AudioBuffer): string {
   const data = buffer.getChannelData(0);
@@ -41,7 +43,6 @@ export function detectMusicalKeyFromBuffer(buffer: AudioBuffer): string {
   const numSlices = 18;
   const sliceStep = Math.max(windowSize, Math.floor(data.length / numSlices));
 
-  // Evaluate 4 octaves (C2 to B5) using exact Goertzel resonator per pitch class
   for (let s = 0; s < numSlices; s++) {
     const start = s * sliceStep;
     if (start + windowSize > data.length) break;
@@ -140,17 +141,35 @@ export function detectBpmFromBuffer(buffer: AudioBuffer): number {
   return Math.round(rawBpm * 2) / 2;
 }
 
+function softLimitSample(s: number): number {
+  const ceiling = 0.966; // -0.3 dBFS
+  const abs = Math.abs(s);
+  const limited =
+    abs > ceiling
+      ? Math.sign(s) *
+        Math.min(0.995, ceiling + (abs - ceiling) / (1 + (abs - ceiling) * 4))
+      : s;
+  return Math.max(-1, Math.min(1, limited));
+}
+
 /**
- * Encodes stereo Float32 arrays into a downloadable 16-bit or 24-bit WAV Blob.
+ * Encodes stereo Float32 arrays into WAV (16-bit PCM, 24-bit PCM, or 32-bit IEEE Float) or 24-bit FLAC.
  */
-export function encodeStereoWavBlob(
+export function encodeStereoAudioBlob(
   left: Float32Array,
   right: Float32Array,
-  sampleRate: number
+  sampleRate: number,
+  format: BrowserAudioExportFormat = 'wav24'
 ): Blob {
+  if (format === 'flac') {
+    return encodeStereoFlac24Blob(left, right, sampleRate);
+  }
+
   const numFrames = Math.min(left.length, right.length);
   const numChannels = 2;
-  const bytesPerSample = 2; // 16-bit PCM for universal compatibility
+  const isFloat = format === 'wav32f';
+  const bitsPerSample = format === 'wav16' ? 16 : format === 'wav24' ? 24 : 32;
+  const bytesPerSample = bitsPerSample / 8;
   const blockAlign = numChannels * bytesPerSample;
   const dataByteLength = numFrames * blockAlign;
   const buffer = new ArrayBuffer(44 + dataByteLength);
@@ -167,34 +186,171 @@ export function encodeStereoWavBlob(
   writeStr(8, 'WAVE');
   writeStr(12, 'fmt ');
   view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true); // PCM
+  view.setUint16(20, isFloat ? 3 : 1, true); // 3 = IEEE Float, 1 = PCM
   view.setUint16(22, numChannels, true);
   view.setUint32(24, sampleRate, true);
   view.setUint32(28, sampleRate * blockAlign, true);
   view.setUint16(32, blockAlign, true);
-  view.setUint16(34, 16, true);
+  view.setUint16(34, bitsPerSample, true);
   writeStr(36, 'data');
   view.setUint32(40, dataByteLength, true);
 
   let offset = 44;
-  for (let i = 0; i < numFrames; i++) {
-    // Apply -0.3 dBFS True-Peak Soft-Knee Limiter before quantization
-    const clampSample = (s: number) => {
-      const ceiling = 0.966;
-      const abs = Math.abs(s);
-      const limited =
-        abs > ceiling
-          ? Math.sign(s) * Math.min(0.995, ceiling + (abs - ceiling) / (1 + (abs - ceiling) * 4))
-          : s;
-      return Math.max(-1, Math.min(1, limited));
-    };
-
-    const lSample = Math.round(clampSample(left[i]) * 32767);
-    const rSample = Math.round(clampSample(right[i]) * 32767);
-    view.setInt16(offset, lSample, true);
-    view.setInt16(offset + 2, rSample, true);
-    offset += 4;
+  if (format === 'wav16') {
+    for (let i = 0; i < numFrames; i++) {
+      view.setInt16(offset, Math.round(softLimitSample(left[i]) * 32767), true);
+      view.setInt16(offset + 2, Math.round(softLimitSample(right[i]) * 32767), true);
+      offset += 4;
+    }
+  } else if (format === 'wav24') {
+    const maxI24 = 8388607;
+    for (let i = 0; i < numFrames; i++) {
+      const l = Math.round(softLimitSample(left[i]) * maxI24);
+      const r = Math.round(softLimitSample(right[i]) * maxI24);
+      view.setUint8(offset, l & 0xff);
+      view.setUint8(offset + 1, (l >> 8) & 0xff);
+      view.setUint8(offset + 2, (l >> 16) & 0xff);
+      view.setUint8(offset + 3, r & 0xff);
+      view.setUint8(offset + 4, (r >> 8) & 0xff);
+      view.setUint8(offset + 5, (r >> 16) & 0xff);
+      offset += 6;
+    }
+  } else {
+    for (let i = 0; i < numFrames; i++) {
+      view.setFloat32(offset, softLimitSample(left[i]), true);
+      view.setFloat32(offset + 4, softLimitSample(right[i]), true);
+      offset += 8;
+    }
   }
 
   return new Blob([buffer], { type: 'audio/wav' });
+}
+
+function encodeUtf8SampleIndex(val: number, bytes: number[]): void {
+  if (val < 0x80) {
+    bytes.push(val);
+  } else if (val < 0x800) {
+    bytes.push(0xc0 | (val >> 6));
+    bytes.push(0x80 | (val & 0x3f));
+  } else if (val < 0x10000) {
+    bytes.push(0xe0 | (val >> 12));
+    bytes.push(0x80 | ((val >> 6) & 0x3f));
+    bytes.push(0x80 | (val & 0x3f));
+  } else if (val < 0x200000) {
+    bytes.push(0xf0 | (val >> 18));
+    bytes.push(0x80 | ((val >> 12) & 0x3f));
+    bytes.push(0x80 | ((val >> 6) & 0x3f));
+    bytes.push(0x80 | (val & 0x3f));
+  } else {
+    bytes.push(0xf8 | Math.floor(val / 0x1000000));
+    bytes.push(0x80 | ((val >> 18) & 0x3f));
+    bytes.push(0x80 | ((val >> 12) & 0x3f));
+    bytes.push(0x80 | ((val >> 6) & 0x3f));
+    bytes.push(0x80 | (val & 0x3f));
+  }
+}
+
+function flacCrc8(data: Uint8Array, start: number, end: number): number {
+  let crc = 0;
+  for (let i = start; i < end; i++) {
+    crc ^= data[i];
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x80) !== 0 ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+    }
+  }
+  return crc;
+}
+
+function flacCrc16(data: Uint8Array, start: number, end: number): number {
+  let crc = 0;
+  for (let i = start; i < end; i++) {
+    crc ^= data[i] << 8;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x8000) !== 0 ? ((crc << 1) ^ 0x8005) & 0xffff : (crc << 1) & 0xffff;
+    }
+  }
+  return crc;
+}
+
+/**
+ * Encodes stereo Float32 audio into a valid 24-bit Lossless FLAC stream (`fLaC`).
+ */
+export function encodeStereoFlac24Blob(
+  left: Float32Array,
+  right: Float32Array,
+  sampleRate: number
+): Blob {
+  const totalFrames = Math.min(left.length, right.length);
+  const maxBlockSize = 4096;
+  const minBlockSize = Math.max(16, Math.min(maxBlockSize, totalFrames));
+  const out: number[] = [];
+
+  // "fLaC" magic + STREAMINFO header
+  out.push(0x66, 0x4c, 0x61, 0x43, 0x80, 0x00, 0x00, 0x22);
+  out.push((minBlockSize >> 8) & 0xff, minBlockSize & 0xff);
+  out.push((maxBlockSize >> 8) & 0xff, maxBlockSize & 0xff);
+  out.push(0, 0, 0, 0, 0, 0);
+
+  const sr = Math.max(1, Math.min(655350, sampleRate));
+  // 20-bit sampleRate | 3-bit (2-1=1) | 5-bit (24-1=23) | 36-bit totalFrames
+  const hi32 = ((sr << 12) | (1 << 9) | (23 << 4) | Math.floor(totalFrames / 0x100000000)) >>> 0;
+  const lo32 = totalFrames >>> 0;
+  out.push(
+    (hi32 >>> 24) & 0xff,
+    (hi32 >>> 16) & 0xff,
+    (hi32 >>> 8) & 0xff,
+    hi32 & 0xff,
+    (lo32 >>> 24) & 0xff,
+    (lo32 >>> 16) & 0xff,
+    (lo32 >>> 8) & 0xff,
+    lo32 & 0xff
+  );
+  for (let i = 0; i < 16; i++) out.push(0);
+
+  const maxI24 = 8388607;
+  let start = 0;
+
+  while (start < totalFrames) {
+    const blockLen = Math.min(maxBlockSize, totalFrames - start);
+    const frameStart = out.length;
+
+    out.push(0xff, 0xf9, 0x70, 0x1c);
+    encodeUtf8SampleIndex(start, out);
+    const blMinus1 = blockLen - 1;
+    out.push((blMinus1 >> 8) & 0xff, blMinus1 & 0xff);
+
+    const headerEnd = out.length;
+    const tempHeader = new Uint8Array(out.slice(frameStart, headerEnd));
+    out.push(flacCrc8(tempHeader, 0, tempHeader.length));
+
+    // Left verbatim subframe
+    out.push(0x02);
+    for (let i = start; i < start + blockLen; i++) {
+      const s = Math.round(softLimitSample(left[i]) * maxI24);
+      out.push((s >> 16) & 0xff, (s >> 8) & 0xff, s & 0xff);
+    }
+
+    // Right verbatim subframe
+    out.push(0x02);
+    for (let i = start; i < start + blockLen; i++) {
+      const s = Math.round(softLimitSample(right[i]) * maxI24);
+      out.push((s >> 16) & 0xff, (s >> 8) & 0xff, s & 0xff);
+    }
+
+    const frameSlice = new Uint8Array(out.slice(frameStart));
+    const crc16 = flacCrc16(frameSlice, 0, frameSlice.length);
+    out.push((crc16 >> 8) & 0xff, crc16 & 0xff);
+
+    start += blockLen;
+  }
+
+  return new Blob([new Uint8Array(out)], { type: 'audio/flac' });
+}
+
+export function encodeStereoWavBlob(
+  left: Float32Array,
+  right: Float32Array,
+  sampleRate: number
+): Blob {
+  return encodeStereoAudioBlob(left, right, sampleRate, 'wav16');
 }

@@ -1,26 +1,28 @@
 //! Single-Binary Rust Entrypoint for Music Studio AI.
 //! Integrates:
-//! - Stage 2: Core Audio & Video Track Demuxer (MP3/WAV/FLAC/MP4/MKV/WEBM) + Multi-Stem Mixer
+//! - Stage 2: Core Audio & Video Track Demuxer (`MP3`/`WAV`/`FLAC`/`MP4`/`MKV`/`WEBM`) + Multi-Stem Mixer
 //! - Stage 3: Formant-Preserving Pitch & Time DSP + Key/BPM Detection
 //! - Stage 4: Resumable HuggingFace ONNX Model Manager + SHA-256 Verification
 //! - Stage 5: 3-Stage STFT/iSTFT + ONNX Runtime (`ort` load-dynamic + DirectML) Stem Separator
-//! - Direct YouTube Single-Track URL Parser (strips playlist bulk downloading)
+//! - Stage 6: Tauri v2 IPC Commands (`--features desktop-tauri`) + Multi-Format Export (`WAV` / `FLAC`)
 
 pub mod ai_separator;
 pub mod audio_engine;
 pub mod audio_io;
 pub mod dsp_pitch_time;
+pub mod ipc_commands;
 pub mod model_manager;
 pub mod youtube_loader;
 
-use ai_separator::{init_ort_environment, SeparationPipelineConfig};
-use audio_engine::MasterTransportState;
-use audio_io::STUDIO_SAMPLE_RATE;
-use dsp_pitch_time::{PitchShiftEngine, PitchSpeedConfig};
-use model_manager::{discover_onnxruntime_library, ModelManager};
-use youtube_loader::parse_youtube_single_video_url;
-
+#[cfg(not(feature = "desktop-tauri"))]
 fn main() {
+    use ai_separator::{init_ort_environment, SeparationPipelineConfig};
+    use audio_engine::MasterTransportState;
+    use audio_io::STUDIO_SAMPLE_RATE;
+    use dsp_pitch_time::{PitchShiftEngine, PitchSpeedConfig};
+    use model_manager::{discover_onnxruntime_library, ModelManager};
+    use youtube_loader::parse_youtube_single_video_url;
+
     let pitch_config = PitchSpeedConfig {
         semitones: 0.0,
         cents: 0.0,
@@ -70,4 +72,29 @@ fn main() {
         transport.total_frames,
         pipeline_config.stage1_inst_model.model_filename
     );
+}
+
+#[cfg(feature = "desktop-tauri")]
+fn main() {
+    use std::sync::{Arc, Mutex};
+    use ipc_commands::{tauri_commands, StudioAppState};
+
+    let app_state = Arc::new(Mutex::new(
+        StudioAppState::new("models").expect("Failed to initialize Music Studio AI state"),
+    ));
+
+    tauri::Builder::default()
+        .manage(app_state)
+        .invoke_handler(tauri::generate_handler![
+            tauri_commands::ipc_load_track,
+            tauri_commands::ipc_parse_youtube_url,
+            tauri_commands::ipc_update_pitch_speed,
+            tauri_commands::ipc_list_models,
+            tauri_commands::ipc_import_local_onnx,
+            tauri_commands::ipc_delete_model,
+            tauri_commands::ipc_run_separation,
+            tauri_commands::ipc_export_audio,
+        ])
+        .run(tauri::generate_context!())
+        .expect("Failed to start Music Studio AI desktop runtime");
 }
