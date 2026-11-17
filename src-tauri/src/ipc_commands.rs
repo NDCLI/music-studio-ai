@@ -188,6 +188,176 @@ pub fn handle_download_model(
     manager.download_model_resumable(model_id, cancel_flag, |_| {})
 }
 
+/// Resolves the default writable export directory (`%USERPROFILE%\Music\Music Studio AI` on Windows).
+pub fn resolve_default_export_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        let base = PathBuf::from(home);
+        let music_dir = base.join("Music");
+        if music_dir.exists() {
+            return music_dir.join("Music Studio AI");
+        }
+        return base.join("Downloads").join("Music Studio AI");
+    }
+    PathBuf::from("exports")
+}
+
+pub fn handle_get_default_export_dir() -> Result<String, String> {
+    let dir = resolve_default_export_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to prepare default export folder: {}", e))?;
+    Ok(dir.display().to_string())
+}
+
+/// Opens a native Windows folder selection dialog via Win32 `SHBrowseForFolderW` (no external `.exe`).
+pub fn handle_pick_export_folder() -> Result<Option<String>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::ffi::OsStringExt;
+
+        #[repr(C)]
+        struct BrowseInfoW {
+            hwnd_owner: *mut core::ffi::c_void,
+            pidl_root: *const core::ffi::c_void,
+            psz_display_name: *mut u16,
+            lpsz_title: *const u16,
+            ul_flags: u32,
+            lpfn: *const core::ffi::c_void,
+            l_param: isize,
+            i_image: i32,
+        }
+
+        #[link(name = "shell32")]
+        extern "system" {
+            fn SHBrowseForFolderW(lpbi: *mut BrowseInfoW) -> *mut core::ffi::c_void;
+            fn SHGetPathFromIDListW(pidl: *const core::ffi::c_void, psz_path: *mut u16) -> i32;
+        }
+
+        #[link(name = "ole32")]
+        extern "system" {
+            fn CoInitializeEx(pv_reserved: *mut core::ffi::c_void, dw_co_init: u32) -> i32;
+            fn CoTaskMemFree(pv: *mut core::ffi::c_void);
+        }
+
+        unsafe {
+            let _ = CoInitializeEx(core::ptr::null_mut(), 0x2); // COINIT_APARTMENTTHREADED
+        }
+
+        let mut display_buf = [0_u16; 260];
+        let title: Vec<u16> = OsStr::new("Chon thu muc luu file nhac xuat - Music Studio AI")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+
+        let mut bi = BrowseInfoW {
+            hwnd_owner: core::ptr::null_mut(),
+            pidl_root: core::ptr::null(),
+            psz_display_name: display_buf.as_mut_ptr(),
+            lpsz_title: title.as_ptr(),
+            ul_flags: 0x0000_0041, // BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
+            lpfn: core::ptr::null(),
+            l_param: 0,
+            i_image: 0,
+        };
+
+        let pidl = unsafe { SHBrowseForFolderW(&mut bi) };
+        if pidl.is_null() {
+            return Ok(None);
+        }
+
+        let mut path_buf = [0_u16; 1024];
+        let ok = unsafe { SHGetPathFromIDListW(pidl, path_buf.as_mut_ptr()) };
+        unsafe { CoTaskMemFree(pidl) };
+
+        if ok == 0 {
+            return Ok(None);
+        }
+
+        let len = path_buf.iter().position(|&c| c == 0).unwrap_or(path_buf.len());
+        let selected = std::ffi::OsString::from_wide(&path_buf[..len])
+            .to_string_lossy()
+            .into_owned();
+        return Ok(Some(selected));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Native folder picker is only supported on Windows".to_string())
+    }
+}
+
+/// Saves rendered audio bytes directly into the user-selected export folder safely.
+pub fn handle_save_exported_file(
+    output_dir: &str,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    let dir = PathBuf::from(output_dir);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create export folder '{}': {}", dir.display(), e))?;
+
+    let safe_name = Path::new(file_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "Invalid export file name".to_string())?;
+    let target_path = dir.join(safe_name);
+
+    std::fs::write(&target_path, bytes)
+        .map_err(|e| format!("Failed to write '{}': {}", target_path.display(), e))?;
+
+    Ok(target_path.display().to_string())
+}
+
+/// Opens a local directory in Windows File Explorer without spawning shell commands.
+pub fn handle_open_local_folder(folder_path: &str) -> Result<(), String> {
+    let dir = Path::new(folder_path);
+    if !dir.is_dir() {
+        return Err(format!("Folder '{}' does not exist", dir.display()));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut core::ffi::c_void,
+                lp_operation: *const u16,
+                lp_file: *const u16,
+                lp_parameters: *const u16,
+                lp_directory: *const u16,
+                n_show_cmd: i32,
+            ) -> isize;
+        }
+
+        let op: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
+        let path_w: Vec<u16> = OsStr::new(folder_path).encode_wide().chain(Some(0)).collect();
+        let res = unsafe {
+            ShellExecuteW(
+                core::ptr::null_mut(),
+                op.as_ptr(),
+                path_w.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                1,
+            )
+        };
+        if res <= 32 {
+            return Err(format!("Failed to open folder (code {})", res));
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = dir;
+        Err("Open folder is only supported on Windows".to_string())
+    }
+}
+
 /// Validates and opens an external `https://` URL in the OS default browser without spawning shell `.exe`s.
 pub fn handle_open_external_url(url: &str) -> Result<(), String> {
     let trimmed = url.trim();
@@ -494,6 +664,32 @@ pub mod tauri_commands {
     }
 
     #[tauri::command]
+    pub fn ipc_get_default_export_dir() -> Result<String, String> {
+        handle_get_default_export_dir()
+    }
+
+    #[tauri::command]
+    pub async fn ipc_pick_export_folder() -> Result<Option<String>, String> {
+        tauri::async_runtime::spawn_blocking(handle_pick_export_folder)
+            .await
+            .map_err(|e| format!("Folder picker worker panicked: {}", e))?
+    }
+
+    #[tauri::command]
+    pub fn ipc_save_exported_file(
+        output_dir: String,
+        file_name: String,
+        bytes: Vec<u8>,
+    ) -> Result<String, String> {
+        handle_save_exported_file(&output_dir, &file_name, &bytes)
+    }
+
+    #[tauri::command]
+    pub fn ipc_open_local_folder(folder_path: String) -> Result<(), String> {
+        handle_open_local_folder(&folder_path)
+    }
+
+    #[tauri::command]
     pub fn ipc_run_separation(
         state: tauri::State<'_, Arc<Mutex<StudioAppState>>>,
         mode: SeparationMode,
@@ -558,6 +754,20 @@ mod tests {
         let overview = handle_list_models(&state).expect("list models");
         assert_eq!(overview.catalog.len(), 6);
 
+        let default_export = resolve_default_export_dir();
+        assert!(default_export.ends_with("Music Studio AI"));
+
+        let temp_export = std::env::temp_dir().join("music_studio_ipc_test_exports");
+        let saved_path = handle_save_exported_file(
+            &temp_export.display().to_string(),
+            "subdir/mix_test.wav",
+            b"RIFFtest",
+        )
+        .expect("save exported file");
+        assert!(saved_path.ends_with("mix_test.wav"));
+        assert_eq!(std::fs::read(&saved_path).expect("read saved"), b"RIFFtest");
+
+        let _ = std::fs::remove_dir_all(&temp_export);
         let _ = std::fs::remove_dir_all(&temp_models);
     }
 }

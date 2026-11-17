@@ -285,9 +285,7 @@ export async function separateAudioBuffer3Stage(
   const yieldStep = isPro ? 220 : 320;
 
   // Stage 1: Extract All Vocals (Lead + Backing) and subtract from Original to get Instrumental
-  const stage1ModelName = isPro
-    ? 'mel_band_roformer_kim_ft_unwa (STFT Spectral)'
-    : 'UVR-MDX-NET-Inst_HQ_4 (STFT Spectral)';
+  const stage1ModelName = isPro ? 'Chế độ Siêu Nét' : 'Chế độ Nhanh';
   const prevStage1Mask = new Float32Array(halfBins);
 
   const allVocals = await runStftSpectralMaskPass(
@@ -350,9 +348,7 @@ export async function separateAudioBuffer3Stage(
   const instrumental = subtractStereo(original, allVocals);
 
   // Stage 2: Extract Lead Vocal (focused centered formant ridges) vs Backing Vocal / Harmony
-  const stage2ModelName = isPro
-    ? 'mel_band_roformer_karaoke_aufr33_viperx'
-    : 'UVR_MDXNET_KARA_2';
+  const stage2ModelName = isPro ? 'Chế độ Siêu Nét' : 'Chế độ Nhanh';
 
   const leadWithReverb = await runStftSpectralMaskPass(
     allVocals,
@@ -424,8 +420,7 @@ export async function separateAudioBuffer3Stage(
       onProgress({
         stage: 3,
         percent: 72 + Math.round(ratio * 28),
-        message:
-          'Tầng 3/3: Đang khử đuôi vang cho Vocal Khô (Reverb_HQ_By_FoxJoy STFT)...',
+        message: 'Tầng 3/3: Đang lọc tiếng vang cho Vocal chính...',
       });
     }
   );
@@ -449,7 +444,7 @@ export async function separateAudioBuffer3Stage(
   onProgress({
     stage: 3,
     percent: 100,
-    message: 'Hoàn tất tách 4 kênh âm thanh độc lập (STFT Overlap-Add 50%)!',
+    message: 'Hoàn tất tách 4 kênh âm thanh độc lập!',
   });
 
   return { stems, peaks };

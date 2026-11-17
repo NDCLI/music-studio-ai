@@ -191,7 +191,7 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
           <div>
             <div className="flex items-center gap-2">
               <h2 className="text-sm font-bold text-white">
-                TÁCH NHẠC NỀN, VOCAL CHÍNH &amp; GIỌNG BÈ (LOCAL AI STEM SEPARATOR)
+                TÁCH NHẠC NỀN, VOCAL CHÍNH &amp; GIỌNG BÈ
               </h2>
               {separationStatus.isSeparated && (
                 <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2.5 py-0.5 font-mono text-[11px] font-semibold text-emerald-400">
@@ -203,7 +203,7 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
             <p className="text-xs text-slate-400">
               {separationStatus.isSeparated && !separationStatus.isRunning
                 ? separationStatus.stageMessage
-                : 'Pipeline 3 tầng ONNX Local: Tách Instrumental → Tách Lead Vocal & Bè → Khử Vang Reverb'}
+                : 'Tách riêng giọng hát chính, giọng bè, nhạc nền và tiếng vang'}
             </p>
           </div>
         </div>
@@ -220,7 +220,7 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
                   : 'text-slate-400 hover:text-white'
               }`}
             >
-              Chế Độ Nhanh (MDX-Net ONNX)
+              Chế Độ Nhanh
             </button>
             <button
               type="button"
@@ -231,7 +231,7 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
                   : 'text-slate-400 hover:text-white'
               }`}
             >
-              Siêu Nét (Mel-Band RoFormer)
+              Chất Lượng Cao (Siêu Nét)
             </button>
           </div>
 
@@ -249,7 +249,7 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
             ) : (
               <>
                 <Sparkles className="h-4 w-4" />
-                <span>Tách Nhạc AI Local (3 Tầng)</span>
+                <span>Tách Nhạc AI (3 Tầng)</span>
               </>
             )}
           </button>
@@ -303,10 +303,6 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
             );
           })}
         </div>
-
-        <span className="font-mono text-[11px] text-slate-400">
-          STFT Overlap-Add: 50% &bull; Sample Rate: 44.1 kHz
-        </span>
       </div>
 
       {/* 4 Multi-Stem Tracks */}
@@ -342,9 +338,6 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
                     )}
                   </div>
                   <p className="text-[11px] text-slate-400 truncate">{stem.subtitle}</p>
-                  <span className="mt-1 inline-block font-mono text-[10px] text-slate-500">
-                    Model: {stem.modelSource}
-                  </span>
                 </div>
               </div>
 

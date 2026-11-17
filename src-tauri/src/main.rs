@@ -101,6 +101,10 @@ fn main() {
             tauri_commands::ipc_import_local_onnx,
             tauri_commands::ipc_delete_model,
             tauri_commands::ipc_open_external_url,
+            tauri_commands::ipc_get_default_export_dir,
+            tauri_commands::ipc_pick_export_folder,
+            tauri_commands::ipc_save_exported_file,
+            tauri_commands::ipc_open_local_folder,
             tauri_commands::ipc_run_separation,
             tauri_commands::ipc_export_audio,
         ])

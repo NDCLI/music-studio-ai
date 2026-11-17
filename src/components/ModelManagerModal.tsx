@@ -8,10 +8,8 @@ import {
   Download,
   ExternalLink,
   FolderPlus,
-  HardDrive,
   Loader2,
   Pause,
-  ShieldCheck,
   Trash2,
   X,
 } from 'lucide-react';
@@ -104,10 +102,10 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
             </div>
             <div>
               <h2 id="model-manager-title" className="text-base font-bold text-white">
-                QUẢN LÝ MODEL AI TÁCH NHẠC &amp; PITCH LOCAL (ONNX RUNTIME)
+                QUẢN LÝ MODEL AI TÁCH NHẠC &amp; XỬ LÝ GIỌNG
               </h2>
               <p className="text-xs text-slate-400">
-                Tải từ HuggingFace hoặc nhập file `.onnx` có sẵn trên máy &bull; Kiểm tra SHA-256 &bull; Lưu Cache Offline
+                Tải từ HuggingFace hoặc nhập file `.onnx` có sẵn trên máy &bull; Lưu Cache Offline ({formatBytesMb(totalCachedBytes)})
               </p>
             </div>
           </div>
@@ -120,17 +118,6 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
           >
             <X className="h-4 w-4" />
           </button>
-        </div>
-
-        {/* Runtime & Cache Summary Banner */}
-        <div className="mx-6 mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-500/25 bg-emerald-500/10 px-4 py-2.5 text-xs text-emerald-200">
-          <span className="inline-flex items-center gap-2">
-            <ShieldCheck className="h-4 w-4 text-emerald-400 shrink-0" />
-            Rust `ort` (`load-dynamic`, `directml`) dùng `onnxruntime.dll` có chữ ký số Microsoft &mdash; Không tạo `.exe` phụ trợ.
-          </span>
-          <span className="font-mono text-[11px] text-emerald-300">
-            Cache Offline: {formatBytesMb(totalCachedBytes)}
-          </span>
         </div>
 
         {/* Models Cards */}
@@ -270,26 +257,12 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
                 </div>
               )}
 
-              {/* Technical STFT Parameters & SHA-256 Fingerprint */}
-              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-white/5 pt-2.5 font-mono text-[11px] text-slate-400">
-                <div className="flex flex-wrap items-center gap-2">
-                  <HardDrive className="h-3.5 w-3.5 text-slate-500" />
-                  <span>n_fft: {m.stftSpec.nFft}</span>
-                  <span>&bull;</span>
-                  <span>hop_length: {m.stftSpec.hopLength}</span>
-                  <span>&bull;</span>
-                  <span>dim_f: {m.stftSpec.dimF}</span>
-                  <span>&bull;</span>
-                  <span>dim_t: {m.stftSpec.dimT}</span>
-                  <span>&bull;</span>
-                  <span>compensate: {m.stftSpec.compensate}</span>
+              {/* SHA-256 Verification Fingerprint when installed */}
+              {m.sha256Hex && (
+                <div className="mt-3 flex items-center justify-end border-t border-white/5 pt-2.5 font-mono text-[11px] text-emerald-400">
+                  SHA-256: {m.sha256Hex.slice(0, 12)}...{m.sha256Hex.slice(-8)}
                 </div>
-                {m.sha256Hex && (
-                  <span className="text-emerald-400">
-                    SHA-256: {m.sha256Hex.slice(0, 12)}...{m.sha256Hex.slice(-8)}
-                  </span>
-                )}
-              </div>
+              )}
             </div>
           ))}
         </div>

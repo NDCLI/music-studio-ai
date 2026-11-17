@@ -136,3 +136,42 @@ export async function parseYouTubeViaRustBackend(rawUrl: string): Promise<{
   if (!isTauriDesktopRuntime()) return null;
   return invokeRustCommand('ipc_parse_youtube_url', { rawUrl });
 }
+
+/**
+ * Resolves the default local export directory (%USERPROFILE%\Music\Music Studio AI).
+ */
+export async function getDefaultExportDirViaRust(): Promise<string | null> {
+  if (!isTauriDesktopRuntime()) return null;
+  return invokeRustCommand<string>('ipc_get_default_export_dir');
+}
+
+/**
+ * Opens a native Windows folder picker dialog without spawning child .exe processes.
+ */
+export async function pickExportFolderViaRust(): Promise<string | null> {
+  if (!isTauriDesktopRuntime()) return null;
+  return invokeRustCommand<string | null>('ipc_pick_export_folder');
+}
+
+/**
+ * Writes rendered audio bytes directly to the chosen Windows directory.
+ */
+export async function saveExportedFileViaRust(
+  outputDir: string,
+  fileName: string,
+  bytes: Uint8Array
+): Promise<string> {
+  return invokeRustCommand<string>('ipc_save_exported_file', {
+    outputDir,
+    fileName,
+    bytes: Array.from(bytes),
+  });
+}
+
+/**
+ * Opens a local folder in Windows Explorer via Win32 ShellExecuteW.
+ */
+export async function openLocalFolderViaRust(folderPath: string): Promise<void> {
+  if (!isTauriDesktopRuntime()) return;
+  await invokeRustCommand<void>('ipc_open_local_folder', { folderPath });
+}

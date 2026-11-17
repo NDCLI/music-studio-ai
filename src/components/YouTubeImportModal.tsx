@@ -99,10 +99,10 @@ export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
             </div>
             <div>
               <h2 id="youtube-modal-title" className="text-base font-bold text-white">
-                NẠP NHẠC TRỰC TIẾP TỪ YOUTUBE (SINGLE-TRACK EXTRACTOR)
+                NẠP NHẠC TỪ YOUTUBE
               </h2>
               <p className="text-xs text-slate-400">
-                Hỗ trợ cả link có Playlist nhưng tự động lọc chỉ lấy đúng bài đang phát (`--no-playlist`)
+                Hỗ trợ link có kèm Playlist &mdash; tự động chỉ lấy đúng bài hát đang phát
               </p>
             </div>
           </div>

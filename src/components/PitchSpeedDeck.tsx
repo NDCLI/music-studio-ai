@@ -54,10 +54,10 @@ export const PitchSpeedDeck: React.FC<PitchSpeedDeckProps> = ({
             </div>
             <div>
               <h2 className="text-sm font-bold text-white">
-                NÂNG HẠ TONE KHÔNG MÉO TIẾNG (ARTIFACT-FREE PITCH SHIFTER)
+                NÂNG HẠ TONE (PITCH SHIFTER)
               </h2>
               <p className="text-xs text-slate-400">
-                Dịch chuyển cao độ thời gian thực giữ nguyên cấu trúc Formant thanh quản
+                Dịch chuyển cao độ thời gian thực giữ nguyên âm sắc giọng hát tự nhiên
               </p>
             </div>
           </div>
@@ -250,15 +250,12 @@ export const PitchSpeedDeck: React.FC<PitchSpeedDeckProps> = ({
           </button>
         </div>
 
-        {/* Open-Source Pitch Engine Selector */}
+        {/* Pitch Engine Selector */}
         <div className="mt-3.5 rounded-xl border border-white/10 bg-[#080B14]/90 p-3">
           <div className="mb-2 flex items-center justify-between">
             <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-300">
               <Sparkles className="h-3.5 w-3.5 text-indigo-400" />
-              Model / Engine Nâng Hạ Tone Mã Nguồn Mở (Free Local):
-            </span>
-            <span className="font-mono text-[11px] text-emerald-400">
-              {activeEngine.license}
+              Chế Độ Xử Lý Cao Độ:
             </span>
           </div>
 
@@ -300,7 +297,7 @@ export const PitchSpeedDeck: React.FC<PitchSpeedDeckProps> = ({
               </div>
               <div>
                 <h2 className="text-sm font-bold text-white">
-                  CHỈNH TỐC ĐỘ BÀI HÁT (TIME STRETCHER)
+                  CHỈNH TỐC ĐỘ BÀI HÁT
                 </h2>
                 <p className="text-xs text-slate-400">
                   Tăng/giảm nhịp độ độc lập không làm thay đổi cao độ

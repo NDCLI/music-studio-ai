@@ -4,7 +4,7 @@ import { TransportBar } from './components/TransportBar';
 import { PitchSpeedDeck } from './components/PitchSpeedDeck';
 import { StemMixerTimeline } from './components/StemMixerTimeline';
 import { ModelManagerModal } from './components/ModelManagerModal';
-import { ExportModal, ExportFormat, ExportTarget } from './components/ExportModal';
+import { ExportModal, ExportFormat, ExportOutcome, ExportTarget } from './components/ExportModal';
 import { YouTubeImportModal } from './components/YouTubeImportModal';
 import { LOCAL_AI_MODELS } from './data/modelsCatalog';
 import {
@@ -21,8 +21,12 @@ import { separateAudioBuffer3Stage } from './services/stemSeparator';
 import {
   deleteModelViaRustBackend,
   downloadModelViaRustBackend,
+  getDefaultExportDirViaRust,
   isTauriDesktopRuntime,
   listModelsViaRustBackend,
+  openLocalFolderViaRust,
+  pickExportFolderViaRust,
+  saveExportedFileViaRust,
   syncPitchSpeedToRustBackend,
 } from './services/tauriBridge';
 import { YouTubeTrackResolvedInfo } from './services/youtubeParser';
@@ -37,6 +41,21 @@ import {
   StemTrackState,
   TrackSourceType,
 } from './types/studio';
+
+const EXPORT_DIR_STORAGE_KEY = 'music_studio_export_dir';
+
+interface BrowserWritableFileStream {
+  write: (data: Blob) => Promise<void>;
+  close: () => Promise<void>;
+}
+
+interface BrowserDirectoryHandle {
+  name: string;
+  getFileHandle: (
+    name: string,
+    options?: { create?: boolean }
+  ) => Promise<{ createWritable: () => Promise<BrowserWritableFileStream> }>;
+}
 
 const VIDEO_EXTENSIONS = ['mp4', 'mkv', 'webm', 'mov', 'avi', 'm4v'];
 
@@ -151,14 +170,25 @@ export const App: React.FC = () => {
       currentStage: 3,
       progressPercent: 100,
       stageMessage:
-        'Sẵn sàng 4 rãnh Demo đa kênh (Mở file Nhạc/Video để tách phổ thực tế)',
-      executionBackend: '4 Stems Active',
+        'Sẵn sàng 4 rãnh mẫu (Mở file Nhạc/Video để tách riêng giọng hát & nhạc nền)',
+      executionBackend: '4 Kênh Sẵn Sàng',
     });
 
   const [models, setModels] = useState<LocalAiModelSpec[]>(LOCAL_AI_MODELS);
   const [isYouTubeModalOpen, setIsYouTubeModalOpen] = useState(false);
   const [isModelModalOpen, setIsModelModalOpen] = useState(false);
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+
+  const [defaultExportDir, setDefaultExportDir] = useState<string | null>(null);
+  const [customExportDir, setCustomExportDir] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(EXPORT_DIR_STORAGE_KEY) || null;
+    } catch {
+      return null;
+    }
+  });
+  const [browserDirHandle, setBrowserDirHandle] =
+    useState<BrowserDirectoryHandle | null>(null);
 
   const audioEngineRef = useRef<StudioPreviewAudioEngine | null>(null);
   const downloadAbortControllersRef = useRef<Record<string, AbortController>>({});
@@ -169,6 +199,14 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     audioEngineRef.current = new StudioPreviewAudioEngine();
+
+    if (isTauriDesktopRuntime()) {
+      void getDefaultExportDirViaRust()
+        .then((dir) => {
+          if (dir) setDefaultExportDir(dir);
+        })
+        .catch(() => {});
+    }
 
     void Promise.all([
       listCachedModelsFromDb().catch(() => ({} as Record<string, { sizeBytes: number; sha256Hex: string; source: 'huggingface' | 'local_import' }>)),
@@ -288,7 +326,7 @@ export const App: React.FC = () => {
         isSeparated: false,
         currentStage: 0,
         progressPercent: 0,
-        stageMessage: `Đã nạp "${file.name}" — Bấm "Tách Nhạc AI Local (3 Tầng)" để tách riêng Vocal, Bè & Nhạc nền.`,
+        stageMessage: `Đã nạp "${file.name}" — Bấm "Tách Nhạc AI (3 Tầng)" để tách riêng Vocal, Bè & Nhạc nền.`,
       });
       setCurrentTimeSec(0);
     } catch {
@@ -340,13 +378,85 @@ export const App: React.FC = () => {
     setCurrentTimeSec(info.parsed.startTimeSec ?? 0);
   };
 
-  const handleTriggerExport = (
+  const activeDesktopExportDir = customExportDir ?? defaultExportDir;
+  const isDesktopRuntime = isTauriDesktopRuntime();
+  const exportFolderLabel = isDesktopRuntime
+    ? activeDesktopExportDir ?? '%USERPROFILE%\\Music\\Music Studio AI'
+    : browserDirHandle?.name ?? 'Thư mục Downloads (Mặc định của trình duyệt)';
+  const isCustomExportFolder = isDesktopRuntime
+    ? Boolean(customExportDir)
+    : Boolean(browserDirHandle);
+  const canOpenExportFolder = isDesktopRuntime && Boolean(activeDesktopExportDir);
+
+  const handlePickExportFolder = async (): Promise<string | null> => {
+    if (isTauriDesktopRuntime()) {
+      const picked = await pickExportFolderViaRust();
+      if (picked) {
+        setCustomExportDir(picked);
+        try {
+          localStorage.setItem(EXPORT_DIR_STORAGE_KEY, picked);
+        } catch {
+          // Ignore storage quota errors
+        }
+      }
+      return null;
+    }
+
+    const picker = (
+      window as unknown as {
+        showDirectoryPicker?: (opts?: { mode?: 'read' | 'readwrite' }) => Promise<BrowserDirectoryHandle>;
+      }
+    ).showDirectoryPicker;
+
+    if (typeof picker !== 'function') {
+      return 'Trình duyệt hiện tại không hỗ trợ chọn thư mục trực tiếp; file xuất sẽ tải về thư mục Downloads mặc định.';
+    }
+
+    try {
+      const handle = await picker({ mode: 'readwrite' });
+      setBrowserDirHandle(handle);
+      return null;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        return null;
+      }
+      return err instanceof Error ? err.message : 'Không thể truy cập thư mục đã chọn.';
+    }
+  };
+
+  const handleResetExportFolder = () => {
+    if (isTauriDesktopRuntime()) {
+      setCustomExportDir(null);
+      try {
+        localStorage.removeItem(EXPORT_DIR_STORAGE_KEY);
+      } catch {
+        // Ignore storage errors
+      }
+      return;
+    }
+    setBrowserDirHandle(null);
+  };
+
+  const handleOpenExportFolder = () => {
+    if (isTauriDesktopRuntime() && activeDesktopExportDir) {
+      void openLocalFolderViaRust(activeDesktopExportDir);
+    }
+  };
+
+  const handleTriggerExport = async (
     baseName: string,
     target: ExportTarget,
     format: ExportFormat
-  ): string[] => {
+  ): Promise<ExportOutcome> => {
     const engine = audioEngineRef.current;
-    if (!engine) return [];
+    if (!engine) {
+      return {
+        files: [],
+        destinationLabel: exportFolderLabel,
+        savedToLocalFolder: false,
+        errorMessage: 'Bộ phát âm thanh chưa sẵn sàng.',
+      };
+    }
 
     const outputs = engine.renderExportAudioFiles(
       baseName,
@@ -355,8 +465,40 @@ export const App: React.FC = () => {
       target,
       format
     );
-    const names: string[] = [];
 
+    if (isTauriDesktopRuntime() && activeDesktopExportDir) {
+      const savedNames: string[] = [];
+      for (const item of outputs) {
+        const bytes = new Uint8Array(await item.blob.arrayBuffer());
+        await saveExportedFileViaRust(activeDesktopExportDir, item.fileName, bytes);
+        savedNames.push(item.fileName);
+      }
+      return {
+        files: savedNames,
+        destinationLabel: activeDesktopExportDir,
+        savedToLocalFolder: true,
+      };
+    }
+
+    if (browserDirHandle) {
+      const savedNames: string[] = [];
+      for (const item of outputs) {
+        const fileHandle = await browserDirHandle.getFileHandle(item.fileName, {
+          create: true,
+        });
+        const writable = await fileHandle.createWritable();
+        await writable.write(item.blob);
+        await writable.close();
+        savedNames.push(item.fileName);
+      }
+      return {
+        files: savedNames,
+        destinationLabel: `thư mục "${browserDirHandle.name}"`,
+        savedToLocalFolder: true,
+      };
+    }
+
+    const names: string[] = [];
     for (const item of outputs) {
       const url = URL.createObjectURL(item.blob);
       const anchor = document.createElement('a');
@@ -369,7 +511,11 @@ export const App: React.FC = () => {
       names.push(item.fileName);
     }
 
-    return names;
+    return {
+      files: names,
+      destinationLabel: 'thư mục Downloads mặc định',
+      savedToLocalFolder: false,
+    };
   };
 
   const handleUpdatePitchSpeed = (partial: Partial<PitchSpeedSettings>) => {
@@ -418,7 +564,7 @@ export const App: React.FC = () => {
         isSeparated: false,
         currentStage: 1,
         progressPercent: 1,
-        stageMessage: 'Đang khởi tạo bộ biến đổi STFT 3 tầng & Overlap-Add 50%...',
+        stageMessage: 'Đang phân tích tín hiệu & chuẩn bị tách 3 tầng...',
       });
 
       const result = await separateAudioBuffer3Stage(
@@ -449,28 +595,21 @@ export const App: React.FC = () => {
         isSeparated: true,
         currentStage: 3,
         progressPercent: 100,
-        stageMessage:
-          'Hoàn tất tách 4 kênh (Lead Vocal, Bè, Nhạc nền, Reverb) bằng STFT Overlap-Add 50%!',
-        executionBackend: 'STFT 3-Stage Separated',
+        stageMessage: 'Hoàn tất tách 4 kênh (Vocal chính, Giọng bè, Nhạc nền, Reverb)!',
+        executionBackend: 'Đã Tách 4 Rãnh',
       });
       return;
     }
 
-    const stage1Model =
-      qualityMode === 'fast_mdx'
-        ? 'UVR-MDX-NET-Inst_HQ_4.onnx (n_fft=5120, dim_f=2560)'
-        : 'mel_band_roformer_kim_ft_unwa.onnx (SDR 13.1 dB)';
-    const stage2Model =
-      qualityMode === 'fast_mdx'
-        ? 'UVR_MDXNET_KARA_2.onnx (n_fft=5120, dim_f=2048)'
-        : 'mel_band_roformer_karaoke_aufr33_viperx.onnx';
+    const modeLabel =
+      qualityMode === 'fast_mdx' ? 'Chế độ Nhanh' : 'Chế độ Siêu Nét';
 
     setSeparationStatus({
       isRunning: true,
       isSeparated: false,
       currentStage: 1,
       progressPercent: 15,
-      stageMessage: `Tầng 1/3 (Demo): Đang tách Nhạc Nền & Tổng Vocal bằng ${stage1Model}...`,
+      stageMessage: `Tầng 1/3: Đang tách Nhạc Nền & Giọng hát (${modeLabel})...`,
     });
 
     window.setTimeout(() => {
@@ -479,7 +618,7 @@ export const App: React.FC = () => {
         isSeparated: false,
         currentStage: 2,
         progressPercent: 56,
-        stageMessage: `Tầng 2/3 (Demo): Đang tách Vocal Chính & Giọng Bè bằng ${stage2Model}...`,
+        stageMessage: `Tầng 2/3: Đang tách Vocal Chính & Giọng Bè (${modeLabel})...`,
       });
     }, 650);
 
@@ -489,8 +628,7 @@ export const App: React.FC = () => {
         isSeparated: false,
         currentStage: 3,
         progressPercent: 86,
-        stageMessage:
-          'Tầng 3/3 (Demo): Đang tách Vocal Khô & Đuôi Vang bằng Reverb_HQ_By_FoxJoy.onnx (n_fft=7680)...',
+        stageMessage: 'Tầng 3/3: Đang lọc tiếng vang cho Vocal chính...',
       });
     }, 1300);
 
@@ -501,8 +639,8 @@ export const App: React.FC = () => {
         currentStage: 3,
         progressPercent: 100,
         stageMessage:
-          'Hoàn tất tách 4 rãnh trên bản Demo (Mở file MP3/WAV/MP4 để chạy tách phổ thực tế)!',
-        executionBackend: 'Demo 4-Stem Mix',
+          'Hoàn tất tách 4 rãnh trên bản mẫu (Mở file Nhạc/Video để tách từ file thực tế)!',
+        executionBackend: '4 Kênh Sẵn Sàng',
       });
       setStems((prev) =>
         prev.map((s) => ({
@@ -860,6 +998,12 @@ export const App: React.FC = () => {
         isOpen={isExportModalOpen}
         song={song}
         settings={pitchSpeed}
+        exportFolderLabel={exportFolderLabel}
+        isCustomExportFolder={isCustomExportFolder}
+        canOpenExportFolder={canOpenExportFolder}
+        onPickExportFolder={handlePickExportFolder}
+        onResetExportFolder={handleResetExportFolder}
+        onOpenExportFolder={handleOpenExportFolder}
         onClose={() => setIsExportModalOpen(false)}
         onTriggerExport={handleTriggerExport}
       />

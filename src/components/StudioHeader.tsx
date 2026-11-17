@@ -5,15 +5,11 @@ import {
   Download,
   Film,
   FolderOpen,
-  Layers,
   Music2,
   Play,
-  ShieldCheck,
-  Sparkles,
 } from 'lucide-react';
 import { SongMetadata } from '../types/studio';
 import { computeTransposedKey } from '../data/modelsCatalog';
-import { isTauriDesktopRuntime } from '../services/tauriBridge';
 
 interface StudioHeaderProps {
   song: SongMetadata;
@@ -49,7 +45,6 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
     return () => window.removeEventListener('scroll', onScroll);
   }, []);
 
-  const isDesktopIpc = isTauriDesktopRuntime();
   const targetKey = computeTransposedKey(song.originalKey, semitones);
   const effectiveBpm = (song.originalBpm * speed).toFixed(1);
 
@@ -117,12 +112,6 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
               >
                 MUSIC STUDIO AI
               </h1>
-              {!isScrolled && (
-                <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 font-mono text-[10px] font-semibold text-emerald-400">
-                  <ShieldCheck className="h-3 w-3" />
-                  {isDesktopIpc ? 'Tauri Rust IPC' : 'Rust Single-Binary'}
-                </span>
-              )}
             </div>
             {!isScrolled && (
               <p className="text-[11px] text-slate-400">
@@ -225,7 +214,7 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
             }`}
           >
             <Cpu className="h-3.5 w-3.5 text-indigo-400" />
-            <span>{isScrolled ? 'AI' : 'Model AI Local'}</span>
+            <span>{isScrolled ? 'AI' : 'Model AI'}</span>
             <span className="rounded-md bg-indigo-500/30 px-1.5 py-0.5 font-mono text-[10px] text-white">
               {installedModelCount}/{totalModelCount}
             </span>
@@ -243,32 +232,6 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
           </button>
         </div>
       </div>
-
-      {/* Sub-bar hidden automatically on scroll so content beneath stays unobstructed */}
-      {!isScrolled && (
-        <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-white/5 pt-1.5 text-[11px] text-slate-400">
-          <div className="flex flex-wrap items-center gap-4">
-            <span className="inline-flex items-center gap-1.5 text-slate-300">
-              <span className="h-2 w-2 rounded-full bg-emerald-400" />
-              IPC Bridge:{' '}
-              <strong className="font-mono text-white">
-                {isDesktopIpc
-                  ? 'Tauri v2 Native Rust IPC Active'
-                  : 'Browser Studio Mode (0 .exe) • Sẵn sàng ghép Tauri v2'}
-              </strong>
-            </span>
-            <span className="hidden md:inline-flex items-center gap-1.5">
-              <Layers className="h-3.5 w-3.5 text-indigo-400" />
-              Máy công ty:{' '}
-              <strong className="text-emerald-400">Anti-AhnLab (Single-Binary / 0 Sidecar .exe)</strong>
-            </span>
-          </div>
-          <div className="inline-flex items-center gap-1.5 font-mono text-indigo-300">
-            <Sparkles className="h-3.5 w-3.5" />
-            ui-ux-pro-max (Dark OLED)
-          </div>
-        </div>
-      )}
     </header>
   );
 };
