@@ -106,6 +106,7 @@ export const App: React.FC = () => {
   const [stems, setStems] = useState<StemTrackState[]>(INITIAL_STEMS);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTimeSec, setCurrentTimeSec] = useState(32.4);
+  const [peakLevelDb, setPeakLevelDb] = useState(-14.2);
   const [loopEnabled, setLoopEnabled] = useState(true);
   const [loopStartSec] = useState(30);
   const [loopEndSec] = useState(75);
@@ -154,13 +155,16 @@ export const App: React.FC = () => {
       engine.start(
         () => stemsRef.current,
         () => pitchSpeedRef.current,
-        (deltaSec) => {
+        (deltaSec, livePeakDb) => {
+          setPeakLevelDb(livePeakDb);
           setCurrentTimeSec((prev) => {
             const next = prev + deltaSec;
             if (loopEnabled && next >= loopEndSec) {
+              engine.seekToSeconds(loopStartSec);
               return loopStartSec;
             }
             if (next >= song.durationSec) {
+              engine.seekToSeconds(0);
               return 0;
             }
             return next;
@@ -174,24 +178,35 @@ export const App: React.FC = () => {
     audioEngineRef.current?.stop();
     setIsPlaying(false);
     setCurrentTimeSec(0);
+    audioEngineRef.current?.seekToSeconds(0);
+  };
+
+  const handleSeek = (timeSec: number) => {
+    setCurrentTimeSec(timeSec);
+    audioEngineRef.current?.seekToSeconds(timeSec);
   };
 
   const handleSelectAudioFile = async (file: File) => {
     const engine = audioEngineRef.current;
     if (!engine) return;
 
+    if (isPlaying) {
+      engine.stop();
+      setIsPlaying(false);
+    }
+
     try {
       const decoded = await engine.loadAudioFile(file);
       const cleanTitle = file.name.replace(/\.[^/.]+$/, '');
       setSong({
         title: cleanTitle,
-        artist: 'Local File',
+        artist: 'Local Audio Track',
         fileName: file.name,
         sampleRate: decoded.sampleRate,
         channels: decoded.channels,
-        durationSec: Math.max(10, Math.round(decoded.durationSec)),
-        originalBpm: 120,
-        originalKey: 'Am',
+        durationSec: Math.max(1, Math.round(decoded.durationSec)),
+        originalBpm: decoded.detectedBpm,
+        originalKey: decoded.detectedKey,
         isCustomFile: true,
       });
 
@@ -203,7 +218,6 @@ export const App: React.FC = () => {
       );
       setCurrentTimeSec(0);
     } catch {
-      // Fallback metadata update if browser cannot decode format directly
       const cleanTitle = file.name.replace(/\.[^/.]+$/, '');
       setSong((prev) => ({
         ...prev,
@@ -212,6 +226,21 @@ export const App: React.FC = () => {
         isCustomFile: true,
       }));
     }
+  };
+
+  const handleTriggerWavDownload = (outputFileName: string) => {
+    const engine = audioEngineRef.current;
+    if (!engine) return;
+
+    const wavBlob = engine.renderExportWavBlob(stems, pitchSpeed);
+    const url = URL.createObjectURL(wavBlob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = outputFileName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
   };
 
   const handleUpdatePitchSpeed = (partial: Partial<PitchSpeedSettings>) => {
@@ -405,9 +434,10 @@ export const App: React.FC = () => {
         loopEndSec={loopEndSec}
         masterVolume={masterVolume}
         limiterEnabled={limiterEnabled}
+        peakLevelDb={peakLevelDb}
         onTogglePlay={handleTogglePlay}
         onStop={handleStop}
-        onSeek={setCurrentTimeSec}
+        onSeek={handleSeek}
         onToggleLoop={() => setLoopEnabled(!loopEnabled)}
         onChangeMasterVolume={setMasterVolume}
         onToggleLimiter={() => setLimiterEnabled(!limiterEnabled)}
@@ -437,7 +467,7 @@ export const App: React.FC = () => {
           onToggleMute={handleToggleMute}
           onToggleSolo={handleToggleSolo}
           onChangeStemVolume={handleChangeStemVolume}
-          onSeek={setCurrentTimeSec}
+          onSeek={handleSeek}
         />
       </main>
 
@@ -454,6 +484,7 @@ export const App: React.FC = () => {
         song={song}
         settings={pitchSpeed}
         onClose={() => setIsExportModalOpen(false)}
+        onTriggerWavDownload={handleTriggerWavDownload}
       />
     </div>
   );

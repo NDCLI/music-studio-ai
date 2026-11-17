@@ -1,10 +1,14 @@
 //! Single-Binary Rust Entrypoint for Music Studio AI.
-//! Designed to minimize process spawning and avoid AhnLab antivirus scan bottlenecks.
+//! Integrates Stage 2 (Core Audio I/O & Multi-Stem Mixer) and Stage 3 (Formant-Preserving Pitch & Time DSP).
 
 pub mod ai_separator;
+pub mod audio_engine;
+pub mod audio_io;
 pub mod dsp_pitch_time;
 
-use ai_separator::{SeparationPipelineConfig, StftModelConfig};
+use ai_separator::SeparationPipelineConfig;
+use audio_engine::MasterTransportState;
+use audio_io::STUDIO_SAMPLE_RATE;
 use dsp_pitch_time::{PitchShiftEngine, PitchSpeedConfig};
 
 fn main() {
@@ -18,10 +22,15 @@ fn main() {
         engine: PitchShiftEngine::SignalsmithR3,
     };
 
+    let transport = MasterTransportState::default();
     let pipeline_config = SeparationPipelineConfig::default_mdx_pipeline();
 
     println!(
-        "Music Studio AI Core initialized | Pitch Engine: {:?} | Stage 1 ONNX: {}",
-        pitch_config.engine, pipeline_config.stage1_inst_model.model_filename
+        "Music Studio AI Core initialized @ {} Hz | Pitch Ratio: {:.4} | Engine: {:?} | Total Frames: {} | Stage 1 ONNX: {}",
+        STUDIO_SAMPLE_RATE,
+        pitch_config.pitch_ratio(),
+        pitch_config.engine,
+        transport.total_frames,
+        pipeline_config.stage1_inst_model.model_filename
     );
 }

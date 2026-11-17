@@ -14,6 +14,7 @@ interface ExportModalProps {
   song: SongMetadata;
   settings: PitchSpeedSettings;
   onClose: () => void;
+  onTriggerWavDownload: (fileName: string) => void;
 }
 
 type ExportFormat = 'wav24' | 'wav32f' | 'flac' | 'mp3_320';
@@ -24,6 +25,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   song,
   settings,
   onClose,
+  onTriggerWavDownload,
 }) => {
   const [format, setFormat] = useState<ExportFormat>('wav24');
   const [target, setTarget] = useState<ExportTarget>('master_mix');
@@ -34,14 +36,18 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   if (!isOpen) return null;
 
   const targetKey = computeTransposedKey(song.originalKey, settings.semitones);
+  const outputFileName = `${song.title.replace(/\s+/g, '_')}_${targetKey}_${Math.round(
+    settings.speed * 100
+  )}pct.wav`;
 
   const handleStartExport = () => {
     setIsExporting(true);
     setExportDone(false);
     window.setTimeout(() => {
+      onTriggerWavDownload(outputFileName);
       setIsExporting(false);
       setExportDone(true);
-    }, 1200);
+    }, 600);
   };
 
   return (
@@ -94,7 +100,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 {
                   id: 'all_stems',
                   title: 'Xuất rời từng kênh (4 Files: Vocal chính, Bè, Nhạc nền, Reverb)',
-                  desc: 'Dùng để đưa vào phần mềm thu âm (DAW) hoặc микs chuyên sâu',
+                  desc: 'Dùng để đưa vào phần mềm thu âm (DAW) hoặc mix chuyên sâu',
                 },
                 {
                   id: 'karaoke_backing',
@@ -175,8 +181,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           {exportDone && (
             <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/15 px-4 py-2.5 text-xs font-semibold text-emerald-300">
               <CheckCircle2 className="h-4 w-4 shrink-0" />
-              Đã sẵn sàng xuất file: {song.title.replace(/\s+/g, '_')}_{targetKey}_
-              {Math.round(settings.speed * 100)}pct.{format.startsWith('wav') ? 'wav' : format}
+              Đã xuất và tải xuống thành công: {outputFileName}
             </div>
           )}
         </div>
@@ -188,7 +193,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             onClick={onClose}
             className="cursor-pointer rounded-xl border border-white/10 bg-slate-800 px-4 py-2 text-xs font-semibold text-slate-300 hover:bg-slate-700"
           >
-            Hủy
+            Đóng
           </button>
           <button
             type="button"

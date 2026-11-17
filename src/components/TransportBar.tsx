@@ -1,5 +1,6 @@
 import React from 'react';
 import {
+  Activity,
   Pause,
   Play,
   Repeat,
@@ -18,6 +19,7 @@ interface TransportBarProps {
   loopEndSec: number;
   masterVolume: number;
   limiterEnabled: boolean;
+  peakLevelDb: number;
   onTogglePlay: () => void;
   onStop: () => void;
   onSeek: (timeSec: number) => void;
@@ -45,6 +47,7 @@ export const TransportBar: React.FC<TransportBarProps> = ({
   loopEndSec,
   masterVolume,
   limiterEnabled,
+  peakLevelDb,
   onTogglePlay,
   onStop,
   onSeek,
@@ -54,6 +57,11 @@ export const TransportBar: React.FC<TransportBarProps> = ({
 }) => {
   const progressPercent =
     durationSec > 0 ? Math.min(100, (currentTimeSec / durationSec) * 100) : 0;
+
+  // Normalize peak dB (-60..0) to 0..100% for the studio level meter
+  const meterPercent = isPlaying
+    ? Math.max(5, Math.min(100, ((peakLevelDb + 48) / 48) * 100))
+    : 0;
 
   return (
     <section
@@ -104,7 +112,7 @@ export const TransportBar: React.FC<TransportBarProps> = ({
           </button>
 
           {/* Timecode Readout */}
-          <div className="ml-2 rounded-xl border border-white/10 bg-[#080B14] px-3.5 py-1.5 font-mono text-sm font-semibold tracking-wider">
+          <div className="ml-1 rounded-xl border border-white/10 bg-[#080B14] px-3.5 py-1.5 font-mono text-sm font-semibold tracking-wider">
             <span className="text-emerald-400">{formatTimecode(currentTimeSec)}</span>
             <span className="mx-1.5 text-slate-600">/</span>
             <span className="text-slate-400">{formatTimecode(durationSec)}</span>
@@ -112,7 +120,7 @@ export const TransportBar: React.FC<TransportBarProps> = ({
         </div>
 
         {/* Center: Master Timeline Scrubber */}
-        <div className="flex flex-1 min-w-[220px] flex-col gap-1.5">
+        <div className="flex flex-1 min-w-[200px] flex-col gap-1.5">
           <div className="flex items-center justify-between text-[11px] text-slate-400">
             <span>Tiến trình phát (Click hoặc kéo để tua)</span>
             <span className="font-mono text-slate-300">{progressPercent.toFixed(1)}%</span>
@@ -123,14 +131,14 @@ export const TransportBar: React.FC<TransportBarProps> = ({
             max={durationSec}
             step={0.05}
             value={currentTimeSec}
-            onChange={(e) => onSeek( parseFloat(e.target.value) )}
+            onChange={(e) => onSeek(parseFloat(e.target.value))}
             aria-label="Thanh tua thời gian bài hát"
             className="studio-slider w-full"
           />
         </div>
 
-        {/* Right: A/B Practice Loop & Master Bus Limiter */}
-        <div className="flex flex-wrap items-center gap-3">
+        {/* Right: A/B Practice Loop, True-Peak Meter & Master Volume */}
+        <div className="flex flex-wrap items-center gap-2.5">
           <button
             type="button"
             onClick={onToggleLoop}
@@ -160,6 +168,23 @@ export const TransportBar: React.FC<TransportBarProps> = ({
             <ShieldAlert className="h-3.5 w-3.5" />
             <span>Chống Vỡ Tiếng (-0.3 dBFS)</span>
           </button>
+
+          {/* Real-time Output Peak Meter */}
+          <div
+            title="Mức âm lượng đầu ra thời gian thực (True-Peak dBFS)"
+            className="hidden xl:flex items-center gap-2 rounded-xl border border-white/10 bg-[#080B14] px-3 py-2"
+          >
+            <Activity className="h-3.5 w-3.5 text-emerald-400" />
+            <div className="h-2 w-16 overflow-hidden rounded-full bg-slate-800">
+              <div
+                className="h-full bg-gradient-to-r from-emerald-400 via-amber-400 to-rose-500 transition-all duration-150"
+                style={{ width: `${meterPercent}%` }}
+              />
+            </div>
+            <span className="w-14 text-right font-mono text-[11px] text-slate-300">
+              {isPlaying ? `${peakLevelDb.toFixed(1)} dB` : '-Inf dB'}
+            </span>
+          </div>
 
           <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-[#080B14] px-3 py-1.5">
             <Volume2 className="h-4 w-4 text-slate-400" />
