@@ -178,7 +178,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 Sử dụng AI RMVPE + NSF-HiFiGAN + WORLD khi xuất kênh Vocal
               </div>
               <p className="mt-0.5 text-[11px] text-slate-400">
-                Tái tạo sóng âm giọng hát bằng Neural Source-Filter kết hợp bảo toàn Formant, đảm bảo không bị méo tiếng ngay cả khi dịch chuyển &pm;6 semitones.
+                Tái tạo sóng âm giọng hát bằng Neural Source-Filter kết hợp bảo toàn Formant, đảm bảo không bị méo tiếng ngay cả khi dịch chuyển &plusmn;6 semitones.
               </p>
             </div>
           </button>
