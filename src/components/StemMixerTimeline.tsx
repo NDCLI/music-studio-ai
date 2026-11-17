@@ -196,12 +196,14 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
               {separationStatus.isSeparated && (
                 <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2.5 py-0.5 font-mono text-[11px] font-semibold text-emerald-400">
                   <CheckCircle2 className="h-3.5 w-3.5" />
-                  Đã Tách 4 Rãnh
+                  {separationStatus.executionBackend ?? 'Đã Tách 4 Rãnh'}
                 </span>
               )}
             </div>
             <p className="text-xs text-slate-400">
-              Pipeline 3 tầng ONNX Local: Tách Instrumental &rarr; Tách Lead Vocal &amp; Bè &rarr; Khử Vang Reverb
+              {separationStatus.isSeparated && !separationStatus.isRunning
+                ? separationStatus.stageMessage
+                : 'Pipeline 3 tầng ONNX Local: Tách Instrumental → Tách Lead Vocal & Bè → Khử Vang Reverb'}
             </p>
           </div>
         </div>

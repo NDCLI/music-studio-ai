@@ -1,4 +1,9 @@
-import { PitchSpeedSettings, StemId, StemTrackState } from '../types/studio';
+import {
+  PitchSpeedSettings,
+  SeparatedStemsMap,
+  StemId,
+  StemTrackState,
+} from '../types/studio';
 import {
   detectBpmFromBuffer,
   detectMusicalKeyFromBuffer,
@@ -63,9 +68,8 @@ export function extractPeaksFromBuffer(buffer: AudioBuffer, count = 140): number
 }
 
 /**
- * Stage 2 & 3 Real-time Multi-Stem & Granular Formant Pitch/Time Engine.
- * Supports both synthesized multi-stem preview and real audio file playback
- * with independent Pitch Shifting (semitones/cents) and Time Stretching (speed).
+ * Stage 2, 3 & 5 Real-time Multi-Stem & Granular Formant Pitch/Time Engine.
+ * Supports synthesized preview, raw decoded audio/video playback, and truly separated 4-stem buffers.
  */
 export class StudioPreviewAudioEngine {
   private ctx: AudioContext | null = null;
@@ -73,11 +77,20 @@ export class StudioPreviewAudioEngine {
   private stepTimer: number | null = null;
   private stepIndex = 0;
   private customBuffer: AudioBuffer | null = null;
+  private separatedStems: SeparatedStemsMap | null = null;
   private scriptProcessor: ScriptProcessorNode | null = null;
   private formantFilterNode: BiquadFilterNode | null = null;
   private playheadSample = 0;
   private grainPhaseA = 0;
   private grainPhaseB = 0.5;
+
+  public getCustomAudioBuffer(): AudioBuffer | null {
+    return this.customBuffer;
+  }
+
+  public setSeparatedStems(stems: SeparatedStemsMap | null): void {
+    this.separatedStems = stems;
+  }
 
   public async loadAudioFile(file: File): Promise<{
     durationSec: number;
@@ -93,6 +106,7 @@ export class StudioPreviewAudioEngine {
     const arrayBuffer = await file.arrayBuffer();
     const audioBuffer = await this.ctx.decodeAudioData(arrayBuffer);
     this.customBuffer = audioBuffer;
+    this.separatedStems = null;
     this.playheadSample = 0;
 
     const detectedKey = detectMusicalKeyFromBuffer(audioBuffer);
@@ -144,7 +158,6 @@ export class StudioPreviewAudioEngine {
     }
     this.isPlaying = true;
 
-    // If a real audio file was loaded, run the real-time Dual-Grain Overlap-Add Pitch/Time Shifter
     if (this.customBuffer) {
       this.startCustomBufferRealtimeEngine(getStems, getPitchSpeed, onTick);
       return;
@@ -190,7 +203,7 @@ export class StudioPreviewAudioEngine {
     const totalSamples = buffer.length;
     const sampleRate = buffer.sampleRate;
     const blockSize = 2048;
-    const grainSize = 2400; // ~54ms Hann window grain for clean vocal & polyphonic pitch shifting
+    const grainSize = 2400;
 
     const processor = this.ctx.createScriptProcessor(blockSize, 0, 2);
     const formantFilter = this.ctx.createBiquadFilter();
@@ -223,13 +236,13 @@ export class StudioPreviewAudioEngine {
       const speedRatio = Math.max(0.25, Math.min(2.0, settings.speed));
       const grainRate = (pitchRatio - speedRatio) / grainSize;
 
-      // Dynamic vocal tract formant compensation (prevents chipmunk thinness when pitching up)
       if (settings.formantPreservation && Math.abs(settings.semitones) > 0) {
         formantFilter.gain.value = -settings.semitones * 0.85;
       } else {
         formantFilter.gain.value = 0;
       }
 
+      const sep = this.separatedStems;
       let maxPeak = 0.0001;
 
       for (let i = 0; i < blockSize; i++) {
@@ -241,7 +254,6 @@ export class StudioPreviewAudioEngine {
         this.grainPhaseA = (this.grainPhaseA + grainRate + 1.0) % 1.0;
         this.grainPhaseB = (this.grainPhaseA + 0.5) % 1.0;
 
-        // Hann window weights for dual overlapping grains (wA + wB = 1.0)
         const winA = 0.5 * (1 - Math.cos(2 * Math.PI * this.grainPhaseA));
         const winB = 0.5 * (1 - Math.cos(2 * Math.PI * this.grainPhaseB));
 
@@ -254,35 +266,47 @@ export class StudioPreviewAudioEngine {
           Math.max(0, Math.floor(this.playheadSample + this.grainPhaseB * grainSize))
         );
 
-        const rawL = chLeft[idxA] * winA + chLeft[idxB] * winB;
-        const rawR = chRight[idxA] * winA + chRight[idxB] * winB;
+        let sumL = 0;
+        let sumR = 0;
 
-        // Real-time Mid/Side decomposition to separate Center Lead Vocal vs Stereo Backing & Instrumental
-        const mid = 0.5 * (rawL + rawR);
-        const side = 0.5 * (rawL - rawR);
+        if (sep) {
+          // Sample-accurate mixing from the 4 genuinely separated STFT stem buffers
+          if (leadGain > 0.001) {
+            sumL += (sep.lead_vocal.left[idxA] * winA + sep.lead_vocal.left[idxB] * winB) * leadGain;
+            sumR += (sep.lead_vocal.right[idxA] * winA + sep.lead_vocal.right[idxB] * winB) * leadGain;
+          }
+          if (backingGain > 0.001) {
+            sumL += (sep.backing_vocal.left[idxA] * winA + sep.backing_vocal.left[idxB] * winB) * backingGain;
+            sumR += (sep.backing_vocal.right[idxA] * winA + sep.backing_vocal.right[idxB] * winB) * backingGain;
+          }
+          if (instGain > 0.001) {
+            sumL += (sep.instrumental.left[idxA] * winA + sep.instrumental.left[idxB] * winB) * instGain;
+            sumR += (sep.instrumental.right[idxA] * winA + sep.instrumental.right[idxB] * winB) * instGain;
+          }
+          if (reverbGain > 0.001) {
+            sumL += (sep.reverb_tail.left[idxA] * winA + sep.reverb_tail.left[idxB] * winB) * reverbGain;
+            sumR += (sep.reverb_tail.right[idxA] * winA + sep.reverb_tail.right[idxB] * winB) * reverbGain;
+          }
+        } else {
+          const rawL = chLeft[idxA] * winA + chLeft[idxB] * winB;
+          const rawR = chRight[idxA] * winA + chRight[idxB] * winB;
 
-        const vocalComponent = mid * leadGain * 0.75;
-        const backingComponentL = side * backingGain * 0.9;
-        const backingComponentR = -side * backingGain * 0.9;
-        const instComponentL = (rawL - mid * 0.55) * instGain;
-        const instComponentR = (rawR - mid * 0.55) * instGain;
-        const revComponent = side * reverbGain * 0.35;
+          const mid = 0.5 * (rawL + rawR);
+          const side = 0.5 * (rawL - rawR);
 
-        // Soft-knee limiter at -0.3 dBFS (0.966)
-        const mixL = Math.max(
-          -0.966,
-          Math.min(
-            0.966,
-            vocalComponent + backingComponentL + instComponentL + revComponent
-          )
-        );
-        const mixR = Math.max(
-          -0.966,
-          Math.min(
-            0.966,
-            vocalComponent + backingComponentR + instComponentR - revComponent
-          )
-        );
+          const vocalComponent = mid * leadGain * 0.75;
+          const backingComponentL = side * backingGain * 0.9;
+          const backingComponentR = -side * backingGain * 0.9;
+          const instComponentL = (rawL - mid * 0.55) * instGain;
+          const instComponentR = (rawR - mid * 0.55) * instGain;
+          const revComponent = side * reverbGain * 0.35;
+
+          sumL = vocalComponent + backingComponentL + instComponentL + revComponent;
+          sumR = vocalComponent + backingComponentR + instComponentR - revComponent;
+        }
+
+        const mixL = Math.max(-0.966, Math.min(0.966, sumL));
+        const mixR = Math.max(-0.966, Math.min(0.966, sumR));
 
         outL[i] = mixL;
         outR[i] = mixR;
@@ -319,9 +343,53 @@ export class StudioPreviewAudioEngine {
   }
 
   /**
-   * Renders a real downloadable WAV Blob with current Pitch, Speed, Formant, and Stem Mixer settings.
+   * Renders one or multiple downloadable WAV files according to the selected export target.
    */
-  public renderExportWavBlob(
+  public renderExportWavFiles(
+    baseName: string,
+    stems: StemTrackState[],
+    settings: PitchSpeedSettings,
+    target: 'master_mix' | 'all_stems' | 'karaoke_backing'
+  ): { fileName: string; blob: Blob }[] {
+    if (target === 'all_stems') {
+      const stemOrder: StemId[] = ['lead_vocal', 'backing_vocal', 'instrumental', 'reverb_tail'];
+      return stemOrder.map((stemId) => {
+        const soloedStems = stems.map((s) => ({
+          ...s,
+          muted: s.id !== stemId,
+          solo: s.id === stemId,
+        }));
+        const blob = this.renderSingleMixBlob(soloedStems, settings);
+        return {
+          fileName: `${baseName}_${stemId}.wav`,
+          blob,
+        };
+      });
+    }
+
+    if (target === 'karaoke_backing') {
+      const karaokeStems = stems.map((s) => ({
+        ...s,
+        solo: false,
+        muted: s.id === 'lead_vocal' || s.id === 'reverb_tail',
+      }));
+      return [
+        {
+          fileName: `${baseName}_karaoke_with_backing.wav`,
+          blob: this.renderSingleMixBlob(karaokeStems, settings),
+        },
+      ];
+    }
+
+    return [
+      {
+        fileName: `${baseName}.wav`,
+        blob: this.renderSingleMixBlob(stems, settings),
+      },
+    ];
+  }
+
+  private renderSingleMixBlob(
     stems: StemTrackState[],
     settings: PitchSpeedSettings
   ): Blob {
@@ -336,6 +404,35 @@ export class StudioPreviewAudioEngine {
     const pitchRatio = Math.pow(2, (settings.semitones + settings.cents / 100) / 12);
     const speedRatio = Math.max(0.25, Math.min(2.0, settings.speed));
 
+    const leadGain = getStemGain('lead_vocal');
+    const backingGain = getStemGain('backing_vocal');
+    const instGain = getStemGain('instrumental');
+    const reverbGain = getStemGain('reverb_tail');
+
+    if (this.separatedStems && this.customBuffer) {
+      const sep = this.separatedStems;
+      const len = sep.instrumental.left.length;
+      const outFrames = Math.min(sampleRate * 45, Math.floor(len / speedRatio));
+      const outL = new Float32Array(outFrames);
+      const outR = new Float32Array(outFrames);
+
+      for (let i = 0; i < outFrames; i++) {
+        const srcIdx = Math.min(len - 1, Math.floor(i * speedRatio * pitchRatio) % len);
+        outL[i] =
+          sep.lead_vocal.left[srcIdx] * leadGain +
+          sep.backing_vocal.left[srcIdx] * backingGain +
+          sep.instrumental.left[srcIdx] * instGain +
+          sep.reverb_tail.left[srcIdx] * reverbGain;
+        outR[i] =
+          sep.lead_vocal.right[srcIdx] * leadGain +
+          sep.backing_vocal.right[srcIdx] * backingGain +
+          sep.instrumental.right[srcIdx] * instGain +
+          sep.reverb_tail.right[srcIdx] * reverbGain;
+      }
+
+      return encodeStereoWavBlob(outL, outR, sampleRate);
+    }
+
     if (this.customBuffer) {
       const srcL = this.customBuffer.getChannelData(0);
       const srcR =
@@ -348,10 +445,6 @@ export class StudioPreviewAudioEngine {
       );
       const outL = new Float32Array(outFrames);
       const outR = new Float32Array(outFrames);
-
-      const leadGain = getStemGain('lead_vocal');
-      const backingGain = getStemGain('backing_vocal');
-      const instGain = getStemGain('instrumental');
 
       for (let i = 0; i < outFrames; i++) {
         const srcIdx = Math.min(
@@ -369,15 +462,10 @@ export class StudioPreviewAudioEngine {
       return encodeStereoWavBlob(outL, outR, sampleRate);
     }
 
-    // Synthesize 8 seconds of the demo track with pitch & speed applied
     const durationSec = 8;
     const outFrames = Math.floor(sampleRate * durationSec);
     const outL = new Float32Array(outFrames);
     const outR = new Float32Array(outFrames);
-
-    const leadGain = getStemGain('lead_vocal') * 0.25;
-    const backingGain = getStemGain('backing_vocal') * 0.2;
-    const instGain = getStemGain('instrumental') * 0.3;
 
     const melody = [440, 523.25, 659.25, 587.33, 523.25, 493.88, 440, 392];
     const bass = [110, 110, 87.31, 87.31, 130.81, 130.81, 98, 98];
@@ -388,9 +476,9 @@ export class StudioPreviewAudioEngine {
       const fLead = melody[step] * pitchRatio;
       const fBass = bass[step] * pitchRatio;
 
-      const sLead = Math.sin(2 * Math.PI * fLead * t) * leadGain;
-      const sBack = Math.sin(2 * Math.PI * (fLead * 0.75) * t) * backingGain;
-      const sInst = Math.sin(2 * Math.PI * fBass * t) * instGain;
+      const sLead = Math.sin(2 * Math.PI * fLead * t) * leadGain * 0.25;
+      const sBack = Math.sin(2 * Math.PI * (fLead * 0.75) * t) * backingGain * 0.2;
+      const sInst = Math.sin(2 * Math.PI * fBass * t) * instGain * 0.3;
 
       outL[i] = sLead + sBack + sInst;
       outR[i] = sLead - sBack * 0.5 + sInst;

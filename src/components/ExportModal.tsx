@@ -9,45 +9,45 @@ import {
 import { PitchSpeedSettings, SongMetadata } from '../types/studio';
 import { computeTransposedKey } from '../data/modelsCatalog';
 
+export type ExportFormat = 'wav24' | 'wav32f' | 'flac' | 'mp3_320';
+export type ExportTarget = 'master_mix' | 'all_stems' | 'karaoke_backing';
+
 interface ExportModalProps {
   isOpen: boolean;
   song: SongMetadata;
   settings: PitchSpeedSettings;
   onClose: () => void;
-  onTriggerWavDownload: (fileName: string) => void;
+  onTriggerExport: (baseName: string, target: ExportTarget) => string[];
 }
-
-type ExportFormat = 'wav24' | 'wav32f' | 'flac' | 'mp3_320';
-type ExportTarget = 'master_mix' | 'all_stems' | 'karaoke_backing';
 
 export const ExportModal: React.FC<ExportModalProps> = ({
   isOpen,
   song,
   settings,
   onClose,
-  onTriggerWavDownload,
+  onTriggerExport,
 }) => {
   const [format, setFormat] = useState<ExportFormat>('wav24');
   const [target, setTarget] = useState<ExportTarget>('master_mix');
   const [useAiVocalRender, setUseAiVocalRender] = useState(true);
   const [isExporting, setIsExporting] = useState(false);
-  const [exportDone, setExportDone] = useState(false);
+  const [exportedFiles, setExportedFiles] = useState<string[]>([]);
 
   if (!isOpen) return null;
 
   const targetKey = computeTransposedKey(song.originalKey, settings.semitones);
-  const outputFileName = `${song.title.replace(/\s+/g, '_')}_${targetKey}_${Math.round(
+  const baseName = `${song.title.replace(/\s+/g, '_')}_${targetKey}_${Math.round(
     settings.speed * 100
-  )}pct.wav`;
+  )}pct`;
 
   const handleStartExport = () => {
     setIsExporting(true);
-    setExportDone(false);
+    setExportedFiles([]);
     window.setTimeout(() => {
-      onTriggerWavDownload(outputFileName);
+      const files = onTriggerExport(baseName, target);
       setIsExporting(false);
-      setExportDone(true);
-    }, 600);
+      setExportedFiles(files);
+    }, 350);
   };
 
   return (
@@ -100,7 +100,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 {
                   id: 'all_stems',
                   title: 'Xuất rời từng kênh (4 Files: Vocal chính, Bè, Nhạc nền, Reverb)',
-                  desc: 'Dùng để đưa vào phần mềm thu âm (DAW) hoặc mix chuyên sâu',
+                  desc: 'Tải xuống 4 file WAV độc lập để đưa vào DAW hoặc mix chuyên sâu',
                 },
                 {
                   id: 'karaoke_backing',
@@ -128,7 +128,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           {/* Audio Format Selection */}
           <div>
             <label className="block text-xs font-bold uppercase tracking-wider text-slate-300 mb-2">
-              2. Định dạng &amp; Chất lượng (Crate `hound` / `flacenc`)
+              2. Định dạng &amp; Chất lượng (Crate `hound` / Browser WAV Renderer)
             </label>
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
               {[
@@ -178,10 +178,15 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             </div>
           </button>
 
-          {exportDone && (
-            <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/15 px-4 py-2.5 text-xs font-semibold text-emerald-300">
-              <CheckCircle2 className="h-4 w-4 shrink-0" />
-              Đã xuất và tải xuống thành công: {outputFileName}
+          {exportedFiles.length > 0 && (
+            <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/15 px-4 py-2.5 text-xs font-semibold text-emerald-300 space-y-1">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="h-4 w-4 shrink-0" />
+                <span>Đã xuất và tải xuống {exportedFiles.length} file WAV:</span>
+              </div>
+              <div className="font-mono text-[11px] text-emerald-200 pl-6">
+                {exportedFiles.join(', ')}
+              </div>
             </div>
           )}
         </div>

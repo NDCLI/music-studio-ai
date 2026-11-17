@@ -32,6 +32,14 @@ export interface StemTrackState {
   peaks: number[];
 }
 
+export interface StereoStemBuffer {
+  sampleRate: number;
+  left: Float32Array;
+  right: Float32Array;
+}
+
+export type SeparatedStemsMap = Record<StemId, StereoStemBuffer>;
+
 export interface PitchSpeedSettings {
   semitones: number; // -12 to +12
   cents: number; // -50 to +50
@@ -70,6 +78,8 @@ export interface LocalAiModelSpec {
   architecture: string;
   sdrDb: string;
   sizeMb: number;
+  downloadUrl: string;
+  sourceRepo: string;
   stftSpec: {
     nFft: number;
     hopLength: number;
@@ -80,7 +90,14 @@ export interface LocalAiModelSpec {
   recommendedDevice: string;
   installed: boolean;
   downloading?: boolean;
+  paused?: boolean;
   downloadProgress?: number;
+  downloadedBytes?: number;
+  totalBytes?: number;
+  sha256Hex?: string;
+  cachedSizeBytes?: number;
+  cachedSource?: 'huggingface' | 'local_import';
+  downloadError?: string;
 }
 
 export interface SeparationStageStatus {
@@ -89,4 +106,5 @@ export interface SeparationStageStatus {
   currentStage: 0 | 1 | 2 | 3;
   progressPercent: number;
   stageMessage: string;
+  executionBackend?: string;
 }

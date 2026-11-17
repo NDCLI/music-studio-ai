@@ -71,6 +71,9 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
     architecture: 'MDX-Net (Hybrid Time-Frequency U-Net)',
     sdrDb: '11.8 dB',
     sizeMb: 56,
+    downloadUrl:
+      'https://huggingface.co/Politrees/UVR_resources/resolve/main/MDXNet_models/UVR-MDX-NET-Inst_HQ_4.onnx',
+    sourceRepo: 'Politrees/UVR_resources',
     stftSpec: {
       nFft: 5120,
       hopLength: 1024,
@@ -79,7 +82,7 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
       compensate: 1.019,
     },
     recommendedDevice: 'CPU Đa Luồng / DirectML GPU',
-    installed: true,
+    installed: false,
   },
   {
     id: 'mel_band_roformer_vocals',
@@ -88,6 +91,9 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
     architecture: 'Mel-Band RoFormer (Rotary Transformer)',
     sdrDb: '13.1 dB',
     sizeMb: 228,
+    downloadUrl:
+      'https://huggingface.co/phuongnse/mel-roformer-kim-onnx/resolve/main/mel_band_roformer_kim_ft_unwa.onnx',
+    sourceRepo: 'phuongnse/mel-roformer-kim-onnx',
     stftSpec: {
       nFft: 4096,
       hopLength: 1024,
@@ -96,7 +102,7 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
       compensate: 1.0,
     },
     recommendedDevice: 'DirectML / CUDA GPU (VRAM ≥ 4GB)',
-    installed: true,
+    installed: false,
   },
   {
     id: 'uvr_mdx_kara_2',
@@ -105,6 +111,9 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
     architecture: 'MDX-Net Karaoke / Backing Extractor',
     sdrDb: '10.4 dB',
     sizeMb: 55,
+    downloadUrl:
+      'https://huggingface.co/Politrees/UVR_resources/resolve/main/MDXNet_models/UVR_MDXNET_KARA_2.onnx',
+    sourceRepo: 'Politrees/UVR_resources',
     stftSpec: {
       nFft: 5120,
       hopLength: 1024,
@@ -113,7 +122,7 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
       compensate: 1.065,
     },
     recommendedDevice: 'CPU Đa Luồng / DirectML GPU',
-    installed: true,
+    installed: false,
   },
   {
     id: 'mel_band_roformer_karaoke',
@@ -122,6 +131,9 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
     architecture: 'Mel-Band RoFormer Karaoke ViperX',
     sdrDb: '10.8 dB',
     sizeMb: 228,
+    downloadUrl:
+      'https://huggingface.co/bdsqlsz/mel_band_roformer_karaoke_aufr33-ONNX/resolve/main/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.onnx',
+    sourceRepo: 'bdsqlsz/mel_band_roformer_karaoke_aufr33-ONNX',
     stftSpec: {
       nFft: 4096,
       hopLength: 1024,
@@ -139,6 +151,9 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
     architecture: 'MDX-Net De-Reverb HQ',
     sdrDb: '11.4 dB',
     sizeMb: 67,
+    downloadUrl:
+      'https://huggingface.co/seanghay/uvr_models/resolve/main/Reverb_HQ_By_FoxJoy.onnx',
+    sourceRepo: 'seanghay/uvr_models',
     stftSpec: {
       nFft: 7680,
       hopLength: 1024,
@@ -147,23 +162,26 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
       compensate: 1.028,
     },
     recommendedDevice: 'CPU Đa Luồng / DirectML GPU',
-    installed: true,
+    installed: false,
   },
   {
-    id: 'rmvpe_nsf_hifigan',
-    fileName: 'rmvpe.onnx + nsf_hifigan.onnx',
+    id: 'rmvpe_f0',
+    fileName: 'rmvpe.onnx',
     taskTitle: 'Nâng Hạ Tone AI: Dò Cao Độ F0 & Tái Tạo Sóng Âm Vocal',
-    architecture: 'Deep Pitch Estimator + Neural Source-Filter',
+    architecture: 'Deep U-Net Pitch Estimator (RMVPE)',
     sdrDb: 'Artifact-Free',
     sizeMb: 90,
+    downloadUrl:
+      'https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.onnx',
+    sourceRepo: 'lj1995/VoiceConversionWebUI',
     stftSpec: {
-      nFft: 2048,
-      hopLength: 512,
-      dimF: 1024,
+      nFft: 1024,
+      hopLength: 160,
+      dimF: 512,
       dimT: 128,
       compensate: 1.0,
     },
     recommendedDevice: 'CPU / DirectML GPU',
-    installed: true,
+    installed: false,
   },
 ];

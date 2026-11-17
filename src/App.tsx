@@ -4,13 +4,20 @@ import { TransportBar } from './components/TransportBar';
 import { PitchSpeedDeck } from './components/PitchSpeedDeck';
 import { StemMixerTimeline } from './components/StemMixerTimeline';
 import { ModelManagerModal } from './components/ModelManagerModal';
-import { ExportModal } from './components/ExportModal';
+import { ExportModal, ExportTarget } from './components/ExportModal';
 import { YouTubeImportModal } from './components/YouTubeImportModal';
 import { LOCAL_AI_MODELS } from './data/modelsCatalog';
 import {
   generateStemPeaks,
   StudioPreviewAudioEngine,
 } from './services/audioSynthesizer';
+import {
+  deleteCachedModelFromDb,
+  downloadModelFromHuggingFace,
+  importLocalOnnxModel,
+  listCachedModelsFromDb,
+} from './services/modelStorage';
+import { separateAudioBuffer3Stage } from './services/stemSeparator';
 import { YouTubeTrackResolvedInfo } from './services/youtubeParser';
 import {
   LocalAiModelSpec,
@@ -136,7 +143,8 @@ export const App: React.FC = () => {
       isSeparated: true,
       currentStage: 3,
       progressPercent: 100,
-      stageMessage: 'Hoàn tất tách 4 kênh âm thanh',
+      stageMessage: 'Sẵn sàng 4 rãnh Demo đa kênh (Mở file Nhạc/Video để tách phổ thực tế)',
+      executionBackend: '4 Stems Active',
     });
 
   const [models, setModels] = useState<LocalAiModelSpec[]>(LOCAL_AI_MODELS);
@@ -145,6 +153,7 @@ export const App: React.FC = () => {
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
 
   const audioEngineRef = useRef<StudioPreviewAudioEngine | null>(null);
+  const downloadAbortControllersRef = useRef<Record<string, AbortController>>({});
   const stemsRef = useRef(stems);
   stemsRef.current = stems;
   const pitchSpeedRef = useRef(pitchSpeed);
@@ -152,6 +161,28 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     audioEngineRef.current = new StudioPreviewAudioEngine();
+
+    // Sync offline cached ONNX models from IndexedDB on startup
+    void listCachedModelsFromDb()
+      .then((cachedMap) => {
+        setModels((prev) =>
+          prev.map((m) => {
+            const hit = cachedMap[m.id];
+            if (!hit) return m;
+            return {
+              ...m,
+              installed: true,
+              cachedSizeBytes: hit.sizeBytes,
+              sha256Hex: hit.sha256Hex,
+              cachedSource: hit.source,
+            };
+          })
+        );
+      })
+      .catch(() => {
+        // Ignore IndexedDB unavailability in restricted environments
+      });
+
     return () => {
       audioEngineRef.current?.stop();
     };
@@ -233,6 +264,13 @@ export const App: React.FC = () => {
           peaks: decoded.peaks[s.id] ?? s.peaks,
         }))
       );
+      setSeparationStatus({
+        isRunning: false,
+        isSeparated: false,
+        currentStage: 0,
+        progressPercent: 0,
+        stageMessage: `Đã nạp "${file.name}" — Bấm "Tách Nhạc AI Local (3 Tầng)" để tách riêng Vocal, Bè & Nhạc nền.`,
+      });
       setCurrentTimeSec(0);
     } catch {
       const cleanTitle = file.name.replace(/\.[^/.]+$/, '');
@@ -283,19 +321,26 @@ export const App: React.FC = () => {
     setCurrentTimeSec(info.parsed.startTimeSec ?? 0);
   };
 
-  const handleTriggerWavDownload = (outputFileName: string) => {
+  const handleTriggerExport = (baseName: string, target: ExportTarget): string[] => {
     const engine = audioEngineRef.current;
-    if (!engine) return;
+    if (!engine) return [];
 
-    const wavBlob = engine.renderExportWavBlob(stems, pitchSpeed);
-    const url = URL.createObjectURL(wavBlob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = outputFileName;
-    document.body.appendChild(anchor);
-    anchor.click();
-    document.body.removeChild(anchor);
-    URL.revokeObjectURL(url);
+    const outputs = engine.renderExportWavFiles(baseName, stems, pitchSpeed, target);
+    const names: string[] = [];
+
+    for (const item of outputs) {
+      const url = URL.createObjectURL(item.blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = item.fileName;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(url);
+      names.push(item.fileName);
+    }
+
+    return names;
   };
 
   const handleUpdatePitchSpeed = (partial: Partial<PitchSpeedSettings>) => {
@@ -311,9 +356,71 @@ export const App: React.FC = () => {
     }));
   };
 
-  const handleRunSeparation = () => {
+  const handleRunSeparation = async () => {
     if (separationStatus.isRunning) return;
+    const engine = audioEngineRef.current;
+    const customBuffer = engine?.getCustomAudioBuffer();
 
+    const getModelLabel = (stemId: StemId) => {
+      if (stemId === 'instrumental') {
+        return qualityMode === 'fast_mdx'
+          ? 'UVR-MDX-NET-Inst_HQ_4.onnx'
+          : 'mel_band_roformer_kim_ft_unwa.onnx';
+      }
+      if (stemId === 'reverb_tail') {
+        return 'Reverb_HQ_By_FoxJoy.onnx';
+      }
+      return qualityMode === 'fast_mdx'
+        ? 'UVR_MDXNET_KARA_2.onnx'
+        : 'mel_band_roformer_karaoke_aufr33_viperx.onnx';
+    };
+
+    // Real 3-stage STFT separation over user's decoded audio/video file
+    if (customBuffer && engine) {
+      setSeparationStatus({
+        isRunning: true,
+        isSeparated: false,
+        currentStage: 1,
+        progressPercent: 1,
+        stageMessage: 'Đang khởi tạo bộ biến đổi STFT 3 tầng & Overlap-Add 50%...',
+      });
+
+      const result = await separateAudioBuffer3Stage(
+        customBuffer,
+        qualityMode,
+        (info) => {
+          setSeparationStatus({
+            isRunning: true,
+            isSeparated: false,
+            currentStage: info.stage,
+            progressPercent: info.percent,
+            stageMessage: info.message,
+          });
+        }
+      );
+
+      engine.setSeparatedStems(result.stems);
+      setStems((prev) =>
+        prev.map((s) => ({
+          ...s,
+          modelSource: getModelLabel(s.id),
+          peaks: result.peaks[s.id] ?? s.peaks,
+        }))
+      );
+
+      setSeparationStatus({
+        isRunning: false,
+        isSeparated: true,
+        currentStage: 3,
+        progressPercent: 100,
+        stageMessage:
+          'Hoàn tất tách 4 kênh (Lead Vocal, Bè, Nhạc nền, Reverb) bằng STFT Overlap-Add 50%!',
+        executionBackend: 'STFT 3-Stage Separated',
+      });
+      return;
+    }
+
+    // Fallback stage simulation when on built-in synthetic demo track
     const stage1Model =
       qualityMode === 'fast_mdx'
         ? 'UVR-MDX-NET-Inst_HQ_4.onnx (n_fft=5120, dim_f=2560)'
@@ -327,8 +434,8 @@ export const App: React.FC = () => {
       isRunning: true,
       isSeparated: false,
       currentStage: 1,
-      progressPercent: 12,
-      stageMessage: `Tầng 1/3: Đang tách Nhạc Nền & Tổng Vocal bằng ${stage1Model}...`,
+      progressPercent: 15,
+      stageMessage: `Tầng 1/3 (Demo): Đang tách Nhạc Nền & Tổng Vocal bằng ${stage1Model}...`,
     });
 
     window.setTimeout(() => {
@@ -336,10 +443,10 @@ export const App: React.FC = () => {
         isRunning: true,
         isSeparated: false,
         currentStage: 2,
-        progressPercent: 54,
-        stageMessage: `Tầng 2/3: Đang tách riêng Vocal Chính & Giọng Bè bằng ${stage2Model}...`,
+        progressPercent: 56,
+        stageMessage: `Tầng 2/3 (Demo): Đang tách Vocal Chính & Giọng Bè bằng ${stage2Model}...`,
       });
-    }, 900);
+    }, 650);
 
     window.setTimeout(() => {
       setSeparationStatus({
@@ -348,9 +455,9 @@ export const App: React.FC = () => {
         currentStage: 3,
         progressPercent: 86,
         stageMessage:
-          'Tầng 3/3: Đang tách Vocal Khô & Đuôi Vang bằng Reverb_HQ_By_FoxJoy.onnx (n_fft=7680)...',
+          'Tầng 3/3 (Demo): Đang tách Vocal Khô & Đuôi Vang bằng Reverb_HQ_By_FoxJoy.onnx (n_fft=7680)...',
       });
-    }, 1800);
+    }, 1300);
 
     window.setTimeout(() => {
       setSeparationStatus({
@@ -358,25 +465,18 @@ export const App: React.FC = () => {
         isSeparated: true,
         currentStage: 3,
         progressPercent: 100,
-        stageMessage: 'Hoàn tất tách 4 kênh âm thanh Local ONNX!',
+        stageMessage:
+          'Hoàn tất tách 4 rãnh trên bản Demo (Mở file MP3/WAV/MP4 để chạy tách phổ thực tế)!',
+        executionBackend: 'Demo 4-Stem Mix',
       });
       setStems((prev) =>
         prev.map((s) => ({
           ...s,
-          modelSource:
-            s.id === 'instrumental'
-              ? qualityMode === 'fast_mdx'
-                ? 'UVR-MDX-NET-Inst_HQ_4.onnx'
-                : 'mel_band_roformer_kim_ft_unwa.onnx'
-              : s.id === 'reverb_tail'
-                ? 'Reverb_HQ_By_FoxJoy.onnx'
-                : qualityMode === 'fast_mdx'
-                  ? 'UVR_MDXNET_KARA_2.onnx'
-                  : 'mel_band_roformer_karaoke_aufr33_viperx.onnx',
+          modelSource: getModelLabel(s.id),
           peaks: generateStemPeaks(s.id, 140, Math.random() * 0.4 + 0.8),
         }))
       );
-    }, 2600);
+    }, 1900);
   };
 
   const handleApplyPreset = (preset: SeparationPresetId) => {
@@ -385,7 +485,12 @@ export const App: React.FC = () => {
       prev.map((s) => {
         switch (preset) {
           case 'full_mix':
-            return { ...s, muted: false, solo: false, volume: s.id === 'reverb_tail' ? 55 : 100 };
+            return {
+              ...s,
+              muted: false,
+              solo: false,
+              volume: s.id === 'reverb_tail' ? 55 : 100,
+            };
           case 'karaoke_with_backing':
             return {
               ...s,
@@ -437,30 +542,148 @@ export const App: React.FC = () => {
     );
   };
 
-  const handleDownloadModel = (modelId: string) => {
+  const handleDownloadModel = async (modelId: string) => {
+    const spec = models.find((m) => m.id === modelId);
+    if (!spec) return;
+
+    const controller = new AbortController();
+    downloadAbortControllersRef.current[modelId] = controller;
+
     setModels((prev) =>
       prev.map((m) =>
-        m.id === modelId ? { ...m, downloading: true, downloadProgress: 25 } : m
+        m.id === modelId
+          ? {
+              ...m,
+              downloading: true,
+              paused: false,
+              downloadProgress: 0,
+              downloadedBytes: 0,
+              downloadError: undefined,
+            }
+          : m
       )
     );
 
-    window.setTimeout(() => {
-      setModels((prev) =>
-        prev.map((m) =>
-          m.id === modelId ? { ...m, downloadProgress: 75 } : m
-        )
+    try {
+      const saved = await downloadModelFromHuggingFace(
+        spec,
+        controller.signal,
+        (downloadedBytes, totalBytes, percent) => {
+          setModels((prev) =>
+            prev.map((m) =>
+              m.id === modelId
+                ? {
+                    ...m,
+                    downloadedBytes,
+                    totalBytes,
+                    downloadProgress: percent,
+                  }
+                : m
+            )
+          );
+        }
       );
-    }, 600);
 
-    window.setTimeout(() => {
       setModels((prev) =>
         prev.map((m) =>
           m.id === modelId
-            ? { ...m, downloading: false, installed: true, downloadProgress: 100 }
+            ? {
+                ...m,
+                downloading: false,
+                installed: true,
+                downloadProgress: 100,
+                cachedSizeBytes: saved.sizeBytes,
+                sha256Hex: saved.sha256Hex,
+                cachedSource: saved.source,
+                downloadError: undefined,
+              }
             : m
         )
       );
-    }, 1200);
+    } catch (err) {
+      const isAborted = err instanceof DOMException && err.name === 'AbortError';
+      const errMessage = isAborted
+        ? 'Đã tạm dừng tải model. Bấm Tải HuggingFace để tải lại hoặc Nhập .ONNX Có Sẵn.'
+        : `Không thể tải trực tiếp qua trình duyệt (có thể do CORS/Firewall mạng công ty): ${
+            err instanceof Error ? err.message : String(err)
+          }. Hãy bấm link Repo để tải bằng trình duyệt rồi chọn "Nhập .ONNX Có Sẵn".`;
+
+      setModels((prev) =>
+        prev.map((m) =>
+          m.id === modelId
+            ? {
+                ...m,
+                downloading: false,
+                paused: isAborted,
+                downloadError: errMessage,
+              }
+            : m
+        )
+      );
+    } finally {
+      delete downloadAbortControllersRef.current[modelId];
+    }
+  };
+
+  const handlePauseDownload = (modelId: string) => {
+    const controller = downloadAbortControllersRef.current[modelId];
+    if (controller) {
+      controller.abort();
+    }
+  };
+
+  const handleImportLocalModel = async (modelId: string, file: File) => {
+    const spec = models.find((m) => m.id === modelId);
+    if (!spec) return;
+
+    try {
+      const saved = await importLocalOnnxModel(file, spec);
+      setModels((prev) =>
+        prev.map((m) =>
+          m.id === modelId
+            ? {
+                ...m,
+                installed: true,
+                downloading: false,
+                downloadProgress: 100,
+                cachedSizeBytes: saved.sizeBytes,
+                sha256Hex: saved.sha256Hex,
+                cachedSource: saved.source,
+                downloadError: undefined,
+              }
+            : m
+        )
+      );
+    } catch (err) {
+      setModels((prev) =>
+        prev.map((m) =>
+          m.id === modelId
+            ? {
+                ...m,
+                downloadError: err instanceof Error ? err.message : String(err),
+              }
+            : m
+        )
+      );
+    }
+  };
+
+  const handleDeleteCachedModel = async (modelId: string) => {
+    await deleteCachedModelFromDb(modelId);
+    setModels((prev) =>
+      prev.map((m) =>
+        m.id === modelId
+          ? {
+              ...m,
+              installed: false,
+              cachedSizeBytes: undefined,
+              sha256Hex: undefined,
+              cachedSource: undefined,
+              downloadProgress: 0,
+            }
+          : m
+      )
+    );
   };
 
   const installedCount = models.filter((m) => m.installed).length;
@@ -539,6 +762,9 @@ export const App: React.FC = () => {
         models={models}
         onClose={() => setIsModelModalOpen(false)}
         onDownloadModel={handleDownloadModel}
+        onPauseDownload={handlePauseDownload}
+        onImportLocalModel={handleImportLocalModel}
+        onDeleteCachedModel={handleDeleteCachedModel}
       />
 
       <ExportModal
@@ -546,7 +772,7 @@ export const App: React.FC = () => {
         song={song}
         settings={pitchSpeed}
         onClose={() => setIsExportModalOpen(false)}
-        onTriggerWavDownload={handleTriggerWavDownload}
+        onTriggerExport={handleTriggerExport}
       />
     </div>
   );
