@@ -1,0 +1,16 @@
+# .cargo/config.toml - Tối ưu hóa chống lag do AhnLab quét tiến trình trên máy công ty
+[build]
+# Giới hạn số tiến trình rustc.exe / build-script-build.exe chạy đồng thời
+# Giúp AhnLab không bị quá tải I/O và CPU vẫn mượt cho các tác vụ văn phòng khác
+jobs = 2
+
+[profile.dev]
+# Tắt debug info chi tiết để giảm dung lượng file .exe từ ~150MB xuống ~15MB
+# File .exe càng nhỏ, thời gian AhnLab quét khi khởi chạy càng nhanh (chỉ mất vài ms)
+debug = 0
+strip = "debuginfo"
+opt-level = 1
+
+[profile.dev.package."*"]
+# Tối ưu tốc độ chạy cho các thư viện xử lý âm thanh & FFT ngay cả ở chế độ dev
+opt-level = 2

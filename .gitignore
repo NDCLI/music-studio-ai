@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node / Frontend UI
+node_modules/
+dist/
+.vite/
+
+# Local AI Models (downloaded at runtime)
+models/*.onnx
+models/*.ckpt
+models/*.pth
+
+# OS & IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
