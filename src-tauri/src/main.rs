@@ -83,9 +83,11 @@ fn main() {
 fn main() {
     use std::sync::{Arc, Mutex};
     use ipc_commands::{tauri_commands, StudioAppState};
+    use model_manager::resolve_default_models_dir;
 
+    let models_dir = resolve_default_models_dir();
     let app_state = Arc::new(Mutex::new(
-        StudioAppState::new("models").expect("Failed to initialize Music Studio AI state"),
+        StudioAppState::new(models_dir).expect("Failed to initialize Music Studio AI state"),
     ));
 
     tauri::Builder::default()
@@ -95,8 +97,10 @@ fn main() {
             tauri_commands::ipc_parse_youtube_url,
             tauri_commands::ipc_update_pitch_speed,
             tauri_commands::ipc_list_models,
+            tauri_commands::ipc_download_model,
             tauri_commands::ipc_import_local_onnx,
             tauri_commands::ipc_delete_model,
+            tauri_commands::ipc_open_external_url,
             tauri_commands::ipc_run_separation,
             tauri_commands::ipc_export_audio,
         ])

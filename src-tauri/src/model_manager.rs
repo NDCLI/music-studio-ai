@@ -70,6 +70,21 @@ pub enum DownloadStage {
     Completed,
 }
 
+/// Returns the writable local directory for caching `.onnx` models (`%LOCALAPPDATA%\com.musicstudio.ai\models` on Windows).
+pub fn resolve_default_models_dir() -> PathBuf {
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local_app_data)
+            .join("com.musicstudio.ai")
+            .join("models");
+    }
+    if let Some(xdg_data) = std::env::var_os("XDG_DATA_HOME") {
+        return PathBuf::from(xdg_data)
+            .join("com.musicstudio.ai")
+            .join("models");
+    }
+    PathBuf::from("models")
+}
+
 /// Returns the default open-source ONNX model catalog for Music Studio AI.
 pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
     vec![
@@ -81,7 +96,7 @@ pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
             architecture: "MDX-Net (Hybrid Time-Frequency U-Net)".to_string(),
             sdr_label: "11.8 dB".to_string(),
             approx_size_mb: 56,
-            download_url: "https://huggingface.co/Politrees/UVR_resources/resolve/main/MDXNet_models/UVR-MDX-NET-Inst_HQ_4.onnx".to_string(),
+            download_url: "https://huggingface.co/Politrees/UVR_resources/resolve/main/models/MDXNet/UVR-MDX-NET-Inst_HQ_4.onnx".to_string(),
             expected_sha256: None,
             stft_spec: StftModelConfig {
                 model_filename: "UVR-MDX-NET-Inst_HQ_4.onnx".to_string(),
@@ -95,16 +110,16 @@ pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
         },
         ModelCatalogEntry {
             id: "mel_band_roformer_vocals".to_string(),
-            file_name: "mel_band_roformer_kim_ft_unwa.onnx".to_string(),
+            file_name: "mel-roformer.fp16.onnx".to_string(),
             role: ModelRole::InstrumentalSeparator,
             task_title: "Stage 1: Instrumental & All Vocals (Pro Mel-Band RoFormer)".to_string(),
-            architecture: "Mel-Band RoFormer (Rotary Transformer)".to_string(),
+            architecture: "Mel-Band RoFormer FP16 (Rotary Transformer)".to_string(),
             sdr_label: "13.1 dB".to_string(),
-            approx_size_mb: 228,
-            download_url: "https://huggingface.co/phuongnse/mel-roformer-kim-onnx/resolve/main/mel_band_roformer_kim_ft_unwa.onnx".to_string(),
+            approx_size_mb: 443,
+            download_url: "https://huggingface.co/phuongnse/mel-roformer-kim-onnx/resolve/main/mel-roformer.fp16.onnx".to_string(),
             expected_sha256: None,
             stft_spec: StftModelConfig {
-                model_filename: "mel_band_roformer_kim_ft_unwa.onnx".to_string(),
+                model_filename: "mel-roformer.fp16.onnx".to_string(),
                 sample_rate: 44_100,
                 n_fft: 4096,
                 hop_length: 1024,
@@ -120,8 +135,8 @@ pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
             task_title: "Stage 2: Lead Vocal & Backing Harmony (Fast MDX-Net)".to_string(),
             architecture: "MDX-Net Karaoke / Backing Extractor".to_string(),
             sdr_label: "10.4 dB".to_string(),
-            approx_size_mb: 55,
-            download_url: "https://huggingface.co/Politrees/UVR_resources/resolve/main/MDXNet_models/UVR_MDXNET_KARA_2.onnx".to_string(),
+            approx_size_mb: 50,
+            download_url: "https://huggingface.co/Politrees/UVR_resources/resolve/main/models/MDXNet/UVR_MDXNET_KARA_2.onnx".to_string(),
             expected_sha256: None,
             stft_spec: StftModelConfig {
                 model_filename: "UVR_MDXNET_KARA_2.onnx".to_string(),
@@ -140,8 +155,8 @@ pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
             task_title: "Stage 2: Lead Vocal & Backing Harmony (Pro RoFormer Karaoke)".to_string(),
             architecture: "Mel-Band RoFormer Karaoke ViperX".to_string(),
             sdr_label: "10.8 dB".to_string(),
-            approx_size_mb: 228,
-            download_url: "https://huggingface.co/bdsqlsz/mel_band_roformer_karaoke_aufr33-ONNX/resolve/main/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.onnx".to_string(),
+            approx_size_mb: 876,
+            download_url: "https://huggingface.co/bdsqlsz/mel_band_roformer_karaoke_aufr33-ONNX/resolve/main/model.onnx".to_string(),
             expected_sha256: None,
             stft_spec: StftModelConfig {
                 model_filename: "mel_band_roformer_karaoke_aufr33_viperx.onnx".to_string(),
@@ -160,7 +175,7 @@ pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
             task_title: "Stage 3: Dry Lead Vocal & Reverb Tail De-Reverb".to_string(),
             architecture: "MDX-Net De-Reverb HQ".to_string(),
             sdr_label: "11.4 dB".to_string(),
-            approx_size_mb: 67,
+            approx_size_mb: 64,
             download_url: "https://huggingface.co/seanghay/uvr_models/resolve/main/Reverb_HQ_By_FoxJoy.onnx".to_string(),
             expected_sha256: None,
             stft_spec: StftModelConfig {
@@ -178,9 +193,9 @@ pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
             file_name: "rmvpe.onnx".to_string(),
             role: ModelRole::VocalPitchEstimator,
             task_title: "Neural Pitch Shifting: RMVPE F0 Estimator".to_string(),
-            architecture: "Deep U-Net Pitch Extractor".to_string(),
+            architecture: "Deep U-Net Pitch Estimator".to_string(),
             sdr_label: "Artifact-Free".to_string(),
-            approx_size_mb: 90,
+            approx_size_mb: 345,
             download_url: "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.onnx".to_string(),
             expected_sha256: None,
             stft_spec: StftModelConfig {
@@ -197,6 +212,7 @@ pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
 }
 
 /// Manages local `.onnx` model storage, resumable HTTPS downloads, SHA-256 checks, and local imports.
+#[derive(Clone)]
 pub struct ModelManager {
     models_dir: PathBuf,
     catalog: Vec<ModelCatalogEntry>,

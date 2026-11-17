@@ -1,7 +1,9 @@
 import React, { useRef, useState } from 'react';
 import {
   AlertCircle,
+  Check,
   CheckCircle2,
+  Copy,
   Cpu,
   Download,
   ExternalLink,
@@ -14,6 +16,7 @@ import {
   X,
 } from 'lucide-react';
 import { LocalAiModelSpec } from '../types/studio';
+import { openExternalUrl } from '../services/tauriBridge';
 
 interface ModelManagerModalProps {
   isOpen: boolean;
@@ -41,6 +44,7 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [importTargetId, setImportTargetId] = useState<string | null>(null);
+  const [copiedModelId, setCopiedModelId] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
@@ -60,6 +64,20 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
       onImportLocalModel(importTargetId, file);
     }
     e.target.value = '';
+  };
+
+  const handleOpenRepoPage = (sourceRepo: string) => {
+    void openExternalUrl(`https://huggingface.co/${sourceRepo}`);
+  };
+
+  const handleCopyDirectLink = async (model: LocalAiModelSpec) => {
+    try {
+      await navigator.clipboard.writeText(model.downloadUrl);
+      setCopiedModelId(model.id);
+      window.setTimeout(() => setCopiedModelId(null), 1800);
+    } catch {
+      // Clipboard fallback ignored if blocked
+    }
   };
 
   return (
@@ -111,7 +129,7 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
             Rust `ort` (`load-dynamic`, `directml`) dùng `onnxruntime.dll` có chữ ký số Microsoft &mdash; Không tạo `.exe` phụ trợ.
           </span>
           <span className="font-mono text-[11px] text-emerald-300">
-            Cache Offline: {formatBytesMb(totalCachedBytes)} (IndexedDB + ./models/*.onnx)
+            Cache Offline: {formatBytesMb(totalCachedBytes)}
           </span>
         </div>
 
@@ -143,18 +161,37 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
                   <h3 className="mt-1 text-sm font-semibold text-white">
                     {m.taskTitle}
                   </h3>
-                  <p className="text-xs text-slate-400">
-                    Kiến trúc: {m.architecture} &bull; Phần cứng: {m.recommendedDevice} &bull; Repo:{' '}
-                    <a
-                      href={m.downloadUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1 text-indigo-400 hover:underline"
+                  <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                    <span>
+                      Kiến trúc: {m.architecture} &bull; Phần cứng: {m.recommendedDevice} &bull; Repo:
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => handleOpenRepoPage(m.sourceRepo)}
+                      className="cursor-pointer inline-flex items-center gap-1 text-indigo-400 hover:text-indigo-300 hover:underline"
                     >
                       <span>{m.sourceRepo}</span>
                       <ExternalLink className="h-3 w-3" />
-                    </a>
-                  </p>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleCopyDirectLink(m)}
+                      title={m.downloadUrl}
+                      className="cursor-pointer inline-flex items-center gap-1 rounded border border-white/10 bg-slate-800/80 px-2 py-0.5 text-[10px] font-medium text-slate-300 hover:border-indigo-400/50 hover:text-white"
+                    >
+                      {copiedModelId === m.id ? (
+                        <>
+                          <Check className="h-3 w-3 text-emerald-400" />
+                          <span className="text-emerald-300">Đã Copy Link</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="h-3 w-3" />
+                          <span>Copy Link Tải</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </div>
 
                 {/* Action Controls */}
@@ -178,7 +215,9 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
                     <div className="flex items-center gap-2">
                       <span className="inline-flex items-center gap-1.5 rounded-xl border border-indigo-500/40 bg-indigo-500/20 px-3 py-1.5 font-mono text-xs font-semibold text-indigo-200">
                         <Loader2 className="h-4 w-4 animate-spin" />
-                        {formatBytesMb(m.downloadedBytes)} / {m.sizeMb} MB ({m.downloadProgress ?? 0}%)
+                        {m.downloadedBytes
+                          ? `${formatBytesMb(m.downloadedBytes)} / ${m.sizeMb} MB (${m.downloadProgress ?? 0}%)`
+                          : 'Đang tải trực tiếp...'}
                       </span>
                       <button
                         type="button"
@@ -218,12 +257,12 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
                 <div className="mt-2.5 h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
                   <div
                     className="h-full bg-gradient-to-r from-indigo-500 to-emerald-400 transition-all duration-150"
-                    style={{ width: `${m.downloadProgress ?? 0}%` }}
+                    style={{ width: `${Math.max(5, m.downloadProgress ?? 0)}%` }}
                   />
                 </div>
               )}
 
-              {/* Error banner if network/CORS blocked browser download */}
+              {/* Error banner if network/CORS blocked download */}
               {m.downloadError && (
                 <div className="mt-2.5 flex items-start gap-2 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
                   <AlertCircle className="h-3.5 w-3.5 text-amber-400 shrink-0 mt-0.5" />
@@ -258,7 +297,7 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
         {/* Footer */}
         <div className="flex items-center justify-between border-t border-white/10 px-6 py-3.5">
           <span className="text-[11px] text-slate-400">
-            Mẹo: Nếu mạng công ty chặn tải trực tiếp từ trình duyệt, hãy bấm vào link Repo rồi chọn <strong>Nhập .ONNX Có Sẵn</strong>.
+            Bấm <strong>Repo</strong> để mở HuggingFace bằng trình duyệt, hoặc bấm <strong>Copy Link Tải</strong> rồi chọn <strong>Nhập .ONNX Có Sẵn</strong>.
           </span>
           <button
             type="button"

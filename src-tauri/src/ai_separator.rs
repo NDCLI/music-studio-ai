@@ -92,7 +92,7 @@ impl SeparationPipelineConfig {
     pub fn pro_roformer_pipeline() -> Self {
         Self {
             stage1_inst_model: StftModelConfig {
-                model_filename: "mel_band_roformer_kim_ft_unwa.onnx".to_string(),
+                model_filename: "mel-roformer.fp16.onnx".to_string(),
                 sample_rate: STUDIO_SAMPLE_RATE,
                 n_fft: 4096,
                 hop_length: 1024,

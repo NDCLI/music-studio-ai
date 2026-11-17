@@ -36,6 +36,50 @@ export async function invokeRustCommand<T>(
   return window.__TAURI_INTERNALS__!.invoke<T>(commandName, args);
 }
 
+/**
+ * Opens an external HTTPS URL in the user's system browser (Edge/Chrome),
+ * routing through Win32 ShellExecuteW inside Tauri Desktop where target="_blank" is blocked.
+ */
+export async function openExternalUrl(url: string): Promise<void> {
+  if (isTauriDesktopRuntime()) {
+    await invokeRustCommand<void>('ipc_open_external_url', { url });
+    return;
+  }
+  window.open(url, '_blank', 'noopener,noreferrer');
+}
+
+export interface RustCachedModelStatus {
+  id: string;
+  file_name: string;
+  installed: boolean;
+  local_path?: string;
+  size_bytes: number;
+  partial_bytes: number;
+  sha256_hex?: string;
+}
+
+export async function listModelsViaRustBackend(): Promise<{
+  models_dir: string;
+  cached_status: RustCachedModelStatus[];
+} | null> {
+  if (!isTauriDesktopRuntime()) return null;
+  return invokeRustCommand('ipc_list_models');
+}
+
+export async function downloadModelViaRustBackend(
+  modelId: string
+): Promise<RustCachedModelStatus | null> {
+  if (!isTauriDesktopRuntime()) return null;
+  return invokeRustCommand('ipc_download_model', { modelId });
+}
+
+export async function deleteModelViaRustBackend(
+  fileName: string
+): Promise<void> {
+  if (!isTauriDesktopRuntime()) return;
+  await invokeRustCommand('ipc_delete_model', { fileName });
+}
+
 export interface RustPitchSpeedPayload {
   semitones: number;
   cents: number;

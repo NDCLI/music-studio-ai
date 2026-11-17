@@ -174,6 +174,71 @@ pub fn handle_delete_model(
     guard.model_manager.delete_cached_model(file_name)
 }
 
+pub fn handle_download_model(
+    state: &Arc<Mutex<StudioAppState>>,
+    model_id: &str,
+) -> Result<CachedModelStatus, String> {
+    let manager = {
+        let guard = state
+            .lock()
+            .map_err(|_| "Failed to acquire studio state lock".to_string())?;
+        guard.model_manager.clone()
+    };
+    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    manager.download_model_resumable(model_id, cancel_flag, |_| {})
+}
+
+/// Validates and opens an external `https://` URL in the OS default browser without spawning shell `.exe`s.
+pub fn handle_open_external_url(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !trimmed.starts_with("https://")
+        || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err("Only valid HTTPS URLs without whitespace are permitted".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut core::ffi::c_void,
+                lp_operation: *const u16,
+                lp_file: *const u16,
+                lp_parameters: *const u16,
+                lp_directory: *const u16,
+                n_show_cmd: i32,
+            ) -> isize;
+        }
+
+        let op: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
+        let file: Vec<u16> = OsStr::new(trimmed).encode_wide().chain(Some(0)).collect();
+        let res = unsafe {
+            ShellExecuteW(
+                core::ptr::null_mut(),
+                op.as_ptr(),
+                file.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                1, // SW_SHOWNORMAL
+            )
+        };
+        if res <= 32 {
+            return Err(format!("ShellExecuteW failed with code {}", res));
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = trimmed;
+        Err("External URL opener is only configured for Windows".to_string())
+    }
+}
+
 pub fn handle_run_separation(
     state: &Arc<Mutex<StudioAppState>>,
     mode: SeparationMode,
@@ -410,6 +475,22 @@ pub mod tauri_commands {
         file_name: String,
     ) -> Result<(), String> {
         handle_delete_model(state.inner(), &file_name)
+    }
+
+    #[tauri::command]
+    pub async fn ipc_download_model(
+        state: tauri::State<'_, Arc<Mutex<StudioAppState>>>,
+        model_id: String,
+    ) -> Result<CachedModelStatus, String> {
+        let state_arc = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || handle_download_model(&state_arc, &model_id))
+            .await
+            .map_err(|e| format!("Download worker panicked: {}", e))?
+    }
+
+    #[tauri::command]
+    pub fn ipc_open_external_url(url: String) -> Result<(), String> {
+        handle_open_external_url(&url)
     }
 
     #[tauri::command]

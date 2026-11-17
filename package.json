@@ -1,7 +1,7 @@
 {
   "name": "music-studio-ai",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Rust Music Studio AI: Formant-Preserving Pitch/Speed Shifter & Local ONNX Stem Separation",
   "type": "module",
   "scripts": {

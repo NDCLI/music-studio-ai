@@ -72,7 +72,10 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
     sdrDb: '11.8 dB',
     sizeMb: 56,
     downloadUrl:
-      'https://huggingface.co/Politrees/UVR_resources/resolve/main/MDXNet_models/UVR-MDX-NET-Inst_HQ_4.onnx',
+      'https://huggingface.co/Politrees/UVR_resources/resolve/main/models/MDXNet/UVR-MDX-NET-Inst_HQ_4.onnx',
+    fallbackUrls: [
+      'https://huggingface.co/aaatmy/uvr-mdx-net-onnx/resolve/main/UVR-MDX-NET-Inst_HQ_4.onnx',
+    ],
     sourceRepo: 'Politrees/UVR_resources',
     stftSpec: {
       nFft: 5120,
@@ -86,13 +89,13 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
   },
   {
     id: 'mel_band_roformer_vocals',
-    fileName: 'mel_band_roformer_kim_ft_unwa.onnx',
+    fileName: 'mel-roformer.fp16.onnx',
     taskTitle: 'Tầng 1: Tách Nhạc Nền & Tổng Vocal (Chế độ Siêu Nét)',
-    architecture: 'Mel-Band RoFormer (Rotary Transformer)',
+    architecture: 'Mel-Band RoFormer FP16 (Rotary Transformer)',
     sdrDb: '13.1 dB',
-    sizeMb: 228,
+    sizeMb: 443,
     downloadUrl:
-      'https://huggingface.co/phuongnse/mel-roformer-kim-onnx/resolve/main/mel_band_roformer_kim_ft_unwa.onnx',
+      'https://huggingface.co/phuongnse/mel-roformer-kim-onnx/resolve/main/mel-roformer.fp16.onnx',
     sourceRepo: 'phuongnse/mel-roformer-kim-onnx',
     stftSpec: {
       nFft: 4096,
@@ -110,9 +113,12 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
     taskTitle: 'Tầng 2: Tách Vocal Chính (Lead) & Giọng Bè (Harmony)',
     architecture: 'MDX-Net Karaoke / Backing Extractor',
     sdrDb: '10.4 dB',
-    sizeMb: 55,
+    sizeMb: 50,
     downloadUrl:
-      'https://huggingface.co/Politrees/UVR_resources/resolve/main/MDXNet_models/UVR_MDXNET_KARA_2.onnx',
+      'https://huggingface.co/Politrees/UVR_resources/resolve/main/models/MDXNet/UVR_MDXNET_KARA_2.onnx',
+    fallbackUrls: [
+      'https://huggingface.co/seanghay/uvr_models/resolve/main/UVR_MDXNET_KARA_2.onnx',
+    ],
     sourceRepo: 'Politrees/UVR_resources',
     stftSpec: {
       nFft: 5120,
@@ -130,9 +136,9 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
     taskTitle: 'Tầng 2: Tách Vocal Chính & Giọng Bè (Chế độ Pro)',
     architecture: 'Mel-Band RoFormer Karaoke ViperX',
     sdrDb: '10.8 dB',
-    sizeMb: 228,
+    sizeMb: 876,
     downloadUrl:
-      'https://huggingface.co/bdsqlsz/mel_band_roformer_karaoke_aufr33-ONNX/resolve/main/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.onnx',
+      'https://huggingface.co/bdsqlsz/mel_band_roformer_karaoke_aufr33-ONNX/resolve/main/model.onnx',
     sourceRepo: 'bdsqlsz/mel_band_roformer_karaoke_aufr33-ONNX',
     stftSpec: {
       nFft: 4096,
@@ -150,9 +156,13 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
     taskTitle: 'Tầng 3: Tách Vocal Khô (Dry) & Đuôi Vang (Reverb Tail)',
     architecture: 'MDX-Net De-Reverb HQ',
     sdrDb: '11.4 dB',
-    sizeMb: 67,
+    sizeMb: 64,
     downloadUrl:
       'https://huggingface.co/seanghay/uvr_models/resolve/main/Reverb_HQ_By_FoxJoy.onnx',
+    fallbackUrls: [
+      'https://huggingface.co/Politrees/UVR_resources/resolve/main/models/MDXNet/Reverb_HQ_By_FoxJoy.onnx',
+      'https://huggingface.co/raydotac/AudioSeparatorONNX/resolve/main/Reverb_HQ_By_FoxJoy.onnx',
+    ],
     sourceRepo: 'seanghay/uvr_models',
     stftSpec: {
       nFft: 7680,
@@ -170,7 +180,7 @@ export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
     taskTitle: 'Nâng Hạ Tone AI: Dò Cao Độ F0 & Tái Tạo Sóng Âm Vocal',
     architecture: 'Deep U-Net Pitch Estimator (RMVPE)',
     sdrDb: 'Artifact-Free',
-    sizeMb: 90,
+    sizeMb: 345,
     downloadUrl:
       'https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.onnx',
     sourceRepo: 'lj1995/VoiceConversionWebUI',

@@ -79,6 +79,7 @@ export interface LocalAiModelSpec {
   sdrDb: string;
   sizeMb: number;
   downloadUrl: string;
+  fallbackUrls?: string[];
   sourceRepo: string;
   stftSpec: {
     nFft: number;

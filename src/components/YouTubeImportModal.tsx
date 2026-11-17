@@ -16,6 +16,7 @@ import {
   parseYouTubeSingleVideoUrl,
   YouTubeTrackResolvedInfo,
 } from '../services/youtubeParser';
+import { openExternalUrl } from '../services/tauriBridge';
 
 interface YouTubeImportModalProps {
   isOpen: boolean;
@@ -264,15 +265,14 @@ export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
                       Nhịp độ: {resolvedInfo.detectedBpm} BPM
                     </span>
                     <span className="text-slate-600">&bull;</span>
-                    <a
-                      href={resolvedInfo.parsed.canonicalWatchUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1 text-indigo-400 hover:underline"
+                    <button
+                      type="button"
+                      onClick={() => void openExternalUrl(resolvedInfo.parsed.canonicalWatchUrl)}
+                      className="cursor-pointer inline-flex items-center gap-1 text-indigo-400 hover:underline"
                     >
                       <span>Link đơn đã lọc</span>
                       <ExternalLink className="h-3 w-3" />
-                    </a>
+                    </button>
                   </div>
                 </div>
               </div>

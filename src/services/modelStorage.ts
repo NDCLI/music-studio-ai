@@ -154,13 +154,32 @@ export async function downloadModelFromHuggingFace(
   abortSignal: AbortSignal,
   onProgress: (downloadedBytes: number, totalBytes: number, percent: number) => void
 ): Promise<Omit<CachedModelRecord, 'blob'>> {
-  const response = await fetch(spec.downloadUrl, {
-    signal: abortSignal,
-    mode: 'cors',
-  });
+  const candidateUrls = [spec.downloadUrl, ...(spec.fallbackUrls ?? [])];
+  let response: Response | null = null;
+  let lastStatus = 0;
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} khi tải ${spec.fileName} từ HuggingFace.`);
+  for (const url of candidateUrls) {
+    try {
+      const res = await fetch(url, {
+        signal: abortSignal,
+        mode: 'cors',
+      });
+      if (res.ok) {
+        response = res;
+        break;
+      }
+      lastStatus = res.status;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err;
+      }
+    }
+  }
+
+  if (!response) {
+    throw new Error(
+      `HTTP ${lastStatus || 'Network'} khi tải ${spec.fileName} từ HuggingFace.`
+    );
   }
 
   const headerLen = response.headers.get('content-length');

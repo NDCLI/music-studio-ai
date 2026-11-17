@@ -18,7 +18,13 @@ import {
   listCachedModelsFromDb,
 } from './services/modelStorage';
 import { separateAudioBuffer3Stage } from './services/stemSeparator';
-import { syncPitchSpeedToRustBackend } from './services/tauriBridge';
+import {
+  deleteModelViaRustBackend,
+  downloadModelViaRustBackend,
+  isTauriDesktopRuntime,
+  listModelsViaRustBackend,
+  syncPitchSpeedToRustBackend,
+} from './services/tauriBridge';
 import { YouTubeTrackResolvedInfo } from './services/youtubeParser';
 import {
   LocalAiModelSpec,
@@ -164,25 +170,37 @@ export const App: React.FC = () => {
   useEffect(() => {
     audioEngineRef.current = new StudioPreviewAudioEngine();
 
-    void listCachedModelsFromDb()
-      .then((cachedMap) => {
-        setModels((prev) =>
-          prev.map((m) => {
-            const hit = cachedMap[m.id];
-            if (!hit) return m;
+    void Promise.all([
+      listCachedModelsFromDb().catch(() => ({} as Record<string, { sizeBytes: number; sha256Hex: string; source: 'huggingface' | 'local_import' }>)),
+      listModelsViaRustBackend().catch(() => null),
+    ]).then(([dbMap, rustOverview]) => {
+      const rustMap = new Map(
+        (rustOverview?.cached_status ?? []).map((item) => [item.id, item])
+      );
+      setModels((prev) =>
+        prev.map((m) => {
+          const rustHit = rustMap.get(m.id);
+          if (rustHit?.installed) {
             return {
               ...m,
               installed: true,
-              cachedSizeBytes: hit.sizeBytes,
-              sha256Hex: hit.sha256Hex,
-              cachedSource: hit.source,
+              cachedSizeBytes: rustHit.size_bytes,
+              sha256Hex: rustHit.sha256_hex ?? m.sha256Hex,
+              cachedSource: 'huggingface',
             };
-          })
-        );
-      })
-      .catch(() => {
-        // Ignore IndexedDB unavailability in restricted environments
-      });
+          }
+          const hit = dbMap[m.id];
+          if (!hit) return m;
+          return {
+            ...m,
+            installed: true,
+            cachedSizeBytes: hit.sizeBytes,
+            sha256Hex: hit.sha256Hex,
+            cachedSource: hit.source,
+          };
+        })
+      );
+    });
 
     return () => {
       audioEngineRef.current?.stop();
@@ -582,6 +600,29 @@ export const App: React.FC = () => {
     );
 
     try {
+      if (isTauriDesktopRuntime() && spec.sizeMb > 200) {
+        const rustSaved = await downloadModelViaRustBackend(modelId);
+        if (rustSaved?.installed) {
+          setModels((prev) =>
+            prev.map((m) =>
+              m.id === modelId
+                ? {
+                    ...m,
+                    downloading: false,
+                    installed: true,
+                    downloadProgress: 100,
+                    cachedSizeBytes: rustSaved.size_bytes,
+                    sha256Hex: rustSaved.sha256_hex,
+                    cachedSource: 'huggingface',
+                    downloadError: undefined,
+                  }
+                : m
+            )
+          );
+          return;
+        }
+      }
+
       const saved = await downloadModelFromHuggingFace(
         spec,
         controller.signal,
@@ -619,11 +660,38 @@ export const App: React.FC = () => {
       );
     } catch (err) {
       const isAborted = err instanceof DOMException && err.name === 'AbortError';
+      if (!isAborted && isTauriDesktopRuntime()) {
+        try {
+          const rustSaved = await downloadModelViaRustBackend(modelId);
+          if (rustSaved?.installed) {
+            setModels((prev) =>
+              prev.map((m) =>
+                m.id === modelId
+                  ? {
+                      ...m,
+                      downloading: false,
+                      installed: true,
+                      downloadProgress: 100,
+                      cachedSizeBytes: rustSaved.size_bytes,
+                      sha256Hex: rustSaved.sha256_hex,
+                      cachedSource: 'huggingface',
+                      downloadError: undefined,
+                    }
+                  : m
+              )
+            );
+            return;
+          }
+        } catch {
+          // Fall through to detailed error banner below
+        }
+      }
+
       const errMessage = isAborted
         ? 'Đã tạm dừng tải model. Bấm Tải HuggingFace để tải lại hoặc Nhập .ONNX Có Sẵn.'
-        : `Không thể tải trực tiếp qua trình duyệt (có thể do CORS/Firewall mạng công ty): ${
+        : `Không thể tải trực tiếp (${
             err instanceof Error ? err.message : String(err)
-          }. Hãy bấm link Repo để tải bằng trình duyệt rồi chọn "Nhập .ONNX Có Sẵn".`;
+          }). Hãy bấm nút "Copy Link Tải" hoặc mở Repo trên trình duyệt rồi chọn "Nhập .ONNX Có Sẵn".`;
 
       setModels((prev) =>
         prev.map((m) =>
@@ -686,7 +754,11 @@ export const App: React.FC = () => {
   };
 
   const handleDeleteCachedModel = async (modelId: string) => {
+    const spec = models.find((m) => m.id === modelId);
     await deleteCachedModelFromDb(modelId);
+    if (spec) {
+      await deleteModelViaRustBackend(spec.fileName).catch(() => {});
+    }
     setModels((prev) =>
       prev.map((m) =>
         m.id === modelId
