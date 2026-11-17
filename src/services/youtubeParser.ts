@@ -1,7 +1,3 @@
-import { MUSICAL_KEYS } from '../data/modelsCatalog';
-import { generateStemPeaks } from './audioSynthesizer';
-import { StemId } from '../types/studio';
-
 export interface ParsedYouTubeTarget {
   videoId: string;
   canonicalWatchUrl: string;
@@ -16,10 +12,6 @@ export interface YouTubeTrackResolvedInfo {
   title: string;
   authorName: string;
   thumbnailUrl: string;
-  durationSec: number;
-  detectedKey: string;
-  detectedBpm: number;
-  peaks: Record<StemId, number[]>;
 }
 
 /**
@@ -100,11 +92,23 @@ export function parseYouTubeSingleVideoUrl(rawUrl: string): {
     };
   }
 
-  // Clean videoId to valid characters
-  const cleanId = videoId.replace(/[^a-zA-Z0-9_-]/g, '');
-  if (cleanId.length < 6) {
-    return { ok: false, error: 'Mã video YouTube (`v=`) không hợp lệ.' };
+  if (/https?:\/\//i.test(videoId) || trimmed.indexOf('http', 8) !== -1) {
+    return {
+      ok: false,
+      error:
+        'Đường dẫn bị dính nhiều link liên tiếp. Vui lòng xóa sạch ô nhập rồi dán lại đúng 1 link YouTube.',
+    };
   }
+
+  // Standard YouTube video IDs are strictly 11 chars [a-zA-Z0-9_-]
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+    return {
+      ok: false,
+      error: 'Mã video YouTube (`v=`) không đúng chuẩn 11 ký tự. Vui lòng kiểm tra lại link.',
+    };
+  }
+
+  const cleanId = videoId;
 
   const parsedIndex = indexParam ? parseInt(indexParam, 10) : undefined;
   const parsedStart = tParam ? parseInt(tParam.replace(/[^0-9]/g, ''), 10) : undefined;
@@ -123,35 +127,14 @@ export function parseYouTubeSingleVideoUrl(rawUrl: string): {
 }
 
 /**
- * Computes a deterministic numeric hash from a string (e.g. videoId)
- * to derive consistent musical characteristics when previewing.
- */
-function hashString(str: string): number {
-  let h = 2166136261;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return Math.abs(h);
-}
-
-/**
  * Fetches real YouTube video title, author, and thumbnail via YouTube oEmbed API
  * for the isolated single track (`canonicalWatchUrl`).
  */
 export async function fetchYouTubeTrackMetadata(
   parsed: ParsedYouTubeTarget
 ): Promise<YouTubeTrackResolvedInfo> {
-  const hash = hashString(parsed.videoId);
-  const keyRoot = MUSICAL_KEYS[hash % MUSICAL_KEYS.length];
-  const isMinor = hash % 2 === 0;
-  const detectedKey = `${keyRoot}${isMinor ? 'm' : ''}`;
-  const detectedBpm = 92 + (hash % 56);
-  const durationSec = 185 + (hash % 95);
-  const seedBoost = 0.8 + ((hash % 40) / 100);
-
-  let title = `YouTube Track (${parsed.videoId})`;
-  let authorName = 'YouTube Music Stream';
+  let title = `YouTube Video (${parsed.videoId})`;
+  let authorName = 'YouTube';
   let thumbnailUrl = `https://i.ytimg.com/vi/${parsed.videoId}/hqdefault.jpg`;
 
   try {
@@ -170,7 +153,7 @@ export async function fetchYouTubeTrackMetadata(
       if (json.thumbnail_url) thumbnailUrl = json.thumbnail_url;
     }
   } catch {
-    // Fallback to deterministic metadata if offline
+    // Offline fallback uses canonical videoId label
   }
 
   return {
@@ -178,14 +161,5 @@ export async function fetchYouTubeTrackMetadata(
     title,
     authorName,
     thumbnailUrl,
-    durationSec,
-    detectedKey,
-    detectedBpm,
-    peaks: {
-      lead_vocal: generateStemPeaks('lead_vocal', 140, seedBoost),
-      backing_vocal: generateStemPeaks('backing_vocal', 140, seedBoost * 1.1),
-      instrumental: generateStemPeaks('instrumental', 140, seedBoost * 0.95),
-      reverb_tail: generateStemPeaks('reverb_tail', 140, seedBoost * 1.05),
-    },
   };
 }

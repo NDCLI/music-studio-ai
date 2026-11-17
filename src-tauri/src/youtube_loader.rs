@@ -97,8 +97,17 @@ pub fn parse_youtube_single_video_url(raw_url: &str) -> Result<ParsedYouTubeTarg
         }
     })?;
 
-    if vid.len() < 6 {
-        return Err("Mã video YouTube không hợp lệ.".to_string());
+    let after_scheme = trimmed.split_once("://").map(|(_, rest)| rest).unwrap_or(trimmed);
+    if after_scheme.contains("http://") || after_scheme.contains("https://") {
+        return Err("Đường dẫn bị dính nhiều link liên tiếp. Vui lòng dán lại đúng 1 link YouTube.".to_string());
+    }
+
+    if vid.len() != 11
+        || !vid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("Mã video YouTube không đúng chuẩn 11 ký tự.".to_string());
     }
 
     let canonical_watch_url = format!("https://www.youtube.com/watch?v={}", vid);
@@ -112,4 +121,20 @@ pub fn parse_youtube_single_video_url(raw_url: &str) -> Result<ParsedYouTubeTarg
         playlist_index,
         start_time_sec,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_youtube_url_rejects_concatenated_urls_and_invalid_ids() {
+        let dup = "https://www.youtube.com/watch?v=8nsV1giVhttps://www.youtube.com/watch?v=8nsV1giVLOQ";
+        assert!(parse_youtube_single_video_url(dup).is_err());
+        assert!(parse_youtube_single_video_url("https://youtu.be/abc").is_err());
+
+        let valid = parse_youtube_single_video_url("https://youtu.be/8nsV1giVLOQ?si=TKLZ1x2UyRnoeIrD")
+            .expect("valid short youtube link");
+        assert_eq!(valid.video_id, "8nsV1giVLOQ");
+    }
 }

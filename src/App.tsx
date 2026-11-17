@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { AlertCircle, CheckCircle2, FolderOpen, Upload, X } from 'lucide-react';
 import { StudioHeader } from './components/StudioHeader';
 import { TransportBar } from './components/TransportBar';
 import { PitchSpeedDeck } from './components/PitchSpeedDeck';
@@ -7,10 +8,7 @@ import { ModelManagerModal } from './components/ModelManagerModal';
 import { ExportModal, ExportFormat, ExportOutcome, ExportTarget } from './components/ExportModal';
 import { YouTubeImportModal } from './components/YouTubeImportModal';
 import { LOCAL_AI_MODELS } from './data/modelsCatalog';
-import {
-  generateStemPeaks,
-  StudioPreviewAudioEngine,
-} from './services/audioSynthesizer';
+import { StudioPreviewAudioEngine } from './services/audioSynthesizer';
 import {
   deleteCachedModelFromDb,
   downloadModelFromHuggingFace,
@@ -19,17 +17,27 @@ import {
 } from './services/modelStorage';
 import { separateAudioBuffer3Stage } from './services/stemSeparator';
 import {
+  base64ToArrayBuffer,
   deleteModelViaRustBackend,
   downloadModelViaRustBackend,
+  exportAudioViaRustBackend,
   getDefaultExportDirViaRust,
+  getSeparatedStemsWavViaRust,
+  importLocalOnnxViaRust,
   isTauriDesktopRuntime,
   listModelsViaRustBackend,
+  loadAudioBytesViaRustBackend,
+  loadTrackViaRustBackend,
   openLocalFolderViaRust,
+  pickAudioFileViaRust,
   pickExportFolderViaRust,
+  pickOnnxFileViaRust,
+  preparePreviewWavViaRust,
+  readFileBytesViaRust,
+  runSeparationViaRustBackend,
   saveExportedFileViaRust,
   syncPitchSpeedToRustBackend,
 } from './services/tauriBridge';
-import { YouTubeTrackResolvedInfo } from './services/youtubeParser';
 import {
   LocalAiModelSpec,
   PitchSpeedSettings,
@@ -71,7 +79,7 @@ const INITIAL_STEMS: StemTrackState[] = [
     id: 'lead_vocal',
     name: 'Vocal Chính (Dry Lead Vocal)',
     subtitle: 'Giọng hát chính đã tách bè & khử đuôi vang',
-    modelSource: 'UVR_MDXNET_KARA_2.onnx',
+    modelSource: '',
     colorHex: '#EC4899',
     badgeClass: 'text-pink-400',
     volume: 100,
@@ -79,13 +87,13 @@ const INITIAL_STEMS: StemTrackState[] = [
     muted: false,
     solo: false,
     formantLocked: true,
-    peaks: generateStemPeaks('lead_vocal', 140),
+    peaks: [],
   },
   {
     id: 'backing_vocal',
     name: 'Giọng Bè (Backing Vocal / Harmony)',
     subtitle: 'Bè phối âm, hợp xướng & điệp khúc phụ họa',
-    modelSource: 'UVR_MDXNET_KARA_2.onnx',
+    modelSource: '',
     colorHex: '#F59E0B',
     badgeClass: 'text-amber-400',
     volume: 90,
@@ -93,13 +101,13 @@ const INITIAL_STEMS: StemTrackState[] = [
     muted: false,
     solo: false,
     formantLocked: true,
-    peaks: generateStemPeaks('backing_vocal', 140),
+    peaks: [],
   },
   {
     id: 'instrumental',
     name: 'Nhạc Nền (Instrumental Beat)',
     subtitle: 'Trống, Bass, Guitar, Piano & Synth giữ nguyên độ nảy',
-    modelSource: 'UVR-MDX-NET-Inst_HQ_4.onnx',
+    modelSource: '',
     colorHex: '#10B981',
     badgeClass: 'text-emerald-400',
     volume: 100,
@@ -107,13 +115,13 @@ const INITIAL_STEMS: StemTrackState[] = [
     muted: false,
     solo: false,
     formantLocked: false,
-    peaks: generateStemPeaks('instrumental', 140),
+    peaks: [],
   },
   {
     id: 'reverb_tail',
     name: 'Đuôi Vang (Vocal Reverb / Echo Tail)',
     subtitle: 'Không gian vang phòng thu tách rời để nâng tone không méo pha',
-    modelSource: 'Reverb_HQ_By_FoxJoy.onnx',
+    modelSource: '',
     colorHex: '#06B6D4',
     badgeClass: 'text-cyan-400',
     volume: 55,
@@ -121,23 +129,12 @@ const INITIAL_STEMS: StemTrackState[] = [
     muted: false,
     solo: false,
     formantLocked: false,
-    peaks: generateStemPeaks('reverb_tail', 140),
+    peaks: [],
   },
 ];
 
 export const App: React.FC = () => {
-  const [song, setSong] = useState<SongMetadata>({
-    title: 'Bản Ballad Phòng Thu (Demo Đa Kênh)',
-    artist: 'Music Studio AI',
-    fileName: 'Studio_Ballad_Master_44k.wav',
-    sampleRate: 44100,
-    channels: 2,
-    durationSec: 215,
-    originalBpm: 124,
-    originalKey: 'Am',
-    isCustomFile: false,
-    sourceType: 'studio_demo',
-  });
+  const [song, setSong] = useState<SongMetadata | null>(null);
 
   const [pitchSpeed, setPitchSpeed] = useState<PitchSpeedSettings>({
     semitones: 0,
@@ -151,13 +148,20 @@ export const App: React.FC = () => {
 
   const [stems, setStems] = useState<StemTrackState[]>(INITIAL_STEMS);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [currentTimeSec, setCurrentTimeSec] = useState(32.4);
-  const [peakLevelDb, setPeakLevelDb] = useState(-14.2);
-  const [loopEnabled, setLoopEnabled] = useState(true);
+  const [currentTimeSec, setCurrentTimeSec] = useState(0);
+  const [peakLevelDb, setPeakLevelDb] = useState(-60);
+  const [loopEnabled, setLoopEnabled] = useState(false);
   const [loopStartSec] = useState(30);
   const [loopEndSec] = useState(75);
   const [masterVolume, setMasterVolume] = useState(100);
   const [limiterEnabled, setLimiterEnabled] = useState(true);
+  const [isLoadingTrack, setIsLoadingTrack] = useState(false);
+  const [trackLoadError, setTrackLoadError] = useState<string | null>(null);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const [separationToast, setSeparationToast] = useState<string | null>(null);
+  const [separationBackendType, setSeparationBackendType] = useState<
+    'none' | 'stft_dsp' | 'onnx_rust'
+  >('none');
 
   const [qualityMode, setQualityMode] =
     useState<SeparationQualityMode>('fast_mdx');
@@ -166,12 +170,10 @@ export const App: React.FC = () => {
   const [separationStatus, setSeparationStatus] =
     useState<SeparationStageStatus>({
       isRunning: false,
-      isSeparated: true,
-      currentStage: 3,
-      progressPercent: 100,
-      stageMessage:
-        'Sẵn sàng 4 rãnh mẫu (Mở file Nhạc/Video để tách riêng giọng hát & nhạc nền)',
-      executionBackend: '4 Kênh Sẵn Sàng',
+      isSeparated: false,
+      currentStage: 0,
+      progressPercent: 0,
+      stageMessage: 'Hãy mở file Nhạc hoặc Video từ máy để xử lý thực tế.',
     });
 
   const [models, setModels] = useState<LocalAiModelSpec[]>(LOCAL_AI_MODELS);
@@ -191,7 +193,20 @@ export const App: React.FC = () => {
     useState<BrowserDirectoryHandle | null>(null);
 
   const audioEngineRef = useRef<StudioPreviewAudioEngine | null>(null);
+  const dropzoneFileInputRef = useRef<HTMLInputElement | null>(null);
+  const separationToastTimerRef = useRef<number | null>(null);
   const downloadAbortControllersRef = useRef<Record<string, AbortController>>({});
+
+  const showSeparationSuccessToast = (text: string) => {
+    setSeparationToast(text);
+    if (separationToastTimerRef.current !== null) {
+      window.clearTimeout(separationToastTimerRef.current);
+    }
+    separationToastTimerRef.current = window.setTimeout(() => {
+      setSeparationToast(null);
+      separationToastTimerRef.current = null;
+    }, 6000);
+  };
   const stemsRef = useRef(stems);
   stemsRef.current = stems;
   const pitchSpeedRef = useRef(pitchSpeed);
@@ -247,7 +262,9 @@ export const App: React.FC = () => {
 
   const handleTogglePlay = () => {
     const engine = audioEngineRef.current;
-    if (!engine) return;
+    if (!engine || !song) return;
+
+    const totalDuration = song.durationSec;
 
     if (isPlaying) {
       engine.stop();
@@ -265,7 +282,7 @@ export const App: React.FC = () => {
               engine.seekToSeconds(loopStartSec);
               return loopStartSec;
             }
-            if (next >= song.durationSec) {
+            if (totalDuration > 0 && next >= totalDuration) {
               engine.seekToSeconds(0);
               return 0;
             }
@@ -297,11 +314,19 @@ export const App: React.FC = () => {
       setIsPlaying(false);
     }
 
+    setIsLoadingTrack(true);
+    setTrackLoadError(null);
     const sourceType = detectFileSourceType(file);
 
     try {
-      const decoded = await engine.loadAudioFile(file);
+      const rawArrayBuffer = await file.arrayBuffer();
+      const decoded = await engine.loadAudioFromArrayBuffer(rawArrayBuffer);
       const cleanTitle = file.name.replace(/\.[^/.]+$/, '');
+
+      if (isTauriDesktopRuntime() && rawArrayBuffer.byteLength <= 80 * 1024 * 1024) {
+        void loadAudioBytesViaRustBackend(file.name, rawArrayBuffer).catch(() => null);
+      }
+
       setSong({
         title: cleanTitle,
         artist: sourceType === 'video_file' ? 'Video Audio Track' : 'Local Audio Track',
@@ -318,64 +343,106 @@ export const App: React.FC = () => {
       setStems((prev) =>
         prev.map((s) => ({
           ...s,
-          peaks: decoded.peaks[s.id] ?? s.peaks,
+          muted: false,
+          solo: false,
+          volume: s.id === 'reverb_tail' ? 55 : 100,
+          peaks: [],
         }))
       );
+      setActivePreset('full_mix');
+      setSeparationToast(null);
+      setSeparationBackendType('none');
       setSeparationStatus({
         isRunning: false,
         isSeparated: false,
         currentStage: 0,
         progressPercent: 0,
-        stageMessage: `Đã nạp "${file.name}" — Bấm "Tách Nhạc AI (3 Tầng)" để tách riêng Vocal, Bè & Nhạc nền.`,
+        stageMessage: `Chưa tách nhạc — Bấm "Tách Nhạc AI (3 Tầng)" để tách "${file.name}" và hiển thị sóng âm 4 kênh.`,
       });
       setCurrentTimeSec(0);
-    } catch {
-      const cleanTitle = file.name.replace(/\.[^/.]+$/, '');
-      setSong((prev) => ({
-        ...prev,
-        title: cleanTitle,
-        fileName: file.name,
-        isCustomFile: true,
-        sourceType,
-      }));
+    } catch (err) {
+      setTrackLoadError(
+        `Không thể giải mã "${file.name}": ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    } finally {
+      setIsLoadingTrack(false);
     }
   };
 
-  const handleImportYouTubeTrack = (info: YouTubeTrackResolvedInfo) => {
+  const handleDesktopOpenTrack = async () => {
     const engine = audioEngineRef.current;
-    if (engine && isPlaying) {
+    if (!engine) return;
+
+    const pickedPath = await pickAudioFileViaRust().catch(() => null);
+    if (!pickedPath) return;
+
+    if (isPlaying) {
       engine.stop();
       setIsPlaying(false);
     }
 
-    setSong({
-      title: info.title,
-      artist: info.authorName,
-      fileName: `yt_${info.parsed.videoId}.m4a`,
-      sampleRate: 44100,
-      channels: 2,
-      durationSec: info.durationSec,
-      originalBpm: info.detectedBpm,
-      originalKey: info.detectedKey,
-      isCustomFile: false,
-      sourceType: 'youtube_single',
-      youtubeInfo: {
-        videoId: info.parsed.videoId,
-        canonicalUrl: info.parsed.canonicalWatchUrl,
-        wasInPlaylist: info.parsed.wasInPlaylist,
-        ignoredPlaylistId: info.parsed.ignoredPlaylistId,
-        playlistIndex: info.parsed.playlistIndex,
-        thumbnailUrl: info.thumbnailUrl,
-      },
-    });
+    setIsLoadingTrack(true);
+    setTrackLoadError(null);
 
-    setStems((prev) =>
-      prev.map((s) => ({
-        ...s,
-        peaks: info.peaks[s.id] ?? s.peaks,
-      }))
-    );
-    setCurrentTimeSec(info.parsed.startTimeSec ?? 0);
+    try {
+      const rustSummary = await loadTrackViaRustBackend(pickedPath);
+      if (!rustSummary) {
+        throw new Error('Không đọc được file qua bộ giải mã cục bộ.');
+      }
+
+      try {
+        const rawBytes = await readFileBytesViaRust(pickedPath);
+        await engine.loadAudioFromArrayBuffer(rawBytes);
+      } catch {
+        const previewWavBytes = await preparePreviewWavViaRust();
+        await engine.loadAudioFromArrayBuffer(previewWavBytes);
+      }
+
+      const cleanTitle = rustSummary.file_name.replace(/\.[^/.]+$/, '');
+      setSong({
+        title: cleanTitle,
+        artist: rustSummary.is_video_source ? 'Video Audio Track' : 'Local Audio Track',
+        fileName: rustSummary.file_name,
+        sampleRate: rustSummary.sample_rate,
+        channels: rustSummary.channels,
+        durationSec: Math.max(1, Math.round(rustSummary.duration_sec)),
+        originalBpm: Math.round(rustSummary.detected_bpm),
+        originalKey: rustSummary.detected_key,
+        isCustomFile: true,
+        sourceType: rustSummary.is_video_source ? 'video_file' : 'audio_file',
+      });
+
+      setStems((prev) =>
+        prev.map((s) => ({
+          ...s,
+          muted: false,
+          solo: false,
+          volume: s.id === 'reverb_tail' ? 55 : 100,
+          peaks: [],
+        }))
+      );
+      setActivePreset('full_mix');
+      setSeparationToast(null);
+      setSeparationBackendType('none');
+      setSeparationStatus({
+        isRunning: false,
+        isSeparated: false,
+        currentStage: 0,
+        progressPercent: 0,
+        stageMessage: `Chưa tách nhạc — Bấm "Tách Nhạc AI (3 Tầng)" để tách "${rustSummary.file_name}" và hiển thị sóng âm 4 kênh.`,
+      });
+      setCurrentTimeSec(0);
+    } catch (err) {
+      setTrackLoadError(
+        `Không thể nạp file "${pickedPath}": ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    } finally {
+      setIsLoadingTrack(false);
+    }
   };
 
   const activeDesktopExportDir = customExportDir ?? defaultExportDir;
@@ -449,12 +516,67 @@ export const App: React.FC = () => {
     format: ExportFormat
   ): Promise<ExportOutcome> => {
     const engine = audioEngineRef.current;
-    if (!engine) {
+    if (!engine || !song) {
       return {
         files: [],
         destinationLabel: exportFolderLabel,
         savedToLocalFolder: false,
-        errorMessage: 'Bộ phát âm thanh chưa sẵn sàng.',
+        errorMessage: 'Vui lòng mở file Nhạc hoặc Video trước khi xuất.',
+      };
+    }
+
+    if (
+      isTauriDesktopRuntime() &&
+      activeDesktopExportDir &&
+      separationBackendType !== 'stft_dsp'
+    ) {
+      const formatMap: Record<
+        ExportFormat,
+        'Wav16Bit' | 'Wav24Bit' | 'Wav32Float' | 'Flac24BitLossless'
+      > = {
+        wav16: 'Wav16Bit',
+        wav24: 'Wav24Bit',
+        wav32f: 'Wav32Float',
+        flac: 'Flac24BitLossless',
+      };
+      const targetMap: Record<
+        ExportTarget,
+        'MasterMix' | 'AllStems' | 'KaraokeBacking'
+      > = {
+        master_mix: 'MasterMix',
+        all_stems: 'AllStems',
+        karaoke_backing: 'KaraokeBacking',
+      };
+      const roleMap: Record<
+        StemId,
+        'LeadVocal' | 'BackingVocal' | 'Instrumental' | 'ReverbTail'
+      > = {
+        lead_vocal: 'LeadVocal',
+        backing_vocal: 'BackingVocal',
+        instrumental: 'Instrumental',
+        reverb_tail: 'ReverbTail',
+      };
+
+      const res = await exportAudioViaRustBackend({
+        outputDir: activeDesktopExportDir,
+        baseName,
+        target: targetMap[target],
+        format: formatMap[format],
+        stemParams: stems.map((s) => ({
+          role: roleMap[s.id],
+          volume_percent: s.volume,
+          pan: s.pan / 50,
+          muted: s.muted,
+          solo: s.solo,
+          formant_locked: s.formantLocked,
+        })),
+        limiterEnabled,
+      });
+
+      return {
+        files: res.exported_paths.map((p) => p.split(/[\\/]/).pop() ?? p),
+        destinationLabel: activeDesktopExportDir,
+        savedToLocalFolder: true,
       };
     }
 
@@ -539,34 +661,22 @@ export const App: React.FC = () => {
     });
   };
 
-  const handleRunSeparation = async () => {
-    if (separationStatus.isRunning) return;
+  const runSpectralSeparation = async () => {
     const engine = audioEngineRef.current;
     const customBuffer = engine?.getCustomAudioBuffer();
+    if (!customBuffer || !engine) return;
 
-    const getModelLabel = (stemId: StemId) => {
-      if (stemId === 'instrumental') {
-        return qualityMode === 'fast_mdx'
-          ? 'UVR-MDX-NET-Inst_HQ_4.onnx'
-          : 'mel_band_roformer_kim_ft_unwa.onnx';
-      }
-      if (stemId === 'reverb_tail') {
-        return 'Reverb_HQ_By_FoxJoy.onnx';
-      }
-      return qualityMode === 'fast_mdx'
-        ? 'UVR_MDXNET_KARA_2.onnx'
-        : 'mel_band_roformer_karaoke_aufr33_viperx.onnx';
-    };
+    const startedAt = performance.now();
+    setSeparationToast(null);
+    setSeparationStatus({
+      isRunning: true,
+      isSeparated: false,
+      currentStage: 1,
+      progressPercent: 1,
+      stageMessage: 'Đang phân tích tín hiệu & tách phổ STFT 3 tầng trên file thực tế...',
+    });
 
-    if (customBuffer && engine) {
-      setSeparationStatus({
-        isRunning: true,
-        isSeparated: false,
-        currentStage: 1,
-        progressPercent: 1,
-        stageMessage: 'Đang phân tích tín hiệu & chuẩn bị tách 3 tầng...',
-      });
-
+    try {
       const result = await separateAudioBuffer3Stage(
         customBuffer,
         qualityMode,
@@ -581,75 +691,119 @@ export const App: React.FC = () => {
         }
       );
 
+      const elapsedSec = ((performance.now() - startedAt) / 1000).toFixed(1);
       engine.setSeparatedStems(result.stems);
       setStems((prev) =>
         prev.map((s) => ({
           ...s,
-          modelSource: getModelLabel(s.id),
+          modelSource: 'Tách Phổ STFT (DSP)',
           peaks: result.peaks[s.id] ?? s.peaks,
         }))
       );
-
+      setSeparationBackendType('stft_dsp');
+      const doneMessage = `Đã tách xong 4 kênh độc lập trong ${elapsedSec}s (Vocal chính, Giọng bè, Nhạc nền, Đuôi vang).`;
       setSeparationStatus({
         isRunning: false,
         isSeparated: true,
         currentStage: 3,
         progressPercent: 100,
-        stageMessage: 'Hoàn tất tách 4 kênh (Vocal chính, Giọng bè, Nhạc nền, Reverb)!',
-        executionBackend: 'Đã Tách 4 Rãnh',
+        stageMessage: doneMessage,
+        executionBackend: 'Tách Phổ STFT (DSP)',
       });
-      return;
+      showSeparationSuccessToast(`Tách nhạc thành công (${elapsedSec}s)! Sóng âm 4 kênh đã hiển thị.`);
+    } catch (err) {
+      setSeparationStatus({
+        isRunning: false,
+        isSeparated: false,
+        currentStage: 0,
+        progressPercent: 0,
+        stageMessage: `Lỗi khi tách phổ: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      });
+    }
+  };
+
+  const handleRunSeparation = async () => {
+    if (separationStatus.isRunning) return;
+    const engine = audioEngineRef.current;
+    const customBuffer = engine?.getCustomAudioBuffer();
+    if (!customBuffer || !engine || !song) return;
+
+    if (isTauriDesktopRuntime()) {
+      const startedAt = performance.now();
+      setSeparationToast(null);
+      setSeparationStatus({
+        isRunning: true,
+        isSeparated: false,
+        currentStage: 1,
+        progressPercent: 15,
+        stageMessage: 'Đang chạy suy luận 3 tầng AI ONNX cục bộ...',
+      });
+
+      try {
+        const rustMode = qualityMode === 'pro_roformer' ? 'ProRoformer' : 'FastMdx';
+        const res = await runSeparationViaRustBackend(rustMode, true);
+        const wavRes = await getSeparatedStemsWavViaRust();
+
+        const [lead, backing, inst, rev] = await Promise.all([
+          engine.decodeWavArrayBufferToStereo(base64ToArrayBuffer(wavRes.lead_vocal_b64)),
+          engine.decodeWavArrayBufferToStereo(base64ToArrayBuffer(wavRes.backing_vocal_b64)),
+          engine.decodeWavArrayBufferToStereo(base64ToArrayBuffer(wavRes.instrumental_b64)),
+          engine.decodeWavArrayBufferToStereo(base64ToArrayBuffer(wavRes.reverb_tail_b64)),
+        ]);
+
+        engine.setSeparatedStems({
+          lead_vocal: lead,
+          backing_vocal: backing,
+          instrumental: inst,
+          reverb_tail: rev,
+        });
+
+        const elapsedSec = ((performance.now() - startedAt) / 1000).toFixed(1);
+        setStems((prev) =>
+          prev.map((s) => ({
+            ...s,
+            peaks: res[s.id] ?? s.peaks,
+          }))
+        );
+        setSeparationBackendType('onnx_rust');
+        setSeparationStatus({
+          isRunning: false,
+          isSeparated: true,
+          currentStage: 3,
+          progressPercent: 100,
+          stageMessage: `Đã tách xong 4 kênh bằng AI ONNX cục bộ trong ${elapsedSec}s.`,
+          executionBackend: res.execution_backend,
+        });
+        showSeparationSuccessToast(`Tách nhạc AI ONNX thành công (${elapsedSec}s)!`);
+        return;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('ONNX_PREREQ_MISSING:')) {
+          const cleanReason = msg.replace(/^.*ONNX_PREREQ_MISSING:\s*/, '');
+          setSeparationStatus({
+            isRunning: false,
+            isSeparated: false,
+            currentStage: 0,
+            progressPercent: 0,
+            stageMessage: 'Chưa thể chạy mô hình AI ONNX trên máy.',
+            onnxPrereqMissing: cleanReason,
+          });
+          return;
+        }
+        setSeparationStatus({
+          isRunning: false,
+          isSeparated: false,
+          currentStage: 0,
+          progressPercent: 0,
+          stageMessage: `Lỗi AI ONNX: ${msg}`,
+        });
+        return;
+      }
     }
 
-    const modeLabel =
-      qualityMode === 'fast_mdx' ? 'Chế độ Nhanh' : 'Chế độ Siêu Nét';
-
-    setSeparationStatus({
-      isRunning: true,
-      isSeparated: false,
-      currentStage: 1,
-      progressPercent: 15,
-      stageMessage: `Tầng 1/3: Đang tách Nhạc Nền & Giọng hát (${modeLabel})...`,
-    });
-
-    window.setTimeout(() => {
-      setSeparationStatus({
-        isRunning: true,
-        isSeparated: false,
-        currentStage: 2,
-        progressPercent: 56,
-        stageMessage: `Tầng 2/3: Đang tách Vocal Chính & Giọng Bè (${modeLabel})...`,
-      });
-    }, 650);
-
-    window.setTimeout(() => {
-      setSeparationStatus({
-        isRunning: true,
-        isSeparated: false,
-        currentStage: 3,
-        progressPercent: 86,
-        stageMessage: 'Tầng 3/3: Đang lọc tiếng vang cho Vocal chính...',
-      });
-    }, 1300);
-
-    window.setTimeout(() => {
-      setSeparationStatus({
-        isRunning: false,
-        isSeparated: true,
-        currentStage: 3,
-        progressPercent: 100,
-        stageMessage:
-          'Hoàn tất tách 4 rãnh trên bản mẫu (Mở file Nhạc/Video để tách từ file thực tế)!',
-        executionBackend: '4 Kênh Sẵn Sàng',
-      });
-      setStems((prev) =>
-        prev.map((s) => ({
-          ...s,
-          modelSource: getModelLabel(s.id),
-          peaks: generateStemPeaks(s.id, 140, Math.random() * 0.4 + 0.8),
-        }))
-      );
-    }, 1900);
+    await runSpectralSeparation();
   };
 
   const handleApplyPreset = (preset: SeparationPresetId) => {
@@ -891,6 +1045,43 @@ export const App: React.FC = () => {
     }
   };
 
+  const handleImportDesktopOnnx = async (modelId: string) => {
+    const pickedPath = await pickOnnxFileViaRust().catch(() => null);
+    if (!pickedPath) return;
+
+    try {
+      const saved = await importLocalOnnxViaRust(pickedPath, modelId);
+      if (!saved) return;
+      setModels((prev) =>
+        prev.map((m) =>
+          m.id === modelId
+            ? {
+                ...m,
+                installed: true,
+                downloading: false,
+                downloadProgress: 100,
+                cachedSizeBytes: saved.size_bytes,
+                sha256Hex: saved.sha256_hex,
+                cachedSource: 'local_import',
+                downloadError: undefined,
+              }
+            : m
+        )
+      );
+    } catch (err) {
+      setModels((prev) =>
+        prev.map((m) =>
+          m.id === modelId
+            ? {
+                ...m,
+                downloadError: err instanceof Error ? err.message : String(err),
+              }
+            : m
+        )
+      );
+    }
+  };
+
   const handleDeleteCachedModel = async (modelId: string) => {
     const spec = models.find((m) => m.id === modelId);
     await deleteCachedModelFromDb(modelId);
@@ -914,9 +1105,49 @@ export const App: React.FC = () => {
   };
 
   const installedCount = models.filter((m) => m.installed).length;
+  const hasLoadedTrack = Boolean(song);
+
+  const handleOpenFileClick = () => {
+    if (isTauriDesktopRuntime()) {
+      void handleDesktopOpenTrack();
+    } else {
+      dropzoneFileInputRef.current?.click();
+    }
+  };
+
+  const handleDropFile = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDraggingFile(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) {
+      void handleSelectAudioFile(file);
+    }
+  };
 
   return (
-    <div className="min-h-screen bg-[#080B14] text-slate-100 flex flex-col">
+    <div
+      onDragOver={(e) => {
+        e.preventDefault();
+        if (!isDraggingFile) setIsDraggingFile(true);
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget === e.target) setIsDraggingFile(false);
+      }}
+      onDrop={handleDropFile}
+      className="min-h-screen bg-[#080B14] text-slate-100 flex flex-col"
+    >
+      <input
+        ref={dropzoneFileInputRef}
+        type="file"
+        accept="audio/*,video/*,.mp3,.wav,.flac,.ogg,.m4a,.aac,.opus,.mp4,.mkv,.webm,.mov,.avi,.m4v"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) void handleSelectAudioFile(file);
+          e.target.value = '';
+        }}
+        className="hidden"
+      />
+
       {/* 1. Studio Top Header */}
       <StudioHeader
         song={song}
@@ -925,16 +1156,66 @@ export const App: React.FC = () => {
         installedModelCount={installedCount}
         totalModelCount={models.length}
         onSelectAudioFile={handleSelectAudioFile}
+        onRequestOpenTrack={isTauriDesktopRuntime() ? () => void handleDesktopOpenTrack() : undefined}
         onOpenYouTubeModal={() => setIsYouTubeModalOpen(true)}
         onOpenModelManager={() => setIsModelModalOpen(true)}
         onOpenExportModal={() => setIsExportModalOpen(true)}
       />
 
+      {/* Real Track Loader Dropzone when empty or error occurred */}
+      {(!hasLoadedTrack || trackLoadError || isLoadingTrack || isDraggingFile) && (
+        <div
+          className={`mx-4 mt-3 rounded-2xl border-2 border-dashed p-5 transition-colors ${
+            isDraggingFile
+              ? 'border-indigo-400 bg-indigo-500/15'
+              : 'border-white/15 bg-[#0F1424]/80'
+          }`}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="flex items-center gap-3.5">
+              <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-indigo-500/20 text-indigo-300">
+                <Upload className="h-5 w-5" />
+              </div>
+              <div>
+                <h2 className="text-sm font-bold text-white">
+                  {isLoadingTrack
+                    ? 'Đang giải mã âm thanh từ file...'
+                    : isDraggingFile
+                      ? 'Thả file nhạc hoặc video vào đây để mở'
+                      : 'Chưa mở file âm thanh — Chọn file thực tế từ máy để test'}
+                </h2>
+                <p className="mt-0.5 text-xs text-slate-400">
+                  Hỗ trợ trực tiếp file nhạc (MP3, WAV, FLAC, M4A, OGG) và Video (MP4, MKV, WEBM, MOV).
+                </p>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              disabled={isLoadingTrack}
+              onClick={handleOpenFileClick}
+              className="cursor-pointer inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-xs font-bold text-white shadow-lg shadow-indigo-600/25 transition-colors hover:bg-indigo-500 disabled:opacity-60"
+            >
+              <FolderOpen className="h-4 w-4" />
+              <span>{isLoadingTrack ? 'Đang Mở...' : 'Chọn File Nhạc / Video'}</span>
+            </button>
+          </div>
+
+          {trackLoadError && (
+            <div className="mt-3 flex items-start gap-2 rounded-xl border border-rose-500/40 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-200">
+              <AlertCircle className="h-4 w-4 text-rose-400 shrink-0 mt-0.5" />
+              <span>{trackLoadError}</span>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* 2. Master Transport Bar */}
       <TransportBar
+        disabled={!hasLoadedTrack}
         isPlaying={isPlaying}
         currentTimeSec={currentTimeSec}
-        durationSec={song.durationSec}
+        durationSec={song?.durationSec ?? 0}
         loopEnabled={loopEnabled}
         loopStartSec={loopStartSec}
         loopEndSec={loopEndSec}
@@ -953,22 +1234,25 @@ export const App: React.FC = () => {
       <main className="flex-1">
         <PitchSpeedDeck
           settings={pitchSpeed}
-          originalKey={song.originalKey}
-          originalBpm={song.originalBpm}
+          originalKey={song?.originalKey ?? '--'}
+          originalBpm={song?.originalBpm ?? 0}
           onUpdateSettings={handleUpdatePitchSpeed}
           onResetPitchSpeed={handleResetPitchSpeed}
         />
 
         {/* 4. Local AI Stem Separation & 4-Track Waveform Mixer */}
         <StemMixerTimeline
+          hasLoadedTrack={hasLoadedTrack}
           stems={stems}
           currentTimeSec={currentTimeSec}
-          durationSec={song.durationSec}
+          durationSec={song?.durationSec ?? 0}
           qualityMode={qualityMode}
           activePreset={activePreset}
           separationStatus={separationStatus}
           onChangeQualityMode={setQualityMode}
-          onRunSeparation={handleRunSeparation}
+          onRunSeparation={() => void handleRunSeparation()}
+          onRunSpectralFallback={() => void runSpectralSeparation()}
+          onOpenModelManager={() => setIsModelModalOpen(true)}
           onApplyPreset={handleApplyPreset}
           onToggleMute={handleToggleMute}
           onToggleSolo={handleToggleSolo}
@@ -981,7 +1265,6 @@ export const App: React.FC = () => {
       <YouTubeImportModal
         isOpen={isYouTubeModalOpen}
         onClose={() => setIsYouTubeModalOpen(false)}
-        onImportYouTubeTrack={handleImportYouTubeTrack}
       />
 
       <ModelManagerModal
@@ -991,22 +1274,48 @@ export const App: React.FC = () => {
         onDownloadModel={handleDownloadModel}
         onPauseDownload={handlePauseDownload}
         onImportLocalModel={handleImportLocalModel}
+        onImportDesktopOnnx={
+          isTauriDesktopRuntime()
+            ? (modelId) => void handleImportDesktopOnnx(modelId)
+            : undefined
+        }
         onDeleteCachedModel={handleDeleteCachedModel}
       />
 
-      <ExportModal
-        isOpen={isExportModalOpen}
-        song={song}
-        settings={pitchSpeed}
-        exportFolderLabel={exportFolderLabel}
-        isCustomExportFolder={isCustomExportFolder}
-        canOpenExportFolder={canOpenExportFolder}
-        onPickExportFolder={handlePickExportFolder}
-        onResetExportFolder={handleResetExportFolder}
-        onOpenExportFolder={handleOpenExportFolder}
-        onClose={() => setIsExportModalOpen(false)}
-        onTriggerExport={handleTriggerExport}
-      />
+      {song && (
+        <ExportModal
+          isOpen={isExportModalOpen}
+          song={song}
+          settings={pitchSpeed}
+          exportFolderLabel={exportFolderLabel}
+          isCustomExportFolder={isCustomExportFolder}
+          canOpenExportFolder={canOpenExportFolder}
+          onPickExportFolder={handlePickExportFolder}
+          onResetExportFolder={handleResetExportFolder}
+          onOpenExportFolder={handleOpenExportFolder}
+          onClose={() => setIsExportModalOpen(false)}
+          onTriggerExport={handleTriggerExport}
+        />
+      )}
+
+      {separationToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-5 right-5 z-50 flex items-center gap-3 rounded-xl border border-emerald-400/50 bg-[#0F1424]/95 px-4 py-3 text-xs font-semibold text-emerald-200 shadow-2xl shadow-emerald-950/50 backdrop-blur-xl"
+        >
+          <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+          <span>{separationToast}</span>
+          <button
+            type="button"
+            onClick={() => setSeparationToast(null)}
+            aria-label="Đóng thông báo"
+            className="cursor-pointer rounded p-0.5 text-slate-400 hover:bg-white/10 hover:text-white"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
     </div>
   );
 };

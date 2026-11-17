@@ -12,12 +12,13 @@ import { SongMetadata } from '../types/studio';
 import { computeTransposedKey } from '../data/modelsCatalog';
 
 interface StudioHeaderProps {
-  song: SongMetadata;
+  song: SongMetadata | null;
   semitones: number;
   speed: number;
   installedModelCount: number;
   totalModelCount: number;
   onSelectAudioFile: (file: File) => void;
+  onRequestOpenTrack?: () => void;
   onOpenYouTubeModal: () => void;
   onOpenModelManager: () => void;
   onOpenExportModal: () => void;
@@ -30,6 +31,7 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
   installedModelCount,
   totalModelCount,
   onSelectAudioFile,
+  onRequestOpenTrack,
   onOpenYouTubeModal,
   onOpenModelManager,
   onOpenExportModal,
@@ -45,46 +47,32 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
     return () => window.removeEventListener('scroll', onScroll);
   }, []);
 
-  const targetKey = computeTransposedKey(song.originalKey, semitones);
-  const effectiveBpm = (song.originalBpm * speed).toFixed(1);
+  const targetKey = song ? computeTransposedKey(song.originalKey, semitones) : '--';
+  const effectiveBpm = song ? (song.originalBpm * speed).toFixed(1) : '--';
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
       onSelectAudioFile(file);
     }
+    e.target.value = '';
   };
 
   const renderSourceBadge = () => {
-    switch (song.sourceType) {
-      case 'youtube_single':
-        return (
-          <span className="rounded bg-rose-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-rose-300">
-            {song.youtubeInfo?.wasInPlaylist
-              ? `YT SINGLE (#${song.youtubeInfo.playlistIndex ?? 1} IN LIST)`
-              : 'YOUTUBE SINGLE'}
-          </span>
-        );
-      case 'video_file':
-        return (
-          <span className="inline-flex items-center gap-1 rounded bg-amber-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-amber-300">
-            <Film className="h-3 w-3" />
-            VIDEO AUDIO
-          </span>
-        );
-      case 'audio_file':
-        return (
-          <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-emerald-300">
-            LOCAL AUDIO
-          </span>
-        );
-      default:
-        return (
-          <span className="rounded bg-indigo-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-indigo-300">
-            STUDIO DEMO
-          </span>
-        );
+    if (!song) return null;
+    if (song.sourceType === 'video_file') {
+      return (
+        <span className="inline-flex items-center gap-1 rounded bg-amber-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-amber-300">
+          <Film className="h-3 w-3" />
+          VIDEO AUDIO
+        </span>
+      );
     }
+    return (
+      <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-emerald-300">
+        AUDIO THỰC TẾ
+      </span>
+    );
   };
 
   return (
@@ -130,14 +118,16 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
           <Music2 className="h-3.5 w-3.5 text-indigo-400 shrink-0" />
           <div className="min-w-[130px]">
             <div className="flex items-center gap-1.5">
-              <span className="text-xs font-semibold text-slate-100 truncate max-w-[165px]">
-                {song.title}
+              <span className="text-xs font-semibold text-slate-100 truncate max-w-[190px]">
+                {song ? song.title : 'Chưa mở file âm thanh'}
               </span>
               {!isScrolled && renderSourceBadge()}
             </div>
             {!isScrolled && (
               <div className="font-mono text-[10px] text-slate-400 truncate max-w-[230px]">
-                {song.fileName} &bull; {(song.sampleRate / 1000).toFixed(1)}kHz Stereo
+                {song
+                  ? `${song.fileName} • ${(song.sampleRate / 1000).toFixed(1)}kHz Stereo`
+                  : 'Chọn file Nhạc hoặc Video từ máy để bắt đầu'}
               </div>
             )}
           </div>
@@ -151,16 +141,20 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
                 Key:
               </span>
             )}
-            <span className="text-slate-300">{song.originalKey}</span>
+            <span className="text-slate-300">{song ? song.originalKey : '--'}</span>
             <span className="text-slate-500">&rarr;</span>
             <span
               className={
-                semitones === 0
-                  ? 'text-emerald-400'
-                  : 'rounded bg-indigo-500/20 px-1.5 py-0.2 text-indigo-300'
+                !song
+                  ? 'text-slate-400'
+                  : semitones === 0
+                    ? 'text-emerald-400'
+                    : 'rounded bg-indigo-500/20 px-1.5 py-0.2 text-indigo-300'
               }
             >
-              {targetKey} ({semitones >= 0 ? `+${semitones}` : semitones} st)
+              {song
+                ? `${targetKey} (${semitones >= 0 ? `+${semitones}` : semitones} st)`
+                : '--'}
             </span>
           </div>
 
@@ -184,7 +178,13 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
 
           <button
             type="button"
-            onClick={() => fileInputRef.current?.click()}
+            onClick={() => {
+              if (onRequestOpenTrack) {
+                onRequestOpenTrack();
+              } else {
+                fileInputRef.current?.click();
+              }
+            }}
             title="Hỗ trợ cả file Nhạc (MP3, WAV, FLAC, M4A) và file Video (MP4, MKV, WEBM, MOV)"
             className={`cursor-pointer inline-flex items-center gap-1.5 rounded-xl border border-white/15 bg-slate-800/80 text-xs font-semibold text-slate-200 transition-colors duration-200 hover:border-indigo-400/50 hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
               isScrolled ? 'px-2.5 py-1.5' : 'px-3 py-2'
@@ -197,13 +197,13 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
           <button
             type="button"
             onClick={onOpenYouTubeModal}
-            title="Dán link YouTube hoặc Playlist YouTube (Tự động chỉ lấy bài đang phát)"
+            title="Lọc link YouTube đơn từ Playlist"
             className={`cursor-pointer inline-flex items-center gap-1.5 rounded-xl border border-rose-500/35 bg-rose-500/15 text-xs font-semibold text-rose-200 transition-colors duration-200 hover:bg-rose-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 ${
               isScrolled ? 'px-2.5 py-1.5' : 'px-3 py-2'
             }`}
           >
             <Play className="h-3 w-3 fill-current text-rose-400" />
-            <span>{isScrolled ? 'YouTube' : 'Nạp Link YouTube'}</span>
+            <span>{isScrolled ? 'YouTube' : 'Lọc Link YouTube'}</span>
           </button>
 
           <button
@@ -222,8 +222,9 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
 
           <button
             type="button"
+            disabled={!song}
             onClick={onOpenExportModal}
-            className={`cursor-pointer inline-flex items-center gap-1.5 rounded-xl bg-emerald-500 text-xs font-bold text-slate-950 shadow-lg shadow-emerald-500/20 transition-colors duration-200 hover:bg-emerald-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 ${
+            className={`cursor-pointer inline-flex items-center gap-1.5 rounded-xl bg-emerald-500 text-xs font-bold text-slate-950 shadow-lg shadow-emerald-500/20 transition-colors duration-200 hover:bg-emerald-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 disabled:cursor-not-allowed disabled:opacity-45 ${
               isScrolled ? 'px-3 py-1.5' : 'px-3.5 py-2'
             }`}
           >

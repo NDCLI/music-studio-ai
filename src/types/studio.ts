@@ -108,4 +108,5 @@ export interface SeparationStageStatus {
   progressPercent: number;
   stageMessage: string;
   executionBackend?: string;
+  onnxPrereqMissing?: string;
 }

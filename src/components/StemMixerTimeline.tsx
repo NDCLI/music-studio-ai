@@ -1,5 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import {
+  AlertCircle,
   CheckCircle2,
   Cpu,
   Headphones,
@@ -55,6 +56,16 @@ const WaveformCanvas: React.FC<WaveformCanvasProps> = ({
     ctx.clearRect(0, 0, width, height);
 
     const barCount = peaks.length;
+    if (barCount === 0) {
+      ctx.strokeStyle = 'rgba(148, 163, 184, 0.25)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, height / 2);
+      ctx.lineTo(width, height / 2);
+      ctx.stroke();
+      return;
+    }
+
     const gap = 2;
     const barWidth = Math.max(1.5, (width - (barCount - 1) * gap) / barCount);
     const centerY = height / 2;
@@ -107,6 +118,7 @@ const WaveformCanvas: React.FC<WaveformCanvasProps> = ({
 };
 
 interface StemMixerTimelineProps {
+  hasLoadedTrack: boolean;
   stems: StemTrackState[];
   currentTimeSec: number;
   durationSec: number;
@@ -115,6 +127,8 @@ interface StemMixerTimelineProps {
   separationStatus: SeparationStageStatus;
   onChangeQualityMode: (mode: SeparationQualityMode) => void;
   onRunSeparation: () => void;
+  onRunSpectralFallback?: () => void;
+  onOpenModelManager?: () => void;
   onApplyPreset: (preset: SeparationPresetId) => void;
   onToggleMute: (id: StemId) => void;
   onToggleSolo: (id: StemId) => void;
@@ -147,6 +161,7 @@ const PRESET_BUTTONS: { id: SeparationPresetId; label: string; desc: string }[] 
 ];
 
 export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
+  hasLoadedTrack,
   stems,
   currentTimeSec,
   durationSec,
@@ -155,6 +170,8 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
   separationStatus,
   onChangeQualityMode,
   onRunSeparation,
+  onRunSpectralFallback,
+  onOpenModelManager,
   onApplyPreset,
   onToggleMute,
   onToggleSolo,
@@ -189,19 +206,24 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
             <Layers className="h-5 w-5" />
           </div>
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <h2 className="text-sm font-bold text-white">
                 TÁCH NHẠC NỀN, VOCAL CHÍNH &amp; GIỌNG BÈ
               </h2>
               {separationStatus.isSeparated && (
-                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2.5 py-0.5 font-mono text-[11px] font-semibold text-emerald-400">
+                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/20 px-2.5 py-0.5 font-mono text-[11px] font-semibold text-emerald-300">
                   <CheckCircle2 className="h-3.5 w-3.5" />
-                  {separationStatus.executionBackend ?? 'Đã Tách 4 Rãnh'}
+                  Đã tách xong &bull; {separationStatus.executionBackend ?? '4 Kênh'}
+                </span>
+              )}
+              {hasLoadedTrack && !separationStatus.isSeparated && !separationStatus.isRunning && (
+                <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/35 bg-amber-500/15 px-2.5 py-0.5 font-mono text-[11px] font-semibold text-amber-300">
+                  Chưa tách nhạc
                 </span>
               )}
             </div>
             <p className="text-xs text-slate-400">
-              {separationStatus.isSeparated && !separationStatus.isRunning
+              {separationStatus.isSeparated || separationStatus.isRunning || hasLoadedTrack
                 ? separationStatus.stageMessage
                 : 'Tách riêng giọng hát chính, giọng bè, nhạc nền và tiếng vang'}
             </p>
@@ -237,9 +259,9 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
 
           <button
             type="button"
-            disabled={separationStatus.isRunning}
+            disabled={!hasLoadedTrack || separationStatus.isRunning}
             onClick={onRunSeparation}
-            className="cursor-pointer inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-indigo-600 to-pink-600 px-4 py-2.5 text-xs font-bold text-white shadow-lg shadow-indigo-500/25 transition-opacity duration-200 hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-60"
+            className="cursor-pointer inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-indigo-600 to-pink-600 px-4 py-2.5 text-xs font-bold text-white shadow-lg shadow-indigo-500/25 transition-opacity duration-200 hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-45"
           >
             {separationStatus.isRunning ? (
               <>
@@ -255,6 +277,41 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Missing ONNX Dependencies Guidance (Desktop Mode) */}
+      {separationStatus.onnxPrereqMissing && (
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/35 bg-amber-500/10 p-3.5 text-xs text-amber-200">
+          <div className="flex items-start gap-2.5 flex-1 min-w-[240px]">
+            <AlertCircle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <div className="font-bold text-amber-300">Chưa đủ tệp để chạy AI ONNX trên máy</div>
+              <p className="mt-0.5 text-[11px] text-amber-200/90">
+                {separationStatus.onnxPrereqMissing}
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {onOpenModelManager && (
+              <button
+                type="button"
+                onClick={onOpenModelManager}
+                className="cursor-pointer rounded-lg border border-indigo-400/40 bg-indigo-500/20 px-3 py-1.5 text-xs font-semibold text-indigo-200 hover:bg-indigo-500/30"
+              >
+                Mở Quản Lý Model AI
+              </button>
+            )}
+            {onRunSpectralFallback && (
+              <button
+                type="button"
+                onClick={onRunSpectralFallback}
+                className="cursor-pointer rounded-lg border border-amber-400/50 bg-amber-500/20 px-3 py-1.5 text-xs font-semibold text-amber-100 hover:bg-amber-500/30"
+              >
+                Tách Tạm Bằng Lọc Phổ (Không cần .ONNX)
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Live 3-Stage AI Separation Progress Bar (when running) */}
       {separationStatus.isRunning && (
@@ -277,6 +334,29 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
         </div>
       )}
 
+      {/* Prominent Success Status Banner after separation completes */}
+      {separationStatus.isSeparated && !separationStatus.isRunning && (
+        <div
+          role="status"
+          className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-4 py-3 text-xs text-emerald-100"
+        >
+          <div className="flex items-center gap-2.5">
+            <CheckCircle2 className="h-5 w-5 text-emerald-400 shrink-0" />
+            <div>
+              <div className="font-bold text-emerald-300">
+                Tách nhạc thành công!
+              </div>
+              <p className="mt-0.5 text-[11px] text-emerald-200/90">
+                {separationStatus.stageMessage}
+              </p>
+            </div>
+          </div>
+          <span className="rounded-lg border border-emerald-400/30 bg-emerald-500/20 px-2.5 py-1 font-mono text-[11px] font-semibold text-emerald-200">
+            4 Kênh Đã Tách
+          </span>
+        </div>
+      )}
+
       {/* 1-Click Karaoke / Harmony Presets */}
       <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-1.5">
@@ -286,14 +366,16 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
           </span>
           {PRESET_BUTTONS.map((p) => {
             const active = activePreset === p.id;
+            const controlsLocked = !hasLoadedTrack || !separationStatus.isSeparated;
             return (
               <button
                 key={p.id}
                 type="button"
-                title={p.desc}
+                disabled={controlsLocked}
+                title={controlsLocked ? 'Hãy tách nhạc trước để chọn chế độ nghe từng kênh' : p.desc}
                 onClick={() => onApplyPreset(p.id)}
-                className={`cursor-pointer rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors duration-150 ${
-                  active
+                className={`cursor-pointer rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-45 ${
+                  active && !controlsLocked
                     ? 'border-indigo-400/60 bg-indigo-500/20 text-white'
                     : 'border-white/10 bg-[#080B14]/80 text-slate-300 hover:border-white/25 hover:text-white'
                 }`}
@@ -345,9 +427,10 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
               <div className="lg:col-span-3 flex items-center gap-2.5">
                 <button
                   type="button"
+                  disabled={!hasLoadedTrack || !separationStatus.isSeparated}
                   onClick={() => onToggleMute(stem.id)}
                   title="Tắt tiếng kênh này (Mute)"
-                  className={`cursor-pointer flex h-8 w-9 items-center justify-center rounded-lg border font-mono text-xs font-bold transition-colors duration-150 ${
+                  className={`cursor-pointer flex h-8 w-9 items-center justify-center rounded-lg border font-mono text-xs font-bold transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-45 ${
                     stem.muted
                       ? 'border-rose-500 bg-rose-500 text-white'
                       : 'border-white/15 bg-slate-800/80 text-slate-300 hover:border-white/30'
@@ -358,9 +441,10 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
 
                 <button
                   type="button"
+                  disabled={!hasLoadedTrack || !separationStatus.isSeparated}
                   onClick={() => onToggleSolo(stem.id)}
                   title="Chỉ nghe kênh này (Solo)"
-                  className={`cursor-pointer flex h-8 w-9 items-center justify-center rounded-lg border font-mono text-xs font-bold transition-colors duration-150 ${
+                  className={`cursor-pointer flex h-8 w-9 items-center justify-center rounded-lg border font-mono text-xs font-bold transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-45 ${
                     stem.solo
                       ? 'border-amber-400 bg-amber-400 text-slate-950'
                       : 'border-white/15 bg-slate-800/80 text-slate-300 hover:border-white/30'
@@ -377,6 +461,7 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
                   )}
                   <input
                     type="range"
+                    disabled={!hasLoadedTrack || !separationStatus.isSeparated}
                     min={0}
                     max={150}
                     value={stem.volume}
@@ -384,7 +469,7 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
                       onChangeStemVolume(stem.id, parseInt(e.target.value, 10))
                     }
                     aria-label={`Âm lượng ${stem.name}`}
-                    className="studio-slider w-full"
+                    className="studio-slider w-full disabled:opacity-45"
                   />
                   <span className="w-10 text-right font-mono text-xs text-slate-200">
                     {stem.volume}%
@@ -392,15 +477,26 @@ export const StemMixerTimeline: React.FC<StemMixerTimelineProps> = ({
                 </div>
               </div>
 
-              {/* Right 6 cols: Interactive High-DPI Canvas Waveform */}
-              <div className="lg:col-span-6">
+              {/* Right 6 cols: Interactive High-DPI Canvas Waveform (hidden until separated) */}
+              <div className="relative lg:col-span-6">
                 <WaveformCanvas
-                  peaks={stem.peaks}
+                  peaks={separationStatus.isSeparated ? stem.peaks : []}
                   colorHex={stem.colorHex}
                   progressRatio={progressRatio}
                   isMuted={isSilenced}
                   onSeekRatio={(ratio) => onSeek(ratio * durationSec)}
                 />
+                {!separationStatus.isSeparated && (
+                  <div className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-lg px-3 text-center">
+                    <span className="rounded-md bg-[#080B14]/85 px-2.5 py-1 text-[11px] font-medium text-slate-400">
+                      {!hasLoadedTrack
+                        ? 'Chưa nạp file âm thanh'
+                        : separationStatus.isRunning
+                          ? `Đang tách sóng âm... (${separationStatus.progressPercent}%)`
+                          : 'Chưa tách — Sóng âm sẽ hiển thị sau khi tách nhạc xong'}
+                    </span>
+                  </div>
+                )}
               </div>
             </div>
           );

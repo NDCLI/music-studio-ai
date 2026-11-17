@@ -31,7 +31,7 @@ export const PitchSpeedDeck: React.FC<PitchSpeedDeckProps> = ({
   onResetPitchSpeed,
 }) => {
   const targetKey = computeTransposedKey(originalKey, settings.semitones);
-  const currentBpm = (originalBpm * settings.speed).toFixed(1);
+  const currentBpm = originalBpm > 0 ? (originalBpm * settings.speed).toFixed(1) : '--';
   const activeEngine =
     PITCH_ENGINES.find((e) => e.id === settings.pitchEngine) ?? PITCH_ENGINES[0];
 
@@ -336,7 +336,7 @@ export const PitchSpeedDeck: React.FC<PitchSpeedDeckProps> = ({
               <div className="mt-1 font-mono text-2xl font-bold text-white">
                 {currentBpm}
                 <span className="ml-1.5 text-xs font-normal text-slate-400">
-                  BPM (Gốc: {originalBpm})
+                  BPM (Gốc: {originalBpm > 0 ? originalBpm : '--'})
                 </span>
               </div>
             </div>

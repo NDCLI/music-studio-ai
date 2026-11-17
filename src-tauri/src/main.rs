@@ -93,7 +93,12 @@ fn main() {
     tauri::Builder::default()
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
+            tauri_commands::ipc_pick_audio_file,
+            tauri_commands::ipc_pick_onnx_file,
             tauri_commands::ipc_load_track,
+            tauri_commands::ipc_load_audio_bytes_b64,
+            tauri_commands::ipc_read_file_base64,
+            tauri_commands::ipc_prepare_preview_wav_b64,
             tauri_commands::ipc_parse_youtube_url,
             tauri_commands::ipc_update_pitch_speed,
             tauri_commands::ipc_list_models,
@@ -106,6 +111,7 @@ fn main() {
             tauri_commands::ipc_save_exported_file,
             tauri_commands::ipc_open_local_folder,
             tauri_commands::ipc_run_separation,
+            tauri_commands::ipc_export_separated_stems_b64,
             tauri_commands::ipc_export_audio,
         ])
         .run(tauri::generate_context!())

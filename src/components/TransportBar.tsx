@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 
 interface TransportBarProps {
+  disabled: boolean;
   isPlaying: boolean;
   currentTimeSec: number;
   durationSec: number;
@@ -39,6 +40,7 @@ export function formatTimecode(sec: number): string {
 }
 
 export const TransportBar: React.FC<TransportBarProps> = ({
+  disabled,
   isPlaying,
   currentTimeSec,
   durationSec,
@@ -73,17 +75,19 @@ export const TransportBar: React.FC<TransportBarProps> = ({
         <div className="flex items-center gap-2.5">
           <button
             type="button"
+            disabled={disabled}
             onClick={() => onSeek(0)}
             title="Về đầu bài (Rewind)"
-            className="cursor-pointer flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-slate-800/80 text-slate-300 transition-colors duration-200 hover:border-white/25 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+            className="cursor-pointer flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-slate-800/80 text-slate-300 transition-colors duration-200 hover:border-white/25 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 disabled:cursor-not-allowed disabled:opacity-45"
           >
             <RotateCcw className="h-4 w-4" />
           </button>
 
           <button
             type="button"
+            disabled={disabled}
             onClick={onTogglePlay}
-            className={`cursor-pointer inline-flex h-10 items-center gap-2 rounded-xl px-5 text-xs font-bold transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 ${
+            className={`cursor-pointer inline-flex h-10 items-center gap-2 rounded-xl px-5 text-xs font-bold transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 disabled:cursor-not-allowed disabled:opacity-45 ${
               isPlaying
                 ? 'bg-amber-500 text-slate-950 hover:bg-amber-400'
                 : 'bg-emerald-500 text-slate-950 shadow-lg shadow-emerald-500/20 hover:bg-emerald-400'
@@ -97,16 +101,17 @@ export const TransportBar: React.FC<TransportBarProps> = ({
             ) : (
               <>
                 <Play className="h-4 w-4 fill-current" />
-                <span>Phát Nhạc (Nghe Thử Tức Thì)</span>
+                <span>Phát Nhạc</span>
               </>
             )}
           </button>
 
           <button
             type="button"
+            disabled={disabled}
             onClick={onStop}
             title="Dừng hẳn (Stop)"
-            className="cursor-pointer flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-slate-800/80 text-slate-300 transition-colors duration-200 hover:border-rose-500/40 hover:text-rose-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500"
+            className="cursor-pointer flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-slate-800/80 text-slate-300 transition-colors duration-200 hover:border-rose-500/40 hover:text-rose-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 disabled:cursor-not-allowed disabled:opacity-45"
           >
             <Square className="h-4 w-4" />
           </button>
@@ -127,13 +132,14 @@ export const TransportBar: React.FC<TransportBarProps> = ({
           </div>
           <input
             type="range"
+            disabled={disabled}
             min={0}
-            max={durationSec}
+            max={Math.max(1, durationSec)}
             step={0.05}
             value={currentTimeSec}
             onChange={(e) => onSeek(parseFloat(e.target.value))}
             aria-label="Thanh tua thời gian bài hát"
-            className="studio-slider w-full"
+            className="studio-slider w-full disabled:opacity-45"
           />
         </div>
 
@@ -141,8 +147,9 @@ export const TransportBar: React.FC<TransportBarProps> = ({
         <div className="flex flex-wrap items-center gap-2.5">
           <button
             type="button"
+            disabled={disabled}
             onClick={onToggleLoop}
-            className={`cursor-pointer inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 font-mono text-xs font-semibold transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
+            className={`cursor-pointer inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 font-mono text-xs font-semibold transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 disabled:cursor-not-allowed disabled:opacity-45 ${
               loopEnabled
                 ? 'border-indigo-400/60 bg-indigo-500/20 text-indigo-200'
                 : 'border-white/10 bg-slate-800/60 text-slate-400 hover:text-slate-200'

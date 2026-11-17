@@ -273,7 +273,8 @@ function flacCrc16(data: Uint8Array, start: number, end: number): number {
 }
 
 /**
- * Encodes stereo Float32 audio into a valid 24-bit Lossless FLAC stream (`fLaC`).
+ * Encodes stereo Float32 audio into a valid 24-bit Lossless FLAC stream (`fLaC`)
+ * using pre-allocated chunk buffers so full-length multi-minute songs encode fast with low RAM.
  */
 export function encodeStereoFlac24Blob(
   left: Float32Array,
@@ -283,68 +284,81 @@ export function encodeStereoFlac24Blob(
   const totalFrames = Math.min(left.length, right.length);
   const maxBlockSize = 4096;
   const minBlockSize = Math.max(16, Math.min(maxBlockSize, totalFrames));
-  const out: number[] = [];
+  const chunks: BlobPart[] = [];
 
-  // "fLaC" magic + STREAMINFO header
-  out.push(0x66, 0x4c, 0x61, 0x43, 0x80, 0x00, 0x00, 0x22);
-  out.push((minBlockSize >> 8) & 0xff, minBlockSize & 0xff);
-  out.push((maxBlockSize >> 8) & 0xff, maxBlockSize & 0xff);
-  out.push(0, 0, 0, 0, 0, 0);
+  const header = new Uint8Array(42);
+  // "fLaC" magic + STREAMINFO header (34 bytes)
+  header.set([0x66, 0x4c, 0x61, 0x43, 0x80, 0x00, 0x00, 0x22], 0);
+  header[8] = (minBlockSize >> 8) & 0xff;
+  header[9] = minBlockSize & 0xff;
+  header[10] = (maxBlockSize >> 8) & 0xff;
+  header[11] = maxBlockSize & 0xff;
 
   const sr = Math.max(1, Math.min(655350, sampleRate));
-  // 20-bit sampleRate | 3-bit (2-1=1) | 5-bit (24-1=23) | 36-bit totalFrames
   const hi32 = ((sr << 12) | (1 << 9) | (23 << 4) | Math.floor(totalFrames / 0x100000000)) >>> 0;
   const lo32 = totalFrames >>> 0;
-  out.push(
-    (hi32 >>> 24) & 0xff,
-    (hi32 >>> 16) & 0xff,
-    (hi32 >>> 8) & 0xff,
-    hi32 & 0xff,
-    (lo32 >>> 24) & 0xff,
-    (lo32 >>> 16) & 0xff,
-    (lo32 >>> 8) & 0xff,
-    lo32 & 0xff
-  );
-  for (let i = 0; i < 16; i++) out.push(0);
+  header[18] = (hi32 >>> 24) & 0xff;
+  header[19] = (hi32 >>> 16) & 0xff;
+  header[20] = (hi32 >>> 8) & 0xff;
+  header[21] = hi32 & 0xff;
+  header[22] = (lo32 >>> 24) & 0xff;
+  header[23] = (lo32 >>> 16) & 0xff;
+  header[24] = (lo32 >>> 8) & 0xff;
+  header[25] = lo32 & 0xff;
+  chunks.push(header);
 
   const maxI24 = 8388607;
   let start = 0;
 
   while (start < totalFrames) {
     const blockLen = Math.min(maxBlockSize, totalFrames - start);
-    const frameStart = out.length;
+    const utf8SampleBytes: number[] = [];
+    encodeUtf8SampleIndex(start, utf8SampleBytes);
 
-    out.push(0xff, 0xf9, 0x70, 0x1c);
-    encodeUtf8SampleIndex(start, out);
+    const headerLen = 4 + utf8SampleBytes.length + 2;
+    const frameBytes = new Uint8Array(headerLen + 1 + 1 + blockLen * 3 + 1 + blockLen * 3 + 2);
+    let pos = 0;
+
+    frameBytes[pos++] = 0xff;
+    frameBytes[pos++] = 0xf9;
+    frameBytes[pos++] = 0x70;
+    frameBytes[pos++] = 0x1c;
+    for (let b = 0; b < utf8SampleBytes.length; b++) {
+      frameBytes[pos++] = utf8SampleBytes[b];
+    }
     const blMinus1 = blockLen - 1;
-    out.push((blMinus1 >> 8) & 0xff, blMinus1 & 0xff);
-
-    const headerEnd = out.length;
-    const tempHeader = new Uint8Array(out.slice(frameStart, headerEnd));
-    out.push(flacCrc8(tempHeader, 0, tempHeader.length));
+    frameBytes[pos++] = (blMinus1 >> 8) & 0xff;
+    frameBytes[pos++] = blMinus1 & 0xff;
+    frameBytes[pos] = flacCrc8(frameBytes, 0, pos);
+    pos++;
 
     // Left verbatim subframe
-    out.push(0x02);
+    frameBytes[pos++] = 0x02;
     for (let i = start; i < start + blockLen; i++) {
       const s = Math.round(softLimitSample(left[i]) * maxI24);
-      out.push((s >> 16) & 0xff, (s >> 8) & 0xff, s & 0xff);
+      frameBytes[pos++] = (s >> 16) & 0xff;
+      frameBytes[pos++] = (s >> 8) & 0xff;
+      frameBytes[pos++] = s & 0xff;
     }
 
     // Right verbatim subframe
-    out.push(0x02);
+    frameBytes[pos++] = 0x02;
     for (let i = start; i < start + blockLen; i++) {
       const s = Math.round(softLimitSample(right[i]) * maxI24);
-      out.push((s >> 16) & 0xff, (s >> 8) & 0xff, s & 0xff);
+      frameBytes[pos++] = (s >> 16) & 0xff;
+      frameBytes[pos++] = (s >> 8) & 0xff;
+      frameBytes[pos++] = s & 0xff;
     }
 
-    const frameSlice = new Uint8Array(out.slice(frameStart));
-    const crc16 = flacCrc16(frameSlice, 0, frameSlice.length);
-    out.push((crc16 >> 8) & 0xff, crc16 & 0xff);
+    const crc16 = flacCrc16(frameBytes, 0, pos);
+    frameBytes[pos++] = (crc16 >> 8) & 0xff;
+    frameBytes[pos++] = crc16 & 0xff;
 
+    chunks.push(frameBytes);
     start += blockLen;
   }
 
-  return new Blob([new Uint8Array(out)], { type: 'audio/flac' });
+  return new Blob(chunks, { type: 'audio/flac' });
 }
 
 export function encodeStereoWavBlob(

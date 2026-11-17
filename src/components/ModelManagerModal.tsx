@@ -23,6 +23,7 @@ interface ModelManagerModalProps {
   onDownloadModel: (modelId: string) => void;
   onPauseDownload: (modelId: string) => void;
   onImportLocalModel: (modelId: string, file: File) => void;
+  onImportDesktopOnnx?: (modelId: string) => void;
   onDeleteCachedModel: (modelId: string) => void;
 }
 
@@ -38,6 +39,7 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
   onDownloadModel,
   onPauseDownload,
   onImportLocalModel,
+  onImportDesktopOnnx,
   onDeleteCachedModel,
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -52,6 +54,10 @@ export const ModelManagerModal: React.FC<ModelManagerModalProps> = ({
   );
 
   const handleOpenImportPicker = (modelId: string) => {
+    if (onImportDesktopOnnx) {
+      onImportDesktopOnnx(modelId);
+      return;
+    }
     setImportTargetId(modelId);
     fileInputRef.current?.click();
   };

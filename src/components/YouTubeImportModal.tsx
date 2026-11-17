@@ -1,9 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
   ExternalLink,
   Filter,
+  Info,
   Link2,
   ListMusic,
   Loader2,
@@ -21,45 +22,28 @@ import { openExternalUrl } from '../services/tauriBridge';
 interface YouTubeImportModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onImportYouTubeTrack: (info: YouTubeTrackResolvedInfo) => void;
 }
-
-const SAMPLE_YOUTUBE_LINKS = [
-  {
-    label: 'Ví dụ 1: Link nằm trong Playlist (Tự lọc bài đang phát #3)',
-    url: 'https://www.youtube.com/watch?v=kJQP7kiw5Fk&list=PLMC9KNkIncKtPzgY-5rmhvj7fax8fdxoj&index=3',
-  },
-  {
-    label: 'Ví dụ 2: Link Radio Mix YouTube (Tự bỏ list=RD...)',
-    url: 'https://www.youtube.com/watch?v=fJ9rUzIMcZQ&list=RDfJ9rUzIMcZQ&start_radio=1&index=1',
-  },
-  {
-    label: 'Ví dụ 3: Link rút gọn youtu.be kèm Playlist',
-    url: 'https://youtu.be/09R8_2nJtjg?list=PLMC9KNkIncKtPzgY-5rmhvj7fax8fdxoj',
-  },
-];
 
 export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
   isOpen,
   onClose,
-  onImportYouTubeTrack,
 }) => {
-  const [rawUrl, setRawUrl] = useState(SAMPLE_YOUTUBE_LINKS[0].url);
+  const [rawUrl, setRawUrl] = useState('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [resolvedInfo, setResolvedInfo] =
     useState<YouTubeTrackResolvedInfo | null>(null);
 
-  useEffect(() => {
-    if (!isOpen) return;
-    handlePreviewUrl(rawUrl);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen]);
-
   if (!isOpen) return null;
 
   const handlePreviewUrl = async (inputUrl: string) => {
     setRawUrl(inputUrl);
+    if (!inputUrl.trim()) {
+      setErrorMsg(null);
+      setResolvedInfo(null);
+      return;
+    }
+
     const parsedResult = parseYouTubeSingleVideoUrl(inputUrl);
     if (!parsedResult.ok) {
       setErrorMsg(parsedResult.error);
@@ -75,12 +59,6 @@ export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
     } finally {
       setIsLoading(false);
     }
-  };
-
-  const handleConfirmImport = () => {
-    if (!resolvedInfo) return;
-    onImportYouTubeTrack(resolvedInfo);
-    onClose();
   };
 
   return (
@@ -99,10 +77,10 @@ export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
             </div>
             <div>
               <h2 id="youtube-modal-title" className="text-base font-bold text-white">
-                NẠP NHẠC TỪ YOUTUBE
+                KIỂM TRA &amp; TÁCH LINK YOUTUBE
               </h2>
               <p className="text-xs text-slate-400">
-                Hỗ trợ link có kèm Playlist &mdash; tự động chỉ lấy đúng bài hát đang phát
+                Tự động loại bỏ tham số Playlist, giữ đúng video đơn đang phát
               </p>
             </div>
           </div>
@@ -125,7 +103,7 @@ export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
               htmlFor="youtube-url-input"
               className="block text-xs font-bold uppercase tracking-wider text-slate-300 mb-2"
             >
-              Dán đường dẫn YouTube / YouTube Music / Link Playlist đang phát
+              Dán đường dẫn YouTube / YouTube Music / Link Playlist của bạn
             </label>
             <div className="flex gap-2">
               <div className="relative flex-1">
@@ -134,14 +112,26 @@ export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
                   id="youtube-url-input"
                   type="text"
                   value={rawUrl}
-                  onChange={(e) => handlePreviewUrl(e.target.value)}
-                  placeholder="https://www.youtube.com/watch?v=...&list=...&index=..."
-                  className="w-full rounded-xl border border-white/15 bg-[#080B14] pl-10 pr-4 py-2.5 font-mono text-xs text-white placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
+                  onFocus={(e) => e.currentTarget.select()}
+                  onChange={(e) => void handlePreviewUrl(e.target.value)}
+                  placeholder="https://youtu.be/... hoặc https://www.youtube.com/watch?v=..."
+                  className="w-full rounded-xl border border-white/15 bg-[#080B14] pl-10 pr-9 py-2.5 font-mono text-xs text-white placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
                 />
+                {rawUrl && (
+                  <button
+                    type="button"
+                    onClick={() => void handlePreviewUrl('')}
+                    aria-label="Xóa link"
+                    title="Xóa link đang nhập"
+                    className="cursor-pointer absolute right-2.5 top-1/2 -translate-y-1/2 rounded-md p-1 text-slate-400 hover:bg-slate-800 hover:text-white"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
               </div>
               <button
                 type="button"
-                onClick={() => handlePreviewUrl(rawUrl)}
+                onClick={() => void handlePreviewUrl(rawUrl)}
                 className="cursor-pointer rounded-xl bg-indigo-600 px-4 py-2.5 text-xs font-bold text-white transition-colors hover:bg-indigo-500"
               >
                 Phân Tích Link
@@ -149,27 +139,11 @@ export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
             </div>
           </div>
 
-          {/* Quick Sample Playlist Links */}
-          <div className="space-y-1.5">
-            <span className="text-[11px] font-semibold text-slate-400">
-              Chọn thử link mẫu (có chứa tham số Playlist `list=` và `index=`):
+          <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs text-amber-200">
+            <Info className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+            <span>
+              YouTube yêu cầu xác thực bot khi tải luồng âm thanh trực tiếp (<code>LOGIN_REQUIRED</code>). Để tách nhạc, nâng/hạ tone và xuất file thật, hãy tải audio/video về máy rồi mở bằng nút <strong>Mở Nhạc / Video</strong>.
             </span>
-            <div className="flex flex-wrap gap-1.5">
-              {SAMPLE_YOUTUBE_LINKS.map((sample) => (
-                <button
-                  key={sample.url}
-                  type="button"
-                  onClick={() => handlePreviewUrl(sample.url)}
-                  className={`cursor-pointer rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
-                    rawUrl === sample.url
-                      ? 'border-indigo-500/60 bg-indigo-500/20 text-indigo-200'
-                      : 'border-white/10 bg-[#080B14] text-slate-400 hover:border-white/25 hover:text-slate-200'
-                  }`}
-                >
-                  {sample.label}
-                </button>
-              ))}
-            </div>
           </div>
 
           {/* Error Banner */}
@@ -184,37 +158,26 @@ export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
           {isLoading && (
             <div className="flex items-center justify-center gap-2 rounded-xl border border-white/10 bg-[#080B14] py-8 text-xs text-slate-300">
               <Loader2 className="h-4 w-4 animate-spin text-indigo-400" />
-              <span>Đang trích xuất thông tin bài hát đang phát từ YouTube...</span>
+              <span>Đang đọc thông tin video từ YouTube...</span>
             </div>
           )}
 
           {/* Resolved Single Track Preview */}
           {!isLoading && resolvedInfo && (
             <div className="space-y-3">
-              {/* Playlist Filter Alert Banner */}
               {resolvedInfo.parsed.wasInPlaylist ? (
-                <div className="flex items-start gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs">
-                  <Filter className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
-                  <div className="space-y-1">
-                    <div className="font-bold text-amber-300">
-                      Đã phát hiện Link kèm Playlist &mdash; Tự động lọc CHỈ LẤY BÀI ĐANG PHÁT
+                <div className="flex items-start gap-2.5 rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-3.5 text-xs text-emerald-200">
+                  <Filter className="h-4 w-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <div>
+                    <div className="font-bold text-emerald-300">
+                      Đã tách riêng đúng bài hát đơn (bỏ qua Playlist)
                     </div>
-                    <p className="text-slate-300">
-                      Đã bỏ qua danh sách phát{' '}
-                      <code className="rounded bg-black/40 px-1.5 py-0.5 font-mono text-amber-300">
+                    <p className="mt-0.5 text-[11px] text-emerald-200/85">
+                      Đã bỏ qua Playlist{' '}
+                      <code className="rounded bg-black/40 px-1 py-0.5 font-mono text-amber-300">
                         list={resolvedInfo.parsed.ignoredPlaylistId}
-                      </code>
-                      {resolvedInfo.parsed.playlistIndex !== undefined && (
-                        <>
-                          {' '}
-                          (Vị trí bài đang phát:{' '}
-                          <strong className="font-mono text-white">
-                            #{resolvedInfo.parsed.playlistIndex}
-                          </strong>
-                          )
-                        </>
-                      )}{' '}
-                      và chỉ trích xuất duy nhất mã video{' '}
+                      </code>{' '}
+                      và giữ lại mã video{' '}
                       <code className="rounded bg-emerald-500/20 px-1.5 py-0.5 font-mono text-emerald-300">
                         v={resolvedInfo.parsed.videoId}
                       </code>
@@ -226,7 +189,7 @@ export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
                 <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2.5 text-xs text-emerald-200">
                   <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
                   <span>
-                    Link bài hát đơn hợp lệ (Mã video:{' '}
+                    Link video hợp lệ (Mã video:{' '}
                     <strong className="font-mono">{resolvedInfo.parsed.videoId}</strong>)
                   </span>
                 </div>
@@ -243,7 +206,7 @@ export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
                   <div className="flex items-center gap-2">
                     <span className="inline-flex items-center gap-1 rounded bg-rose-500/20 px-2 py-0.5 font-mono text-[10px] font-bold text-rose-300">
                       <ListMusic className="h-3 w-3" />
-                      SINGLE TRACK
+                      SINGLE VIDEO
                     </span>
                     <span className="font-mono text-[11px] text-slate-400">
                       ID: {resolvedInfo.parsed.videoId}
@@ -256,21 +219,13 @@ export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
                     <Music2 className="h-3.5 w-3.5 text-indigo-400" />
                     <span>Kênh: {resolvedInfo.authorName}</span>
                   </p>
-                  <div className="flex flex-wrap items-center gap-3 pt-1 font-mono text-[11px]">
-                    <span className="text-emerald-400">
-                      Tone dự kiến: {resolvedInfo.detectedKey}
-                    </span>
-                    <span className="text-slate-600">&bull;</span>
-                    <span className="text-amber-400">
-                      Nhịp độ: {resolvedInfo.detectedBpm} BPM
-                    </span>
-                    <span className="text-slate-600">&bull;</span>
+                  <div className="pt-1 font-mono text-[11px]">
                     <button
                       type="button"
                       onClick={() => void openExternalUrl(resolvedInfo.parsed.canonicalWatchUrl)}
                       className="cursor-pointer inline-flex items-center gap-1 text-indigo-400 hover:underline"
                     >
-                      <span>Link đơn đã lọc</span>
+                      <span>Mở link đơn trên trình duyệt</span>
                       <ExternalLink className="h-3 w-3" />
                     </button>
                   </div>
@@ -287,16 +242,7 @@ export const YouTubeImportModal: React.FC<YouTubeImportModalProps> = ({
             onClick={onClose}
             className="cursor-pointer rounded-xl border border-white/10 bg-slate-800 px-4 py-2 text-xs font-semibold text-slate-300 hover:bg-slate-700"
           >
-            Hủy
-          </button>
-          <button
-            type="button"
-            disabled={!resolvedInfo || isLoading}
-            onClick={handleConfirmImport}
-            className="cursor-pointer inline-flex items-center gap-2 rounded-xl bg-rose-600 px-5 py-2 text-xs font-bold text-white shadow-lg shadow-rose-600/25 transition-colors hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <Play className="h-3.5 w-3.5 fill-current" />
-            Nạp Bài Đang Phát Vào Studio
+            Đóng
           </button>
         </div>
       </div>

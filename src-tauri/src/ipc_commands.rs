@@ -18,13 +18,15 @@ use crate::ai_separator::{
 };
 use crate::audio_engine::{render_stem_aware_master_mix, StemChannelParams, StemRole, StemTrackData};
 use crate::audio_io::{
-    decode_audio_file, export_audio_file, is_video_container_path, AudioExportFormat,
-    LoadedTrackSummary, StereoAudioBuffer,
+    decode_audio_file, encode_wav_16bit_bytes, export_audio_file, is_video_container_path,
+    AudioExportFormat, LoadedTrackSummary, StereoAudioBuffer,
 };
 use crate::dsp_pitch_time::{
     detect_bpm, detect_musical_key, process_stereo_pitch_and_speed, PitchSpeedConfig,
 };
-use crate::model_manager::{CachedModelStatus, ModelCatalogEntry, ModelManager};
+use crate::model_manager::{
+    discover_onnxruntime_library, CachedModelStatus, ModelCatalogEntry, ModelManager,
+};
 use crate::youtube_loader::{parse_youtube_single_video_url, ParsedYouTubeTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +120,276 @@ pub fn handle_load_track(
         detected_key,
         detected_bpm,
         waveform_peaks,
+    })
+}
+
+const B64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Encodes raw bytes into standard Base64 without external crate dependencies.
+pub fn encode_base64(input: &[u8]) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(((input.len() + 2) / 3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+
+        out.push(B64_ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(B64_ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            B64_ALPHABET[((triple >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64_ALPHABET[(triple & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Decodes a standard Base64 string into bytes.
+pub fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    let mut lut = [255_u8; 256];
+    for (idx, &ch) in B64_ALPHABET.iter().enumerate() {
+        lut[ch as usize] = idx as u8;
+    }
+
+    let cleaned: Vec<u8> = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    if cleaned.len() % 4 != 0 {
+        return Err("Invalid Base64 length".to_string());
+    }
+
+    let mut out = Vec::with_capacity((cleaned.len() / 4) * 3);
+    for chunk in cleaned.chunks_exact(4) {
+        let v0 = lut[chunk[0] as usize];
+        let v1 = lut[chunk[1] as usize];
+        if v0 == 255 || v1 == 255 {
+            return Err("Invalid Base64 character".to_string());
+        }
+        let v2 = if chunk[2] == b'=' { 0 } else { lut[chunk[2] as usize] };
+        let v3 = if chunk[3] == b'=' { 0 } else { lut[chunk[3] as usize] };
+        if (chunk[2] != b'=' && v2 == 255) || (chunk[3] != b'=' && v3 == 255) {
+            return Err("Invalid Base64 padding/character".to_string());
+        }
+        let triple = ((v0 as u32) << 18) | ((v1 as u32) << 12) | ((v2 as u32) << 6) | (v3 as u32);
+        out.push(((triple >> 16) & 0xFF) as u8);
+        if chunk[2] != b'=' {
+            out.push(((triple >> 8) & 0xFF) as u8);
+        }
+        if chunk[3] != b'=' {
+            out.push((triple & 0xFF) as u8);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct OpenFileNameW {
+    l_struct_size: u32,
+    hwnd_owner: *mut core::ffi::c_void,
+    h_instance: *mut core::ffi::c_void,
+    lpstr_filter: *const u16,
+    lpstr_custom_filter: *mut u16,
+    n_max_cust_filter: u32,
+    n_filter_index: u32,
+    lpstr_file: *mut u16,
+    n_max_file: u32,
+    lpstr_file_title: *mut u16,
+    n_max_file_title: u32,
+    lpstr_initial_dir: *const u16,
+    lpstr_title: *const u16,
+    flags: u32,
+    n_file_offset: u16,
+    n_file_extension: u16,
+    lpstr_def_ext: *const u16,
+    l_cust_data: isize,
+    lpfn_hook: *const core::ffi::c_void,
+    lp_template_name: *const u16,
+    pv_reserved: *mut core::ffi::c_void,
+    dw_reserved: u32,
+    flags_ex: u32,
+}
+
+#[cfg(target_os = "windows")]
+fn pick_windows_file(title_text: &str, filter_spec: &str) -> Result<Option<String>, String> {
+    use std::ffi::{OsStr, OsString};
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    #[link(name = "comdlg32")]
+    extern "system" {
+        fn GetOpenFileNameW(lpofn: *mut OpenFileNameW) -> i32;
+    }
+
+    let filter: Vec<u16> = OsStr::new(filter_spec).encode_wide().collect();
+    let title: Vec<u16> = OsStr::new(title_text)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    let mut file_buf = vec![0_u16; 2048];
+    let mut ofn = OpenFileNameW {
+        l_struct_size: std::mem::size_of::<OpenFileNameW>() as u32,
+        hwnd_owner: core::ptr::null_mut(),
+        h_instance: core::ptr::null_mut(),
+        lpstr_filter: filter.as_ptr(),
+        lpstr_custom_filter: core::ptr::null_mut(),
+        n_max_cust_filter: 0,
+        n_filter_index: 1,
+        lpstr_file: file_buf.as_mut_ptr(),
+        n_max_file: file_buf.len() as u32,
+        lpstr_file_title: core::ptr::null_mut(),
+        n_max_file_title: 0,
+        lpstr_initial_dir: core::ptr::null(),
+        lpstr_title: title.as_ptr(),
+        flags: 0x0000_1808, // OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR
+        n_file_offset: 0,
+        n_file_extension: 0,
+        lpstr_def_ext: core::ptr::null(),
+        l_cust_data: 0,
+        lpfn_hook: core::ptr::null(),
+        lp_template_name: core::ptr::null(),
+        pv_reserved: core::ptr::null_mut(),
+        dw_reserved: 0,
+        flags_ex: 0,
+    };
+
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) };
+    if ok == 0 {
+        return Ok(None);
+    }
+
+    let len = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+    Ok(Some(
+        OsString::from_wide(&file_buf[..len])
+            .to_string_lossy()
+            .into_owned(),
+    ))
+}
+
+/// Opens a native Windows file picker dialog for audio and video files without external `.exe` sidecars.
+pub fn handle_pick_audio_file() -> Result<Option<String>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        return pick_windows_file(
+            "Mo file Nhac hoac Video - Music Studio AI",
+            "Nhac & Video (*.mp3;*.wav;*.flac;*.ogg;*.m4a;*.aac;*.opus;*.mp4;*.mkv;*.webm;*.mov;*.avi)\0\
+             *.mp3;*.wav;*.flac;*.ogg;*.m4a;*.aac;*.opus;*.mp4;*.mkv;*.webm;*.mov;*.avi\0\
+             Tat ca file (*.*)\0*.*\0\0",
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Native file picker is only supported on Windows".to_string())
+    }
+}
+
+/// Opens a native Windows file picker dialog for local `.onnx` model files.
+pub fn handle_pick_onnx_file() -> Result<Option<String>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        return pick_windows_file(
+            "Chon file Model AI (.onnx) - Music Studio AI",
+            "ONNX Model (*.onnx)\0*.onnx\0Tat ca file (*.*)\0*.*\0\0",
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Native file picker is only supported on Windows".to_string())
+    }
+}
+
+/// Reads a local audio/video file up to 120 MB as Base64 for WebAudio preview decoding.
+pub fn handle_read_file_base64(file_path: &str) -> Result<String, String> {
+    let meta = std::fs::metadata(file_path)
+        .map_err(|e| format!("Failed to read file metadata '{}': {}", file_path, e))?;
+    if meta.len() > 120 * 1024 * 1024 {
+        return Err("File vuot qua gioi han 120 MB cho phat preview truc tiep".to_string());
+    }
+    let bytes = std::fs::read(file_path)
+        .map_err(|e| format!("Failed to read file '{}': {}", file_path, e))?;
+    Ok(encode_base64(&bytes))
+}
+
+/// Encodes the currently loaded Rust track into 16-bit WAV Base64 for containers Chromium cannot decode directly (e.g. MKV/FLAC).
+pub fn handle_prepare_preview_wav_b64(state: &Arc<Mutex<StudioAppState>>) -> Result<String, String> {
+    let track = {
+        let guard = state
+            .lock()
+            .map_err(|_| "Failed to acquire studio state lock".to_string())?;
+        guard
+            .original_track
+            .clone()
+            .ok_or_else(|| "No track loaded in Rust studio state".to_string())?
+    };
+    let wav_bytes = encode_wav_16bit_bytes(&track)?;
+    Ok(encode_base64(&wav_bytes))
+}
+
+/// Loads raw audio/video bytes received via drag-and-drop into Rust StudioAppState.
+pub fn handle_load_audio_bytes_b64(
+    state: &Arc<Mutex<StudioAppState>>,
+    file_name: &str,
+    audio_b64: &str,
+) -> Result<LoadedTrackSummary, String> {
+    let bytes = decode_base64(audio_b64)?;
+    let safe_name = Path::new(file_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("dropped_track.wav");
+    let pid = std::process::id();
+    let temp_path = std::env::temp_dir().join(format!("music_studio_drop_{}_{}", pid, safe_name));
+    std::fs::write(&temp_path, &bytes)
+        .map_err(|e| format!("Failed to buffer dropped file: {}", e))?;
+
+    let result = handle_load_track(state, &temp_path.display().to_string());
+    let _ = std::fs::remove_file(&temp_path);
+
+    let mut summary = result?;
+    summary.file_name = safe_name.to_string();
+    summary.is_video_source = is_video_container_path(Path::new(safe_name));
+    Ok(summary)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeparatedStemsWavB64Response {
+    pub lead_vocal_b64: String,
+    pub backing_vocal_b64: String,
+    pub instrumental_b64: String,
+    pub reverb_tail_b64: String,
+}
+
+/// Exports the 4 Rust ONNX-separated stems as Base64 16-bit WAV buffers for live WebView stem mixing.
+pub fn handle_export_separated_stems_b64(
+    state: &Arc<Mutex<StudioAppState>>,
+) -> Result<SeparatedStemsWavB64Response, String> {
+    let sep = {
+        let guard = state
+            .lock()
+            .map_err(|_| "Failed to acquire studio state lock".to_string())?;
+        guard
+            .separated_stems
+            .clone()
+            .ok_or_else(|| "No separated stems in Rust state".to_string())?
+    };
+
+    Ok(SeparatedStemsWavB64Response {
+        lead_vocal_b64: encode_base64(&encode_wav_16bit_bytes(&sep.lead_vocal)?),
+        backing_vocal_b64: encode_base64(&encode_wav_16bit_bytes(&sep.backing_vocal)?),
+        instrumental_b64: encode_base64(&encode_wav_16bit_bytes(&sep.instrumental)?),
+        reverb_tail_b64: encode_base64(&encode_wav_16bit_bytes(&sep.reverb_tail)?),
     })
 }
 
@@ -414,6 +686,11 @@ pub fn handle_run_separation(
     mode: SeparationMode,
     use_directml: bool,
 ) -> Result<SeparationStemPeaksResponse, String> {
+    let pipeline = match mode {
+        SeparationMode::FastMdx => SeparationPipelineConfig::default_mdx_pipeline(),
+        SeparationMode::ProRoformer => SeparationPipelineConfig::pro_roformer_pipeline(),
+    };
+
     let (track, models_dir, env) = {
         let mut guard = state
             .lock()
@@ -422,7 +699,33 @@ pub fn handle_run_separation(
         let track = guard
             .original_track
             .clone()
-            .ok_or_else(|| "No audio/video track loaded yet".to_string())?;
+            .ok_or_else(|| "Chưa có bài hát nào được nạp vào bộ xử lý Rust.".to_string())?;
+
+        let models_dir = guard.model_manager.models_dir().to_path_buf();
+
+        let stage1_path = models_dir.join(&pipeline.stage1_inst_model.model_filename);
+        if !stage1_path.is_file() {
+            return Err(format!(
+                "ONNX_PREREQ_MISSING: Thiếu model tầng 1 '{}' trong '{}'. Hãy tải hoặc nhập file .ONNX trong mục Model AI.",
+                pipeline.stage1_inst_model.model_filename,
+                models_dir.display()
+            ));
+        }
+        let stage2_path = models_dir.join(&pipeline.stage2_karaoke_model.model_filename);
+        if !stage2_path.is_file() {
+            return Err(format!(
+                "ONNX_PREREQ_MISSING: Thiếu model tầng 2 '{}' trong '{}'. Hãy tải hoặc nhập file .ONNX trong mục Model AI.",
+                pipeline.stage2_karaoke_model.model_filename,
+                models_dir.display()
+            ));
+        }
+
+        if discover_onnxruntime_library().is_none() {
+            return Err(
+                "ONNX_PREREQ_MISSING: Không tìm thấy file 'onnxruntime.dll' (Microsoft signed). Vui lòng đặt onnxruntime.dll cạnh file thực thi hoặc trong thư mục models."
+                    .to_string(),
+            );
+        }
 
         if guard.ort_env.is_none() {
             guard.ort_env = Some(init_ort_environment(None)?);
@@ -432,13 +735,7 @@ pub fn handle_run_separation(
             .ort_env
             .clone()
             .ok_or_else(|| "ONNX Runtime environment not initialized".to_string())?;
-        let models_dir = guard.model_manager.models_dir().to_path_buf();
         (track, models_dir, env)
-    };
-
-    let pipeline = match mode {
-        SeparationMode::FastMdx => SeparationPipelineConfig::default_mdx_pipeline(),
-        SeparationMode::ProRoformer => SeparationPipelineConfig::pro_roformer_pipeline(),
     };
 
     let device = if use_directml {
@@ -603,11 +900,59 @@ pub mod tauri_commands {
     use super::*;
 
     #[tauri::command]
-    pub fn ipc_load_track(
+    pub async fn ipc_pick_audio_file() -> Result<Option<String>, String> {
+        tauri::async_runtime::spawn_blocking(handle_pick_audio_file)
+            .await
+            .map_err(|e| format!("Audio picker worker panicked: {}", e))?
+    }
+
+    #[tauri::command]
+    pub async fn ipc_pick_onnx_file() -> Result<Option<String>, String> {
+        tauri::async_runtime::spawn_blocking(handle_pick_onnx_file)
+            .await
+            .map_err(|e| format!("ONNX picker worker panicked: {}", e))?
+    }
+
+    #[tauri::command]
+    pub async fn ipc_load_track(
         state: tauri::State<'_, Arc<Mutex<StudioAppState>>>,
         file_path: String,
     ) -> Result<LoadedTrackSummary, String> {
-        handle_load_track(state.inner(), &file_path)
+        let state_arc = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || handle_load_track(&state_arc, &file_path))
+            .await
+            .map_err(|e| format!("Track loader panicked: {}", e))?
+    }
+
+    #[tauri::command]
+    pub async fn ipc_load_audio_bytes_b64(
+        state: tauri::State<'_, Arc<Mutex<StudioAppState>>>,
+        file_name: String,
+        audio_b64: String,
+    ) -> Result<LoadedTrackSummary, String> {
+        let state_arc = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            handle_load_audio_bytes_b64(&state_arc, &file_name, &audio_b64)
+        })
+        .await
+        .map_err(|e| format!("Audio bytes loader panicked: {}", e))?
+    }
+
+    #[tauri::command]
+    pub async fn ipc_read_file_base64(file_path: String) -> Result<String, String> {
+        tauri::async_runtime::spawn_blocking(move || handle_read_file_base64(&file_path))
+            .await
+            .map_err(|e| format!("File reader panicked: {}", e))?
+    }
+
+    #[tauri::command]
+    pub async fn ipc_prepare_preview_wav_b64(
+        state: tauri::State<'_, Arc<Mutex<StudioAppState>>>,
+    ) -> Result<String, String> {
+        let state_arc = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || handle_prepare_preview_wav_b64(&state_arc))
+            .await
+            .map_err(|e| format!("Preview encoder panicked: {}", e))?
     }
 
     #[tauri::command]
@@ -631,12 +976,17 @@ pub mod tauri_commands {
     }
 
     #[tauri::command]
-    pub fn ipc_import_local_onnx(
+    pub async fn ipc_import_local_onnx(
         state: tauri::State<'_, Arc<Mutex<StudioAppState>>>,
         source_path: String,
         target_model_id: Option<String>,
     ) -> Result<CachedModelStatus, String> {
-        handle_import_local_onnx(state.inner(), &source_path, target_model_id)
+        let state_arc = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            handle_import_local_onnx(&state_arc, &source_path, target_model_id)
+        })
+        .await
+        .map_err(|e| format!("ONNX import worker panicked: {}", e))?
     }
 
     #[tauri::command]
@@ -690,16 +1040,31 @@ pub mod tauri_commands {
     }
 
     #[tauri::command]
-    pub fn ipc_run_separation(
+    pub async fn ipc_run_separation(
         state: tauri::State<'_, Arc<Mutex<StudioAppState>>>,
         mode: SeparationMode,
         use_directml: bool,
     ) -> Result<SeparationStemPeaksResponse, String> {
-        handle_run_separation(state.inner(), mode, use_directml)
+        let state_arc = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            handle_run_separation(&state_arc, mode, use_directml)
+        })
+        .await
+        .map_err(|e| format!("Separation worker panicked: {}", e))?
     }
 
     #[tauri::command]
-    pub fn ipc_export_audio(
+    pub async fn ipc_export_separated_stems_b64(
+        state: tauri::State<'_, Arc<Mutex<StudioAppState>>>,
+    ) -> Result<SeparatedStemsWavB64Response, String> {
+        let state_arc = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || handle_export_separated_stems_b64(&state_arc))
+            .await
+            .map_err(|e| format!("Separated stem encoder panicked: {}", e))?
+    }
+
+    #[tauri::command]
+    pub async fn ipc_export_audio(
         state: tauri::State<'_, Arc<Mutex<StudioAppState>>>,
         output_dir: String,
         base_name: String,
@@ -708,15 +1073,20 @@ pub mod tauri_commands {
         stem_params: Vec<StemChannelParams>,
         limiter_enabled: bool,
     ) -> Result<ExportAudioResponse, String> {
-        handle_export_audio(
-            state.inner(),
-            &output_dir,
-            &base_name,
-            target,
-            format,
-            stem_params,
-            limiter_enabled,
-        )
+        let state_arc = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            handle_export_audio(
+                &state_arc,
+                &output_dir,
+                &base_name,
+                target,
+                format,
+                stem_params,
+                limiter_enabled,
+            )
+        })
+        .await
+        .map_err(|e| format!("Export worker panicked: {}", e))?
     }
 }
 
@@ -768,6 +1138,43 @@ mod tests {
         assert_eq!(std::fs::read(&saved_path).expect("read saved"), b"RIFFtest");
 
         let _ = std::fs::remove_dir_all(&temp_export);
+        let _ = std::fs::remove_dir_all(&temp_models);
+    }
+
+    #[test]
+    fn test_base64_roundtrip_and_real_wav_load_and_missing_onnx_guard() {
+        let sample = b"MusicStudioAI-Real-Audio-Test";
+        let b64 = encode_base64(sample);
+        assert_eq!(decode_base64(&b64).expect("decode b64"), sample);
+
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        assert_eq!(std::mem::size_of::<OpenFileNameW>(), 152);
+
+        let temp_models = std::env::temp_dir().join("music_studio_ipc_real_wav_test");
+        let state = Arc::new(Mutex::new(
+            StudioAppState::new(&temp_models).expect("init state"),
+        ));
+
+        let buf = StereoAudioBuffer::new(
+            44_100,
+            vec![0.25_f32; 44_100],
+            vec![-0.25_f32; 44_100],
+        );
+        let wav_bytes = encode_wav_16bit_bytes(&buf).expect("encode preview wav");
+        let wav_b64 = encode_base64(&wav_bytes);
+
+        let summary = handle_load_audio_bytes_b64(&state, "real_test.wav", &wav_b64)
+            .expect("load dropped wav into Rust state");
+        assert_eq!(summary.file_name, "real_test.wav");
+        assert!(summary.duration_sec > 0.9);
+
+        let preview_b64 = handle_prepare_preview_wav_b64(&state).expect("prepare preview wav");
+        assert!(!preview_b64.is_empty());
+
+        let sep_err = handle_run_separation(&state, SeparationMode::FastMdx, false)
+            .expect_err("should fail clearly when .onnx models are missing");
+        assert!(sep_err.starts_with("ONNX_PREREQ_MISSING:"));
+
         let _ = std::fs::remove_dir_all(&temp_models);
     }
 }

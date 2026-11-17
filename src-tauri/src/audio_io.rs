@@ -3,7 +3,7 @@
 //! and exports WAV (16/24-bit PCM, 32-bit Float) and Lossless FLAC without external `ffmpeg.exe`.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Cursor, Seek, Write};
 use std::path::Path;
 
 use hound::{SampleFormat, WavSpec, WavWriter};
@@ -275,6 +275,27 @@ pub fn export_audio_file<P: AsRef<Path>>(
     }
 }
 
+/// Encodes a stereo buffer into in-memory 16-bit PCM WAV bytes for low-overhead IPC preview transfer.
+pub fn encode_wav_16bit_bytes(buffer: &StereoAudioBuffer) -> Result<Vec<u8>, String> {
+    let frames = buffer.num_frames();
+    let mut bytes = Vec::with_capacity(44 + frames * 4);
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: buffer.sample_rate,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    {
+        let mut writer = WavWriter::new(Cursor::new(&mut bytes), spec)
+            .map_err(|e| format!("Failed to init WAV buffer: {}", e))?;
+        write_wav_samples(&mut writer, buffer, 16, SampleFormat::Int)?;
+        writer
+            .finalize()
+            .map_err(|e| format!("Failed to finalize WAV buffer: {}", e))?;
+    }
+    Ok(bytes)
+}
+
 fn export_wav_internal<P: AsRef<Path>>(
     path: P,
     buffer: &StereoAudioBuffer,
@@ -291,6 +312,19 @@ fn export_wav_internal<P: AsRef<Path>>(
     let mut writer = WavWriter::create(path.as_ref(), spec)
         .map_err(|e| format!("Failed to create WAV file: {}", e))?;
 
+    write_wav_samples(&mut writer, buffer, bits_per_sample, sample_format)?;
+
+    writer
+        .finalize()
+        .map_err(|e| format!("Failed to finalize WAV file: {}", e))
+}
+
+fn write_wav_samples<W: Write + Seek>(
+    writer: &mut WavWriter<W>,
+    buffer: &StereoAudioBuffer,
+    bits_per_sample: u16,
+    sample_format: SampleFormat,
+) -> Result<(), String> {
     let frames = buffer.num_frames();
     match (bits_per_sample, sample_format) {
         (16, SampleFormat::Int) => {
@@ -321,10 +355,7 @@ fn export_wav_internal<P: AsRef<Path>>(
             }
         }
     }
-
-    writer
-        .finalize()
-        .map_err(|e| format!("Failed to finalize WAV file: {}", e))
+    Ok(())
 }
 
 /// Encodes and writes a valid 24-bit Stereo Lossless FLAC file (`fLaC` + STREAMINFO + VERBATIM frames)

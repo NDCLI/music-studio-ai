@@ -12,42 +12,6 @@ import {
 } from './dspEngine';
 
 /**
- * Generates deterministic studio waveform peak data for each stem track.
- */
-export function generateStemPeaks(stemId: StemId, count = 140, seedBoost = 1): number[] {
-  const peaks: number[] = [];
-  const seedMap: Record<StemId, number> = {
-    lead_vocal: 1.7,
-    backing_vocal: 3.1,
-    instrumental: 0.9,
-    reverb_tail: 4.3,
-  };
-  const baseSeed = seedMap[stemId] * seedBoost;
-
-  for (let i = 0; i < count; i++) {
-    const progress = i / count;
-    const envelope = Math.sin(progress * Math.PI);
-    const waveA = Math.abs(Math.sin((i + baseSeed * 7) * 0.29));
-    const waveB = Math.abs(Math.cos((i * 1.4 + baseSeed * 3) * 0.17));
-    const phraseGap =
-      stemId === 'lead_vocal'
-        ? Math.sin(i * 0.18) > -0.35
-          ? 1
-          : 0.12
-        : stemId === 'backing_vocal'
-          ? Math.cos(i * 0.12) > 0.05
-            ? 0.9
-            : 0.15
-          : 1;
-
-    const raw = (waveA * 0.6 + waveB * 0.4) * (0.35 + 0.65 * envelope) * phraseGap;
-    peaks.push(Math.max(0.08, Math.min(0.98, Number(raw.toFixed(3)))));
-  }
-
-  return peaks;
-}
-
-/**
  * Extracts real waveform peaks from a decoded WebAudio AudioBuffer.
  */
 export function extractPeaksFromBuffer(buffer: AudioBuffer, count = 140): number[] {
@@ -69,15 +33,13 @@ export function extractPeaksFromBuffer(buffer: AudioBuffer, count = 140): number
 }
 
 /**
- * Stage 2, 3, 5 & 6 Real-time Multi-Stem & Granular Formant Pitch/Time Engine.
- * Supports synthesized preview, raw decoded audio/video playback, separated 4-stem buffers,
- * and multi-format lossless export (WAV 16/24-bit, WAV 32-bit Float, FLAC 24-bit).
+ * Real-time Multi-Stem & Granular Formant Pitch/Time Engine.
+ * Operates exclusively on real decoded audio/video tracks and separated stems
+ * with full-duration export (WAV 16/24-bit, WAV 32-bit Float, FLAC 24-bit).
  */
 export class StudioPreviewAudioEngine {
   private ctx: AudioContext | null = null;
   private isPlaying = false;
-  private stepTimer: number | null = null;
-  private stepIndex = 0;
   private customBuffer: AudioBuffer | null = null;
   private separatedStems: SeparatedStemsMap | null = null;
   private scriptProcessor: ScriptProcessorNode | null = null;
@@ -94,7 +56,30 @@ export class StudioPreviewAudioEngine {
     this.separatedStems = stems;
   }
 
+  public hasSeparatedStems(): boolean {
+    return this.separatedStems !== null;
+  }
+
+  public clearTrack(): void {
+    this.stop();
+    this.customBuffer = null;
+    this.separatedStems = null;
+    this.playheadSample = 0;
+  }
+
   public async loadAudioFile(file: File): Promise<{
+    durationSec: number;
+    sampleRate: number;
+    channels: number;
+    detectedKey: string;
+    detectedBpm: number;
+    peaks: Record<StemId, number[]>;
+  }> {
+    const arrayBuffer = await file.arrayBuffer();
+    return this.loadAudioFromArrayBuffer(arrayBuffer);
+  }
+
+  public async loadAudioFromArrayBuffer(arrayBuffer: ArrayBuffer): Promise<{
     durationSec: number;
     sampleRate: number;
     channels: number;
@@ -105,8 +90,7 @@ export class StudioPreviewAudioEngine {
     if (!this.ctx) {
       this.ctx = new AudioContext();
     }
-    const arrayBuffer = await file.arrayBuffer();
-    const audioBuffer = await this.ctx.decodeAudioData(arrayBuffer);
+    const audioBuffer = await this.ctx.decodeAudioData(arrayBuffer.slice(0));
     this.customBuffer = audioBuffer;
     this.separatedStems = null;
     this.playheadSample = 0;
@@ -122,15 +106,32 @@ export class StudioPreviewAudioEngine {
       detectedKey,
       detectedBpm,
       peaks: {
-        lead_vocal: basePeaks.map((p, idx) =>
-          Math.max(0.06, Math.min(0.98, p * (Math.sin(idx * 0.22) > -0.2 ? 0.95 : 0.25)))
-        ),
-        backing_vocal: basePeaks.map((p, idx) =>
-          Math.max(0.06, Math.min(0.95, p * (Math.cos(idx * 0.15) > 0.1 ? 0.78 : 0.18)))
-        ),
+        lead_vocal: basePeaks,
+        backing_vocal: basePeaks,
         instrumental: basePeaks,
-        reverb_tail: basePeaks.map((p) => Math.max(0.05, Math.min(0.75, p * 0.55))),
+        reverb_tail: basePeaks,
       },
+    };
+  }
+
+  public async decodeWavArrayBufferToStereo(wavBuffer: ArrayBuffer): Promise<{
+    sampleRate: number;
+    left: Float32Array;
+    right: Float32Array;
+  }> {
+    if (!this.ctx) {
+      this.ctx = new AudioContext();
+    }
+    const decoded = await this.ctx.decodeAudioData(wavBuffer.slice(0));
+    const left = new Float32Array(decoded.getChannelData(0));
+    const right =
+      decoded.numberOfChannels > 1
+        ? new Float32Array(decoded.getChannelData(1))
+        : new Float32Array(left);
+    return {
+      sampleRate: decoded.sampleRate,
+      left,
+      right,
     };
   }
 
@@ -151,7 +152,7 @@ export class StudioPreviewAudioEngine {
     getPitchSpeed: () => PitchSpeedSettings,
     onTick: (deltaSec: number, peakLevelDb: number) => void
   ): void {
-    if (this.isPlaying) return;
+    if (this.isPlaying || !this.customBuffer) return;
     if (!this.ctx) {
       this.ctx = new AudioContext();
     }
@@ -159,37 +160,7 @@ export class StudioPreviewAudioEngine {
       void this.ctx.resume();
     }
     this.isPlaying = true;
-
-    if (this.customBuffer) {
-      this.startCustomBufferRealtimeEngine(getStems, getPitchSpeed, onTick);
-      return;
-    }
-
-    const baseIntervalMs = 240;
-
-    const triggerStep = () => {
-      if (!this.isPlaying || !this.ctx) return;
-
-      const settings = getPitchSpeed();
-      const stems = getStems();
-      const anySolo = stems.some((s) => s.solo);
-
-      const pitchFactor = Math.pow(2, (settings.semitones + settings.cents / 100) / 12);
-      const effectiveIntervalMs = Math.max(80, baseIntervalMs / settings.speed);
-
-      const peakDb = this.playSynthesizedMultiStemStep(
-        stems,
-        anySolo,
-        pitchFactor,
-        settings.formantPreservation
-      );
-      onTick(effectiveIntervalMs / 1000, peakDb);
-      this.stepIndex = (this.stepIndex + 1) % 16;
-
-      this.stepTimer = window.setTimeout(triggerStep, effectiveIntervalMs);
-    };
-
-    triggerStep();
+    this.startCustomBufferRealtimeEngine(getStems, getPitchSpeed, onTick);
   }
 
   private startCustomBufferRealtimeEngine(
@@ -328,10 +299,6 @@ export class StudioPreviewAudioEngine {
 
   public stop(): void {
     this.isPlaying = false;
-    if (this.stepTimer !== null) {
-      clearTimeout(this.stepTimer);
-      this.stepTimer = null;
-    }
     if (this.scriptProcessor) {
       this.scriptProcessor.disconnect();
       this.scriptProcessor.onaudioprocess = null;
@@ -402,7 +369,11 @@ export class StudioPreviewAudioEngine {
     settings: PitchSpeedSettings,
     format: BrowserAudioExportFormat
   ): Blob {
-    const sampleRate = this.customBuffer?.sampleRate ?? 44100;
+    if (!this.customBuffer) {
+      throw new Error('Chưa có file âm thanh thực tế để xuất.');
+    }
+
+    const sampleRate = this.customBuffer.sampleRate;
     const anySolo = stems.some((s) => s.solo);
     const getStemGain = (id: StemId) => {
       const st = stems.find((x) => x.id === id);
@@ -418,202 +389,87 @@ export class StudioPreviewAudioEngine {
     const instGain = getStemGain('instrumental');
     const reverbGain = getStemGain('reverb_tail');
 
-    if (this.separatedStems && this.customBuffer) {
-      const sep = this.separatedStems;
-      const len = sep.instrumental.left.length;
-      const outFrames = Math.min(sampleRate * 45, Math.floor(len / speedRatio));
-      const outL = new Float32Array(outFrames);
-      const outR = new Float32Array(outFrames);
+    const sep = this.separatedStems;
+    const rawL = this.customBuffer.getChannelData(0);
+    const rawR =
+      this.customBuffer.numberOfChannels > 1
+        ? this.customBuffer.getChannelData(1)
+        : rawL;
 
-      for (let i = 0; i < outFrames; i++) {
-        const srcIdx = Math.min(len - 1, Math.floor(i * speedRatio * pitchRatio) % len);
-        outL[i] =
-          sep.lead_vocal.left[srcIdx] * leadGain +
-          sep.backing_vocal.left[srcIdx] * backingGain +
-          sep.instrumental.left[srcIdx] * instGain +
-          sep.reverb_tail.left[srcIdx] * reverbGain;
-        outR[i] =
-          sep.lead_vocal.right[srcIdx] * leadGain +
-          sep.backing_vocal.right[srcIdx] * backingGain +
-          sep.instrumental.right[srcIdx] * instGain +
-          sep.reverb_tail.right[srcIdx] * reverbGain;
-      }
-
-      return encodeStereoAudioBlob(outL, outR, sampleRate, format);
-    }
-
-    if (this.customBuffer) {
-      const srcL = this.customBuffer.getChannelData(0);
-      const srcR =
-        this.customBuffer.numberOfChannels > 1
-          ? this.customBuffer.getChannelData(1)
-          : srcL;
-      const outFrames = Math.min(
-        sampleRate * 45,
-        Math.floor(this.customBuffer.length / speedRatio)
-      );
-      const outL = new Float32Array(outFrames);
-      const outR = new Float32Array(outFrames);
-
-      for (let i = 0; i < outFrames; i++) {
-        const srcIdx = Math.min(
-          srcL.length - 1,
-          Math.floor(i * speedRatio * pitchRatio) % srcL.length
-        );
-        const l = srcL[srcIdx];
-        const r = srcR[srcIdx];
-        const mid = 0.5 * (l + r);
-        const side = 0.5 * (l - r);
-        outL[i] = mid * leadGain * 0.7 + side * backingGain + (l - mid * 0.5) * instGain;
-        outR[i] = mid * leadGain * 0.7 - side * backingGain + (r - mid * 0.5) * instGain;
-      }
-
-      return encodeStereoAudioBlob(outL, outR, sampleRate, format);
-    }
-
-    const durationSec = 8;
-    const outFrames = Math.floor(sampleRate * durationSec);
+    const srcLen = sep ? sep.instrumental.left.length : this.customBuffer.length;
+    const outFrames = Math.max(1, Math.floor(srcLen / speedRatio));
     const outL = new Float32Array(outFrames);
     const outR = new Float32Array(outFrames);
 
-    const melody = [440, 523.25, 659.25, 587.33, 523.25, 493.88, 440, 392];
-    const bass = [110, 110, 87.31, 87.31, 130.81, 130.81, 98, 98];
+    const isUnityPitchSpeed =
+      Math.abs(pitchRatio - 1.0) < 1e-4 && Math.abs(speedRatio - 1.0) < 1e-4;
+
+    if (isUnityPitchSpeed) {
+      if (sep) {
+        for (let i = 0; i < outFrames; i++) {
+          const idx = Math.min(srcLen - 1, i);
+          outL[i] =
+            sep.lead_vocal.left[idx] * leadGain +
+            sep.backing_vocal.left[idx] * backingGain +
+            sep.instrumental.left[idx] * instGain +
+            sep.reverb_tail.left[idx] * reverbGain;
+          outR[i] =
+            sep.lead_vocal.right[idx] * leadGain +
+            sep.backing_vocal.right[idx] * backingGain +
+            sep.instrumental.right[idx] * instGain +
+            sep.reverb_tail.right[idx] * reverbGain;
+        }
+      } else {
+        for (let i = 0; i < outFrames; i++) {
+          const l = rawL[i];
+          const r = rawR[i];
+          const mid = 0.5 * (l + r);
+          const side = 0.5 * (l - r);
+          outL[i] = mid * leadGain * 0.75 + side * backingGain * 0.9 + (l - mid * 0.55) * instGain + side * reverbGain * 0.35;
+          outR[i] = mid * leadGain * 0.75 - side * backingGain * 0.9 + (r - mid * 0.55) * instGain - side * reverbGain * 0.35;
+        }
+      }
+      return encodeStereoAudioBlob(outL, outR, sampleRate, format);
+    }
+
+    // Full-length Granular Hann Overlap-Add Pitch + Time rendering (preserves true duration / speedRatio)
+    const grainSize = 2400;
+    const grainRate = (pitchRatio - speedRatio) / grainSize;
+    let playhead = 0;
+    let grainPhaseA = 0;
 
     for (let i = 0; i < outFrames; i++) {
-      const t = i / sampleRate;
-      const step = Math.floor(t * 4 * speedRatio) % melody.length;
-      const fLead = melody[step] * pitchRatio;
-      const fBass = bass[step] * pitchRatio;
+      const grainPhaseB = (grainPhaseA + 0.5) % 1.0;
+      const winA = 0.5 * (1 - Math.cos(2 * Math.PI * grainPhaseA));
+      const winB = 0.5 * (1 - Math.cos(2 * Math.PI * grainPhaseB));
 
-      const sLead = Math.sin(2 * Math.PI * fLead * t) * leadGain * 0.25;
-      const sBack = Math.sin(2 * Math.PI * (fLead * 0.75) * t) * backingGain * 0.2;
-      const sInst = Math.sin(2 * Math.PI * fBass * t) * instGain * 0.3;
+      const idxA = Math.min(srcLen - 1, Math.max(0, Math.floor(playhead + grainPhaseA * grainSize)));
+      const idxB = Math.min(srcLen - 1, Math.max(0, Math.floor(playhead + grainPhaseB * grainSize)));
 
-      outL[i] = sLead + sBack + sInst;
-      outR[i] = sLead - sBack * 0.5 + sInst;
+      if (sep) {
+        outL[i] =
+          (sep.lead_vocal.left[idxA] * winA + sep.lead_vocal.left[idxB] * winB) * leadGain +
+          (sep.backing_vocal.left[idxA] * winA + sep.backing_vocal.left[idxB] * winB) * backingGain +
+          (sep.instrumental.left[idxA] * winA + sep.instrumental.left[idxB] * winB) * instGain +
+          (sep.reverb_tail.left[idxA] * winA + sep.reverb_tail.left[idxB] * winB) * reverbGain;
+        outR[i] =
+          (sep.lead_vocal.right[idxA] * winA + sep.lead_vocal.right[idxB] * winB) * leadGain +
+          (sep.backing_vocal.right[idxA] * winA + sep.backing_vocal.right[idxB] * winB) * backingGain +
+          (sep.instrumental.right[idxA] * winA + sep.instrumental.right[idxB] * winB) * instGain +
+          (sep.reverb_tail.right[idxA] * winA + sep.reverb_tail.right[idxB] * winB) * reverbGain;
+      } else {
+        const l = rawL[idxA] * winA + rawL[idxB] * winB;
+        const r = rawR[idxA] * winA + rawR[idxB] * winB;
+        const mid = 0.5 * (l + r);
+        const side = 0.5 * (l - r);
+        outL[i] = mid * leadGain * 0.75 + side * backingGain * 0.9 + (l - mid * 0.55) * instGain + side * reverbGain * 0.35;
+        outR[i] = mid * leadGain * 0.75 - side * backingGain * 0.9 + (r - mid * 0.55) * instGain - side * reverbGain * 0.35;
+      }
+
+      playhead += speedRatio;
+      grainPhaseA = (grainPhaseA + grainRate + 1.0) % 1.0;
     }
 
     return encodeStereoAudioBlob(outL, outR, sampleRate, format);
-  }
-
-  private playSynthesizedMultiStemStep(
-    stems: StemTrackState[],
-    anySolo: boolean,
-    pitchFactor: number,
-    formantPreservation: boolean
-  ): number {
-    if (!this.ctx) return -60;
-    const now = this.ctx.currentTime;
-
-    const leadMelodyFreqs = [
-      440.0, 523.25, 659.25, 587.33, 523.25, 493.88, 440.0, 392.0,
-      349.23, 440.0, 523.25, 659.25, 587.33, 523.25, 493.88, 440.0,
-    ];
-    const backingHarmonyFreqs = [
-      329.63, 392.0, 440.0, 392.0, 349.23, 329.63, 293.66, 261.63,
-      261.63, 329.63, 392.0, 440.0, 392.0, 349.23, 329.63, 329.63,
-    ];
-    const bassFreqs = [
-      110.0, 110.0, 110.0, 110.0, 87.31, 87.31, 87.31, 87.31,
-      130.81, 130.81, 130.81, 130.81, 98.0, 98.0, 98.0, 98.0,
-    ];
-
-    const getEffectiveGain = (id: StemId): number => {
-      const stem = stems.find((s) => s.id === id);
-      if (!stem) return 0;
-      if (stem.muted) return 0;
-      if (anySolo && !stem.solo) return 0;
-      return (stem.volume / 100) * 0.14;
-    };
-
-    const leadGainVal = getEffectiveGain('lead_vocal');
-    if (leadGainVal > 0.001) {
-      const osc = this.ctx.createOscillator();
-      const filter = this.ctx.createBiquadFilter();
-      const gain = this.ctx.createGain();
-
-      osc.type = 'sawtooth';
-      osc.frequency.setValueAtTime(leadMelodyFreqs[this.stepIndex] * pitchFactor, now);
-
-      filter.type = 'bandpass';
-      filter.frequency.setValueAtTime(
-        formantPreservation ? 1150 : 1150 * pitchFactor,
-        now
-      );
-      filter.Q.setValueAtTime(2.4, now);
-
-      gain.gain.setValueAtTime(0.001, now);
-      gain.gain.exponentialRampToValueAtTime(leadGainVal, now + 0.03);
-      gain.gain.exponentialRampToValueAtTime(0.0008, now + 0.21);
-
-      osc.connect(filter);
-      filter.connect(gain);
-      gain.connect(this.ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.22);
-    }
-
-    const backingGainVal = getEffectiveGain('backing_vocal');
-    if (backingGainVal > 0.001 && this.stepIndex % 2 === 0) {
-      const osc = this.ctx.createOscillator();
-      const filter = this.ctx.createBiquadFilter();
-      const gain = this.ctx.createGain();
-
-      osc.type = 'triangle';
-      osc.frequency.setValueAtTime(backingHarmonyFreqs[this.stepIndex] * pitchFactor, now);
-
-      filter.type = 'lowpass';
-      filter.frequency.setValueAtTime(formantPreservation ? 1600 : 1600 * pitchFactor, now);
-
-      gain.gain.setValueAtTime(0.001, now);
-      gain.gain.exponentialRampToValueAtTime(backingGainVal * 0.9, now + 0.05);
-      gain.gain.exponentialRampToValueAtTime(0.0008, now + 0.42);
-
-      osc.connect(filter);
-      filter.connect(gain);
-      gain.connect(this.ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.44);
-    }
-
-    const instGainVal = getEffectiveGain('instrumental');
-    if (instGainVal > 0.001) {
-      const osc = this.ctx.createOscillator();
-      const gain = this.ctx.createGain();
-
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(bassFreqs[this.stepIndex] * pitchFactor, now);
-
-      gain.gain.setValueAtTime(0.001, now);
-      gain.gain.exponentialRampToValueAtTime(instGainVal * 1.35, now + 0.015);
-      gain.gain.exponentialRampToValueAtTime(0.0008, now + 0.2);
-
-      osc.connect(gain);
-      gain.connect(this.ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.21);
-    }
-
-    const reverbGainVal = getEffectiveGain('reverb_tail');
-    if (reverbGainVal > 0.001 && this.stepIndex % 4 === 0) {
-      const osc = this.ctx.createOscillator();
-      const gain = this.ctx.createGain();
-
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(leadMelodyFreqs[this.stepIndex] * 2 * pitchFactor, now);
-
-      gain.gain.setValueAtTime(0.0005, now);
-      gain.gain.exponentialRampToValueAtTime(reverbGainVal * 0.45, now + 0.12);
-      gain.gain.exponentialRampToValueAtTime(0.0005, now + 0.75);
-
-      osc.connect(gain);
-      gain.connect(this.ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.76);
-    }
-
-    const combined =
-      leadGainVal + backingGainVal + instGainVal + reverbGainVal;
-    return combined > 0.001 ? Math.max(-42, 20 * Math.log10(combined * 2.2)) : -60;
   }
 }

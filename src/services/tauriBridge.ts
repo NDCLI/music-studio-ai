@@ -175,3 +175,138 @@ export async function openLocalFolderViaRust(folderPath: string): Promise<void> 
   if (!isTauriDesktopRuntime()) return;
   await invokeRustCommand<void>('ipc_open_local_folder', { folderPath });
 }
+
+export interface RustLoadedTrackSummary {
+  file_name: string;
+  is_video_source: boolean;
+  sample_rate: number;
+  channels: number;
+  duration_sec: number;
+  detected_key: string;
+  detected_bpm: number;
+  waveform_peaks: number[];
+}
+
+export interface RustSeparationStemsPeaks {
+  lead_vocal: number[];
+  backing_vocal: number[];
+  instrumental: number[];
+  reverb_tail: number[];
+  execution_backend: string;
+}
+
+export interface RustSeparatedStemsWavB64 {
+  lead_vocal_b64: string;
+  backing_vocal_b64: string;
+  instrumental_b64: string;
+  reverb_tail_b64: string;
+}
+
+export function base64ToArrayBuffer(b64: string): ArrayBuffer {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    bytes[i] = bin.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+export function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+export async function pickAudioFileViaRust(): Promise<string | null> {
+  if (!isTauriDesktopRuntime()) return null;
+  return invokeRustCommand<string | null>('ipc_pick_audio_file');
+}
+
+export async function pickOnnxFileViaRust(): Promise<string | null> {
+  if (!isTauriDesktopRuntime()) return null;
+  return invokeRustCommand<string | null>('ipc_pick_onnx_file');
+}
+
+export async function importLocalOnnxViaRust(
+  sourcePath: string,
+  targetModelId?: string
+): Promise<RustCachedModelStatus | null> {
+  if (!isTauriDesktopRuntime()) return null;
+  return invokeRustCommand<RustCachedModelStatus>('ipc_import_local_onnx', {
+    sourcePath,
+    targetModelId: targetModelId ?? null,
+  });
+}
+
+export async function loadTrackViaRustBackend(
+  filePath: string
+): Promise<RustLoadedTrackSummary | null> {
+  if (!isTauriDesktopRuntime()) return null;
+  return invokeRustCommand<RustLoadedTrackSummary>('ipc_load_track', { filePath });
+}
+
+export async function loadAudioBytesViaRustBackend(
+  fileName: string,
+  arrayBuffer: ArrayBuffer
+): Promise<RustLoadedTrackSummary | null> {
+  if (!isTauriDesktopRuntime()) return null;
+  return invokeRustCommand<RustLoadedTrackSummary>('ipc_load_audio_bytes_b64', {
+    fileName,
+    audioB64: arrayBufferToBase64(arrayBuffer),
+  });
+}
+
+export async function readFileBytesViaRust(filePath: string): Promise<ArrayBuffer> {
+  const b64 = await invokeRustCommand<string>('ipc_read_file_base64', { filePath });
+  return base64ToArrayBuffer(b64);
+}
+
+export async function preparePreviewWavViaRust(): Promise<ArrayBuffer> {
+  const b64 = await invokeRustCommand<string>('ipc_prepare_preview_wav_b64');
+  return base64ToArrayBuffer(b64);
+}
+
+export async function runSeparationViaRustBackend(
+  mode: 'FastMdx' | 'ProRoformer',
+  useDirectml = true
+): Promise<RustSeparationStemsPeaks> {
+  return invokeRustCommand<RustSeparationStemsPeaks>('ipc_run_separation', {
+    mode,
+    useDirectml,
+  });
+}
+
+export async function getSeparatedStemsWavViaRust(): Promise<RustSeparatedStemsWavB64> {
+  return invokeRustCommand<RustSeparatedStemsWavB64>('ipc_export_separated_stems_b64');
+}
+
+export interface RustExportStemChannelParam {
+  role: 'LeadVocal' | 'BackingVocal' | 'Instrumental' | 'ReverbTail';
+  volume_percent: number;
+  pan: number;
+  muted: boolean;
+  solo: boolean;
+  formant_locked: boolean;
+}
+
+export async function exportAudioViaRustBackend(params: {
+  outputDir: string;
+  baseName: string;
+  target: 'MasterMix' | 'AllStems' | 'KaraokeBacking';
+  format: 'Wav16Bit' | 'Wav24Bit' | 'Wav32Float' | 'Flac24BitLossless';
+  stemParams: RustExportStemChannelParam[];
+  limiterEnabled: boolean;
+}): Promise<{ exported_paths: string[] }> {
+  return invokeRustCommand<{ exported_paths: string[] }>('ipc_export_audio', {
+    outputDir: params.outputDir,
+    baseName: params.baseName,
+    target: params.target,
+    format: params.format,
+    stemParams: params.stemParams,
+    limiterEnabled: params.limiterEnabled,
+  });
+}
