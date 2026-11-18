@@ -32,8 +32,107 @@ export function extractPeaksFromBuffer(buffer: AudioBuffer, count = 140): number
   return peaks;
 }
 
+function cubicHermiteAt(arr: Float32Array, pos: number): number {
+  const len = arr.length;
+  if (len === 0) return 0;
+  const clamped = Math.max(0, Math.min(len - 1, pos));
+  const i1 = Math.floor(clamped);
+  const frac = clamped - i1;
+  if (frac < 1e-6) return arr[i1];
+
+  const i0 = i1 > 0 ? i1 - 1 : 0;
+  const i2 = i1 + 1 < len ? i1 + 1 : len - 1;
+  const i3 = i1 + 2 < len ? i1 + 2 : len - 1;
+
+  const y0 = arr[i0];
+  const y1 = arr[i1];
+  const y2 = arr[i2];
+  const y3 = arr[i3];
+
+  const c0 = y1;
+  const c1 = 0.5 * (y2 - y0);
+  const c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+  const c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+
+  return ((c3 * frac + c2) * frac + c1) * frac + c0;
+}
+
+function softLimitStudioSample(sample: number, ceiling: number): number {
+  if (!Number.isFinite(sample)) return 0;
+  const abs = Math.abs(sample);
+  const knee = ceiling * 0.86;
+  if (abs <= knee) return sample;
+  const span = Math.max(1e-4, ceiling - knee);
+  const excess = abs - knee;
+  const compressed = knee + span * (excess / (excess + span));
+  return Math.sign(sample) * Math.min(ceiling, compressed);
+}
+
 /**
- * Real-time Multi-Stem & Granular Formant Pitch/Time Engine.
+ * Finds a local phase-aligned offset around `candidateCenter` that best correlates with
+ * the currently sounding reference grain at `refPos`, preventing WSOLA phase cancellation / double-attack splats.
+ */
+function findBestWsolaOffset(
+  monoRef: Float32Array,
+  refPos: number,
+  candidateCenter: number,
+  searchRadius = 320
+): number {
+  const len = monoRef.length;
+  const corrLen = 96;
+  const refStart = Math.floor(refPos);
+  if (refStart < 0 || refStart + corrLen >= len) return 0;
+
+  const minDelta = -searchRadius;
+  const maxDelta = searchRadius;
+  let bestDelta = 0;
+  let bestScore = -Infinity;
+
+  // Coarse 4-sample stride scan
+  for (let delta = minDelta; delta <= maxDelta; delta += 4) {
+    const candStart = Math.floor(candidateCenter) + delta;
+    if (candStart < 0 || candStart + corrLen >= len) continue;
+    let dot = 0;
+    let normCand = 1e-8;
+    for (let k = 0; k < corrLen; k += 2) {
+      const a = monoRef[refStart + k];
+      const b = monoRef[candStart + k];
+      dot += a * b;
+      normCand += b * b;
+    }
+    const score = dot / Math.sqrt(normCand);
+    if (score > bestScore) {
+      bestScore = score;
+      bestDelta = delta;
+    }
+  }
+
+  // Fine 1-sample refinement around coarse peak
+  const fineLo = Math.max(minDelta, bestDelta - 3);
+  const fineHi = Math.min(maxDelta, bestDelta + 3);
+  for (let delta = fineLo; delta <= fineHi; delta += 1) {
+    const candStart = Math.floor(candidateCenter) + delta;
+    if (candStart < 0 || candStart + corrLen >= len) continue;
+    let dot = 0;
+    let normCand = 1e-8;
+    for (let k = 0; k < corrLen; k += 2) {
+      const a = monoRef[refStart + k];
+      const b = monoRef[candStart + k];
+      dot += a * b;
+      normCand += b * b;
+    }
+    const score = dot / Math.sqrt(normCand);
+    if (score > bestScore) {
+      bestScore = score;
+      bestDelta = delta;
+    }
+  }
+
+  return bestDelta;
+}
+
+/**
+ * Real-time Multi-Stem & Phase-Locked WSOLA Pitch/Time Engine.
  * Operates exclusively on real decoded audio/video tracks and separated stems
  * with full-duration export (WAV 16/24-bit, WAV 32-bit Float, FLAC 24-bit).
  */
@@ -43,10 +142,27 @@ export class StudioPreviewAudioEngine {
   private customBuffer: AudioBuffer | null = null;
   private separatedStems: SeparatedStemsMap | null = null;
   private scriptProcessor: ScriptProcessorNode | null = null;
-  private formantFilterNode: BiquadFilterNode | null = null;
+  private uiRafId: number | null = null;
+  private lastUiFlushMs = 0;
+  private pendingDeltaSec = 0;
+  private latestPeakDb = -60;
   private playheadSample = 0;
-  private grainPhaseA = 0;
-  private grainPhaseB = 0.5;
+  private vocalPhaseA = 0;
+  private vocalSyncA = 0;
+  private vocalSyncB = 0;
+  private instPhaseA = 0;
+  private instSyncA = 0;
+  private instSyncB = 0;
+  private smoothPitchRatio = 1.0;
+  private bqZ1L = 0;
+  private bqZ2L = 0;
+  private bqZ1R = 0;
+  private bqZ2R = 0;
+  private smoothLeadGain = 1.0;
+  private smoothBackingGain = 1.0;
+  private smoothInstGain = 1.0;
+  private smoothReverbGain = 0.55;
+  private smoothMasterGain = 1.0;
   private masterGain = 1.0;
   private limiterEnabled = true;
 
@@ -147,13 +263,19 @@ export class StudioPreviewAudioEngine {
 
   public seekToSeconds(sec: number): void {
     if (this.customBuffer) {
+      const maxLen = this.separatedStems
+        ? this.separatedStems.instrumental.left.length
+        : this.customBuffer.length;
       this.playheadSample = Math.max(
         0,
-        Math.min(
-          this.customBuffer.length - 1,
-          Math.floor(sec * this.customBuffer.sampleRate)
-        )
+        Math.min(maxLen - 1, Math.floor(sec * this.customBuffer.sampleRate))
       );
+      this.vocalPhaseA = 0;
+      this.vocalSyncA = 0;
+      this.vocalSyncB = 0;
+      this.instPhaseA = 0;
+      this.instSyncA = 0;
+      this.instSyncB = 0;
     }
   }
 
@@ -173,6 +295,31 @@ export class StudioPreviewAudioEngine {
     this.startCustomBufferRealtimeEngine(getStems, getPitchSpeed, onTick);
   }
 
+  private computeFormantPeakingCoeffs(
+    sampleRate: number,
+    semitones: number,
+    enabled: boolean
+  ): [number, number, number, number, number] {
+    if (!enabled || Math.abs(semitones) < 0.05) {
+      return [1, 0, 0, 0, 0];
+    }
+    const gainDb = Math.max(-7.5, Math.min(7.5, -semitones * 0.72));
+    const A = Math.pow(10, gainDb / 40);
+    const w0 = (2 * Math.PI * 1120) / Math.max(8000, sampleRate);
+    const cosW0 = Math.cos(w0);
+    const alpha = Math.sin(w0) / (2 * 1.15);
+
+    const b0 = 1 + alpha * A;
+    const b1 = -2 * cosW0;
+    const b2 = 1 - alpha * A;
+    const a0 = 1 + alpha / A;
+    const a1 = -2 * cosW0;
+    const a2 = 1 - alpha / A;
+
+    const invA0 = 1 / a0;
+    return [b0 * invA0, b1 * invA0, b2 * invA0, a1 * invA0, a2 * invA0];
+  }
+
   private startCustomBufferRealtimeEngine(
     getStems: () => StemTrackState[],
     getPitchSpeed: () => PitchSpeedSettings,
@@ -183,16 +330,49 @@ export class StudioPreviewAudioEngine {
     const buffer = this.customBuffer;
     const chLeft = buffer.getChannelData(0);
     const chRight = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : chLeft;
-    const totalSamples = buffer.length;
     const sampleRate = buffer.sampleRate;
     const blockSize = 2048;
-    const grainSize = 2400;
+    const vocalGrainSize = 1600;
+    const instGrainSize = 1280;
+
+    // Initialize smooth gains to current target values so playback starts cleanly
+    const initStems = getStems();
+    const initAnySolo = initStems.some((s) => s.solo);
+    const readTargetGain = (stemsList: StemTrackState[], anySoloFlag: boolean, id: StemId) => {
+      const st = stemsList.find((x) => x.id === id);
+      if (!st || st.muted || (anySoloFlag && !st.solo)) return 0;
+      return st.volume / 100;
+    };
+    this.smoothLeadGain = readTargetGain(initStems, initAnySolo, 'lead_vocal');
+    this.smoothBackingGain = readTargetGain(initStems, initAnySolo, 'backing_vocal');
+    this.smoothInstGain = readTargetGain(initStems, initAnySolo, 'instrumental');
+    this.smoothReverbGain = readTargetGain(initStems, initAnySolo, 'reverb_tail');
+    this.smoothMasterGain = this.masterGain;
+
+    const initPitch = getPitchSpeed();
+    this.smoothPitchRatio = Math.pow(2, (initPitch.semitones + initPitch.cents / 100) / 12);
+    this.bqZ1L = 0;
+    this.bqZ2L = 0;
+    this.bqZ1R = 0;
+    this.bqZ2R = 0;
+    this.pendingDeltaSec = 0;
+    this.lastUiFlushMs = performance.now();
 
     const processor = this.ctx.createScriptProcessor(blockSize, 0, 2);
-    const formantFilter = this.ctx.createBiquadFilter();
-    formantFilter.type = 'peaking';
-    formantFilter.frequency.value = 1150;
-    formantFilter.Q.value = 1.4;
+
+    // Decoupled UI ticker (~15 fps) so React state updates never stall the audio callback
+    const scheduleUiFlush = () => {
+      if (!this.isPlaying) return;
+      const now = performance.now();
+      if (now - this.lastUiFlushMs >= 64 && this.pendingDeltaSec > 0) {
+        const delta = this.pendingDeltaSec;
+        this.pendingDeltaSec = 0;
+        this.lastUiFlushMs = now;
+        onTick(delta, this.latestPeakDb);
+      }
+      this.uiRafId = window.requestAnimationFrame(scheduleUiFlush);
+    };
+    this.uiRafId = window.requestAnimationFrame(scheduleUiFlush);
 
     processor.onaudioprocess = (event) => {
       if (!this.isPlaying) return;
@@ -204,104 +384,257 @@ export class StudioPreviewAudioEngine {
       const stems = getStems();
       const anySolo = stems.some((s) => s.solo);
 
-      const getStemGain = (id: StemId) => {
-        const st = stems.find((x) => x.id === id);
-        if (!st || st.muted || (anySolo && !st.solo)) return 0;
-        return st.volume / 100;
-      };
+      const targetLead = readTargetGain(stems, anySolo, 'lead_vocal');
+      const targetBacking = readTargetGain(stems, anySolo, 'backing_vocal');
+      const targetInst = readTargetGain(stems, anySolo, 'instrumental');
+      const targetReverb = readTargetGain(stems, anySolo, 'reverb_tail');
+      const targetMaster = this.masterGain;
 
-      const leadGain = getStemGain('lead_vocal');
-      const backingGain = getStemGain('backing_vocal');
-      const instGain = getStemGain('instrumental');
-      const reverbGain = getStemGain('reverb_tail');
-
-      const pitchRatio = Math.pow(2, (settings.semitones + settings.cents / 100) / 12);
+      const targetPitchRatio = Math.pow(2, (settings.semitones + settings.cents / 100) / 12);
       const speedRatio = Math.max(0.25, Math.min(2.0, settings.speed));
-      const grainRate = (pitchRatio - speedRatio) / grainSize;
-
-      if (settings.formantPreservation && Math.abs(settings.semitones) > 0) {
-        formantFilter.gain.value = -settings.semitones * 0.85;
-      } else {
-        formantFilter.gain.value = 0;
-      }
-
       const sep = this.separatedStems;
+      const activeTotalSamples = sep ? sep.instrumental.left.length : buffer.length;
+
+      const isUnityPitchSpeed =
+        Math.abs(targetPitchRatio - 1.0) < 1e-4 &&
+        Math.abs(this.smoothPitchRatio - 1.0) < 1e-4 &&
+        Math.abs(speedRatio - 1.0) < 1e-4;
+
+      const [b0, b1, b2, a1, a2] = this.computeFormantPeakingCoeffs(
+        sampleRate,
+        settings.semitones + settings.cents / 100,
+        settings.formantPreservation && !isUnityPitchSpeed
+      );
+
+      const gainAlpha = 0.003;
+      const pitchAlpha = 0.0025;
       let maxPeak = 0.0001;
 
+      const vocalRef = sep ? sep.lead_vocal.left : chLeft;
+      const instRef = sep ? sep.instrumental.left : chLeft;
+
       for (let i = 0; i < blockSize; i++) {
-        this.playheadSample += speedRatio;
-        if (this.playheadSample >= totalSamples - grainSize - 2) {
-          this.playheadSample = 0;
-        }
+        this.smoothLeadGain += (targetLead - this.smoothLeadGain) * gainAlpha;
+        this.smoothBackingGain += (targetBacking - this.smoothBackingGain) * gainAlpha;
+        this.smoothInstGain += (targetInst - this.smoothInstGain) * gainAlpha;
+        this.smoothReverbGain += (targetReverb - this.smoothReverbGain) * gainAlpha;
+        this.smoothMasterGain += (targetMaster - this.smoothMasterGain) * gainAlpha;
+        this.smoothPitchRatio += (targetPitchRatio - this.smoothPitchRatio) * pitchAlpha;
 
-        this.grainPhaseA = (this.grainPhaseA + grainRate + 1.0) % 1.0;
-        this.grainPhaseB = (this.grainPhaseA + 0.5) % 1.0;
+        let vocL = 0;
+        let vocR = 0;
+        let insL = 0;
+        let insR = 0;
 
-        const winA = 0.5 * (1 - Math.cos(2 * Math.PI * this.grainPhaseA));
-        const winB = 0.5 * (1 - Math.cos(2 * Math.PI * this.grainPhaseB));
+        if (isUnityPitchSpeed) {
+          this.vocalPhaseA = 0;
+          this.vocalSyncA = 0;
+          this.vocalSyncB = 0;
+          this.instPhaseA = 0;
+          this.instSyncA = 0;
+          this.instSyncB = 0;
 
-        const rawPosA = Math.min(
-          totalSamples - 2,
-          Math.max(0, this.playheadSample + this.grainPhaseA * grainSize)
-        );
-        const rawPosB = Math.min(
-          totalSamples - 2,
-          Math.max(0, this.playheadSample + this.grainPhaseB * grainSize)
-        );
-        const idxA = Math.floor(rawPosA);
-        const fracA = rawPosA - idxA;
-        const idxB = Math.floor(rawPosB);
-        const fracB = rawPosB - idxB;
-
-        const lerp = (arr: Float32Array, idx: number, f: number) =>
-          arr[idx] + (arr[idx + 1] - arr[idx]) * f;
-
-        let sumL = 0;
-        let sumR = 0;
-
-        if (sep) {
-          if (leadGain > 0.001) {
-            sumL += (lerp(sep.lead_vocal.left, idxA, fracA) * winA + lerp(sep.lead_vocal.left, idxB, fracB) * winB) * leadGain;
-            sumR += (lerp(sep.lead_vocal.right, idxA, fracA) * winA + lerp(sep.lead_vocal.right, idxB, fracB) * winB) * leadGain;
+          if (this.playheadSample >= activeTotalSamples - 2) {
+            this.playheadSample = 0;
           }
-          if (backingGain > 0.001) {
-            sumL += (lerp(sep.backing_vocal.left, idxA, fracA) * winA + lerp(sep.backing_vocal.left, idxB, fracB) * winB) * backingGain;
-            sumR += (lerp(sep.backing_vocal.right, idxA, fracA) * winA + lerp(sep.backing_vocal.right, idxB, fracB) * winB) * backingGain;
-          }
-          if (instGain > 0.001) {
-            sumL += (lerp(sep.instrumental.left, idxA, fracA) * winA + lerp(sep.instrumental.left, idxB, fracB) * winB) * instGain;
-            sumR += (lerp(sep.instrumental.right, idxA, fracA) * winA + lerp(sep.instrumental.right, idxB, fracB) * winB) * instGain;
-          }
-          if (reverbGain > 0.001) {
-            sumL += (lerp(sep.reverb_tail.left, idxA, fracA) * winA + lerp(sep.reverb_tail.left, idxB, fracB) * winB) * reverbGain;
-            sumR += (lerp(sep.reverb_tail.right, idxA, fracA) * winA + lerp(sep.reverb_tail.right, idxB, fracB) * winB) * reverbGain;
+          const pos = this.playheadSample;
+          this.playheadSample += 1;
+
+          if (sep) {
+            if (this.smoothLeadGain > 1e-4) {
+              vocL += cubicHermiteAt(sep.lead_vocal.left, pos) * this.smoothLeadGain;
+              vocR += cubicHermiteAt(sep.lead_vocal.right, pos) * this.smoothLeadGain;
+            }
+            if (this.smoothBackingGain > 1e-4) {
+              vocL += cubicHermiteAt(sep.backing_vocal.left, pos) * this.smoothBackingGain;
+              vocR += cubicHermiteAt(sep.backing_vocal.right, pos) * this.smoothBackingGain;
+            }
+            if (this.smoothInstGain > 1e-4) {
+              insL += cubicHermiteAt(sep.instrumental.left, pos) * this.smoothInstGain;
+              insR += cubicHermiteAt(sep.instrumental.right, pos) * this.smoothInstGain;
+            }
+            if (this.smoothReverbGain > 1e-4) {
+              insL += cubicHermiteAt(sep.reverb_tail.left, pos) * this.smoothReverbGain;
+              insR += cubicHermiteAt(sep.reverb_tail.right, pos) * this.smoothReverbGain;
+            }
+          } else {
+            const rawL = cubicHermiteAt(chLeft, pos);
+            const rawR = cubicHermiteAt(chRight, pos);
+            insL = rawL;
+            insR = rawR;
           }
         } else {
-          const rawL = lerp(chLeft, idxA, fracA) * winA + lerp(chLeft, idxB, fracB) * winB;
-          const rawR = lerp(chRight, idxA, fracA) * winA + lerp(chRight, idxB, fracB) * winB;
+          this.playheadSample += speedRatio;
+          if (this.playheadSample >= activeTotalSamples - vocalGrainSize - 480) {
+            this.playheadSample = 0;
+            this.vocalSyncA = 0;
+            this.vocalSyncB = 0;
+            this.instSyncA = 0;
+            this.instSyncB = 0;
+          }
 
-          const mid = 0.5 * (rawL + rawR);
-          const side = 0.5 * (rawL - rawR);
+          // 1. Phase-locked Vocal WSOLA stream
+          const vocRate = (this.smoothPitchRatio - speedRatio) / vocalGrainSize;
+          const prevVocA = this.vocalPhaseA;
+          let nextVocA = prevVocA + vocRate;
+          if (vocRate >= 0 && nextVocA >= 1.0) {
+            nextVocA -= Math.floor(nextVocA);
+            const refPosB = this.playheadSample + 0.5 * vocalGrainSize + this.vocalSyncB;
+            this.vocalSyncA = findBestWsolaOffset(
+              vocalRef,
+              refPosB,
+              this.playheadSample + nextVocA * vocalGrainSize,
+              360
+            );
+          } else if (vocRate < 0 && nextVocA < 0.0) {
+            nextVocA = ((nextVocA % 1.0) + 1.0) % 1.0;
+            const refPosB = this.playheadSample + 0.5 * vocalGrainSize + this.vocalSyncB;
+            this.vocalSyncA = findBestWsolaOffset(
+              vocalRef,
+              refPosB,
+              this.playheadSample + nextVocA * vocalGrainSize,
+              360
+            );
+          }
+          if (
+            (vocRate >= 0 && prevVocA < 0.5 && nextVocA >= 0.5) ||
+            (vocRate < 0 && prevVocA >= 0.5 && nextVocA < 0.5)
+          ) {
+            const nextVocB = (nextVocA + 0.5) % 1.0;
+            const refPosA = this.playheadSample + 0.5 * vocalGrainSize + this.vocalSyncA;
+            this.vocalSyncB = findBestWsolaOffset(
+              vocalRef,
+              refPosA,
+              this.playheadSample + nextVocB * vocalGrainSize,
+              360
+            );
+          }
+          this.vocalPhaseA = nextVocA;
+          const vocPhaseB = (nextVocA + 0.5) % 1.0;
+          const vWinA = 0.5 * (1 - Math.cos(2 * Math.PI * nextVocA));
+          const vWinB = 0.5 * (1 - Math.cos(2 * Math.PI * vocPhaseB));
+          const vPosA = this.playheadSample + nextVocA * vocalGrainSize + this.vocalSyncA;
+          const vPosB = this.playheadSample + vocPhaseB * vocalGrainSize + this.vocalSyncB;
 
-          const vocalComponent = mid * leadGain * 0.75;
-          const backingComponentL = side * backingGain * 0.9;
-          const backingComponentR = -side * backingGain * 0.9;
-          const instComponentL = (rawL - mid * 0.55) * instGain;
-          const instComponentR = (rawR - mid * 0.55) * instGain;
-          const revComponent = side * reverbGain * 0.35;
+          // 2. Phase-locked Instrumental WSOLA stream (tighter grain preserves drum attacks)
+          const insRate = (this.smoothPitchRatio - speedRatio) / instGrainSize;
+          const prevInsA = this.instPhaseA;
+          let nextInsA = prevInsA + insRate;
+          if (insRate >= 0 && nextInsA >= 1.0) {
+            nextInsA -= Math.floor(nextInsA);
+            const refPosB = this.playheadSample + 0.5 * instGrainSize + this.instSyncB;
+            this.instSyncA = findBestWsolaOffset(
+              instRef,
+              refPosB,
+              this.playheadSample + nextInsA * instGrainSize,
+              300
+            );
+          } else if (insRate < 0 && nextInsA < 0.0) {
+            nextInsA = ((nextInsA % 1.0) + 1.0) % 1.0;
+            const refPosB = this.playheadSample + 0.5 * instGrainSize + this.instSyncB;
+            this.instSyncA = findBestWsolaOffset(
+              instRef,
+              refPosB,
+              this.playheadSample + nextInsA * instGrainSize,
+              300
+            );
+          }
+          if (
+            (insRate >= 0 && prevInsA < 0.5 && nextInsA >= 0.5) ||
+            (insRate < 0 && prevInsA >= 0.5 && nextInsA < 0.5)
+          ) {
+            const nextInsB = (nextInsA + 0.5) % 1.0;
+            const refPosA = this.playheadSample + 0.5 * instGrainSize + this.instSyncA;
+            this.instSyncB = findBestWsolaOffset(
+              instRef,
+              refPosA,
+              this.playheadSample + nextInsB * instGrainSize,
+              300
+            );
+          }
+          this.instPhaseA = nextInsA;
+          const insPhaseB = (nextInsA + 0.5) % 1.0;
+          const iWinA = 0.5 * (1 - Math.cos(2 * Math.PI * nextInsA));
+          const iWinB = 0.5 * (1 - Math.cos(2 * Math.PI * insPhaseB));
+          const iPosA = this.playheadSample + nextInsA * instGrainSize + this.instSyncA;
+          const iPosB = this.playheadSample + insPhaseB * instGrainSize + this.instSyncB;
 
-          sumL = vocalComponent + backingComponentL + instComponentL + revComponent;
-          sumR = vocalComponent + backingComponentR + instComponentR - revComponent;
+          if (sep) {
+            if (this.smoothLeadGain > 1e-4) {
+              vocL +=
+                (cubicHermiteAt(sep.lead_vocal.left, vPosA) * vWinA +
+                  cubicHermiteAt(sep.lead_vocal.left, vPosB) * vWinB) *
+                this.smoothLeadGain;
+              vocR +=
+                (cubicHermiteAt(sep.lead_vocal.right, vPosA) * vWinA +
+                  cubicHermiteAt(sep.lead_vocal.right, vPosB) * vWinB) *
+                this.smoothLeadGain;
+            }
+            if (this.smoothBackingGain > 1e-4) {
+              vocL +=
+                (cubicHermiteAt(sep.backing_vocal.left, vPosA) * vWinA +
+                  cubicHermiteAt(sep.backing_vocal.left, vPosB) * vWinB) *
+                this.smoothBackingGain;
+              vocR +=
+                (cubicHermiteAt(sep.backing_vocal.right, vPosA) * vWinA +
+                  cubicHermiteAt(sep.backing_vocal.right, vPosB) * vWinB) *
+                this.smoothBackingGain;
+            }
+            if (this.smoothInstGain > 1e-4) {
+              insL +=
+                (cubicHermiteAt(sep.instrumental.left, iPosA) * iWinA +
+                  cubicHermiteAt(sep.instrumental.left, iPosB) * iWinB) *
+                this.smoothInstGain;
+              insR +=
+                (cubicHermiteAt(sep.instrumental.right, iPosA) * iWinA +
+                  cubicHermiteAt(sep.instrumental.right, iPosB) * iWinB) *
+                this.smoothInstGain;
+            }
+            if (this.smoothReverbGain > 1e-4) {
+              insL +=
+                (cubicHermiteAt(sep.reverb_tail.left, iPosA) * iWinA +
+                  cubicHermiteAt(sep.reverb_tail.left, iPosB) * iWinB) *
+                this.smoothReverbGain;
+              insR +=
+                (cubicHermiteAt(sep.reverb_tail.right, iPosA) * iWinA +
+                  cubicHermiteAt(sep.reverb_tail.right, iPosB) * iWinB) *
+                this.smoothReverbGain;
+            }
+          } else {
+            const rawL =
+              cubicHermiteAt(chLeft, iPosA) * iWinA + cubicHermiteAt(chLeft, iPosB) * iWinB;
+            const rawR =
+              cubicHermiteAt(chRight, iPosA) * iWinA + cubicHermiteAt(chRight, iPosB) * iWinB;
+            if (settings.formantPreservation) {
+              const mid = 0.5 * (rawL + rawR);
+              const side = 0.5 * (rawL - rawR);
+              vocL = mid;
+              vocR = mid;
+              insL = side;
+              insR = -side;
+            } else {
+              insL = rawL;
+              insR = rawR;
+            }
+          }
+
+          // Apply Formant EQ exclusively to the Vocal branch so drums/guitars stay crisp
+          const filtVocL = b0 * vocL + this.bqZ1L;
+          this.bqZ1L = b1 * vocL - a1 * filtVocL + this.bqZ2L;
+          this.bqZ2L = b2 * vocL - a2 * filtVocL;
+          vocL = filtVocL;
+
+          const filtVocR = b0 * vocR + this.bqZ1R;
+          this.bqZ1R = b1 * vocR - a1 * filtVocR + this.bqZ2R;
+          this.bqZ2R = b2 * vocR - a2 * filtVocR;
+          vocR = filtVocR;
         }
 
-        const scaledL = sumL * this.masterGain;
-        const scaledR = sumR * this.masterGain;
-        const mixL = this.limiterEnabled
-          ? Math.max(-0.966, Math.min(0.966, scaledL))
-          : Math.max(-1.0, Math.min(1.0, scaledL));
-        const mixR = this.limiterEnabled
-          ? Math.max(-0.966, Math.min(0.966, scaledR))
-          : Math.max(-1.0, Math.min(1.0, scaledR));
+        const scaledL = (vocL + insL) * this.smoothMasterGain;
+        const scaledR = (vocR + insR) * this.smoothMasterGain;
+        const ceiling = this.limiterEnabled ? 0.966 : 0.999;
+        const mixL = softLimitStudioSample(scaledL, ceiling);
+        const mixR = softLimitStudioSample(scaledR, ceiling);
 
         outL[i] = mixL;
         outR[i] = mixR;
@@ -310,26 +643,31 @@ export class StudioPreviewAudioEngine {
         if (absMax > maxPeak) maxPeak = absMax;
       }
 
-      const db = Math.max(-60, 20 * Math.log10(maxPeak));
-      onTick((blockSize / sampleRate) * speedRatio, db);
+      this.latestPeakDb = Math.max(-60, 20 * Math.log10(maxPeak));
+      this.pendingDeltaSec += (blockSize / sampleRate) * speedRatio;
+      // Background-tab safety flush when requestAnimationFrame is throttled
+      if (this.pendingDeltaSec >= 0.25) {
+        const delta = this.pendingDeltaSec;
+        this.pendingDeltaSec = 0;
+        this.lastUiFlushMs = performance.now();
+        onTick(delta, this.latestPeakDb);
+      }
     };
 
-    processor.connect(formantFilter);
-    formantFilter.connect(this.ctx.destination);
+    processor.connect(this.ctx.destination);
     this.scriptProcessor = processor;
-    this.formantFilterNode = formantFilter;
   }
 
   public stop(): void {
     this.isPlaying = false;
+    if (this.uiRafId !== null) {
+      window.cancelAnimationFrame(this.uiRafId);
+      this.uiRafId = null;
+    }
     if (this.scriptProcessor) {
       this.scriptProcessor.disconnect();
       this.scriptProcessor.onaudioprocess = null;
       this.scriptProcessor = null;
-    }
-    if (this.formantFilterNode) {
-      this.formantFilterNode.disconnect();
-      this.formantFilterNode = null;
     }
   }
 
@@ -444,53 +782,191 @@ export class StudioPreviewAudioEngine {
         }
       } else {
         for (let i = 0; i < outFrames; i++) {
-          const l = rawL[i];
-          const r = rawR[i];
-          const mid = 0.5 * (l + r);
-          const side = 0.5 * (l - r);
-          outL[i] = mid * leadGain * 0.75 + side * backingGain * 0.9 + (l - mid * 0.55) * instGain + side * reverbGain * 0.35;
-          outR[i] = mid * leadGain * 0.75 - side * backingGain * 0.9 + (r - mid * 0.55) * instGain - side * reverbGain * 0.35;
+          const idx = Math.min(srcLen - 1, i);
+          outL[i] = rawL[idx] * this.masterGain;
+          outR[i] = rawR[idx] * this.masterGain;
         }
       }
       return encodeStereoAudioBlob(outL, outR, sampleRate, format);
     }
 
-    // Full-length Granular Hann Overlap-Add Pitch + Time rendering (preserves true duration / speedRatio)
-    const grainSize = 2400;
-    const grainRate = (pitchRatio - speedRatio) / grainSize;
+    // Full-length Dual-Stream Phase-Locked WSOLA rendering with Vocal-Only Formant Compensation
+    const vocalGrainSize = 1600;
+    const instGrainSize = 1280;
+    const vocRate = (pitchRatio - speedRatio) / vocalGrainSize;
+    const insRate = (pitchRatio - speedRatio) / instGrainSize;
+    const vocalRef = sep ? sep.lead_vocal.left : rawL;
+    const instRef = sep ? sep.instrumental.left : rawL;
+    const [b0, b1, b2, a1, a2] = this.computeFormantPeakingCoeffs(
+      sampleRate,
+      settings.semitones + settings.cents / 100,
+      settings.formantPreservation
+    );
+
     let playhead = 0;
-    let grainPhaseA = 0;
+    let vocPhaseA = 0;
+    let vocSyncA = 0;
+    let vocSyncB = 0;
+    let insPhaseA = 0;
+    let insSyncA = 0;
+    let insSyncB = 0;
+    let z1L = 0;
+    let z2L = 0;
+    let z1R = 0;
+    let z2R = 0;
 
     for (let i = 0; i < outFrames; i++) {
-      const grainPhaseB = (grainPhaseA + 0.5) % 1.0;
-      const winA = 0.5 * (1 - Math.cos(2 * Math.PI * grainPhaseA));
-      const winB = 0.5 * (1 - Math.cos(2 * Math.PI * grainPhaseB));
+      const prevVocA = vocPhaseA;
+      let nextVocA = prevVocA + vocRate;
+      if (vocRate >= 0 && nextVocA >= 1.0) {
+        nextVocA -= Math.floor(nextVocA);
+        vocSyncA = findBestWsolaOffset(
+          vocalRef,
+          playhead + 0.5 * vocalGrainSize + vocSyncB,
+          playhead + nextVocA * vocalGrainSize,
+          360
+        );
+      } else if (vocRate < 0 && nextVocA < 0.0) {
+        nextVocA = ((nextVocA % 1.0) + 1.0) % 1.0;
+        vocSyncA = findBestWsolaOffset(
+          vocalRef,
+          playhead + 0.5 * vocalGrainSize + vocSyncB,
+          playhead + nextVocA * vocalGrainSize,
+          360
+        );
+      }
+      if (
+        (vocRate >= 0 && prevVocA < 0.5 && nextVocA >= 0.5) ||
+        (vocRate < 0 && prevVocA >= 0.5 && nextVocA < 0.5)
+      ) {
+        const nextVocB = (nextVocA + 0.5) % 1.0;
+        vocSyncB = findBestWsolaOffset(
+          vocalRef,
+          playhead + 0.5 * vocalGrainSize + vocSyncA,
+          playhead + nextVocB * vocalGrainSize,
+          360
+        );
+      }
+      vocPhaseA = nextVocA;
+      const vocPhaseB = (nextVocA + 0.5) % 1.0;
+      const vWinA = 0.5 * (1 - Math.cos(2 * Math.PI * nextVocA));
+      const vWinB = 0.5 * (1 - Math.cos(2 * Math.PI * vocPhaseB));
+      const vPosA = playhead + nextVocA * vocalGrainSize + vocSyncA;
+      const vPosB = playhead + vocPhaseB * vocalGrainSize + vocSyncB;
 
-      const idxA = Math.min(srcLen - 1, Math.max(0, Math.floor(playhead + grainPhaseA * grainSize)));
-      const idxB = Math.min(srcLen - 1, Math.max(0, Math.floor(playhead + grainPhaseB * grainSize)));
+      const prevInsA = insPhaseA;
+      let nextInsA = prevInsA + insRate;
+      if (insRate >= 0 && nextInsA >= 1.0) {
+        nextInsA -= Math.floor(nextInsA);
+        insSyncA = findBestWsolaOffset(
+          instRef,
+          playhead + 0.5 * instGrainSize + insSyncB,
+          playhead + nextInsA * instGrainSize,
+          300
+        );
+      } else if (insRate < 0 && nextInsA < 0.0) {
+        nextInsA = ((nextInsA % 1.0) + 1.0) % 1.0;
+        insSyncA = findBestWsolaOffset(
+          instRef,
+          playhead + 0.5 * instGrainSize + insSyncB,
+          playhead + nextInsA * instGrainSize,
+          300
+        );
+      }
+      if (
+        (insRate >= 0 && prevInsA < 0.5 && nextInsA >= 0.5) ||
+        (insRate < 0 && prevInsA >= 0.5 && nextInsA < 0.5)
+      ) {
+        const nextInsB = (nextInsA + 0.5) % 1.0;
+        insSyncB = findBestWsolaOffset(
+          instRef,
+          playhead + 0.5 * instGrainSize + insSyncA,
+          playhead + nextInsB * instGrainSize,
+          300
+        );
+      }
+      insPhaseA = nextInsA;
+      const insPhaseB = (nextInsA + 0.5) % 1.0;
+      const iWinA = 0.5 * (1 - Math.cos(2 * Math.PI * nextInsA));
+      const iWinB = 0.5 * (1 - Math.cos(2 * Math.PI * insPhaseB));
+      const iPosA = playhead + nextInsA * instGrainSize + insSyncA;
+      const iPosB = playhead + insPhaseB * instGrainSize + insSyncB;
+
+      let vocL = 0;
+      let vocR = 0;
+      let insL = 0;
+      let insR = 0;
 
       if (sep) {
-        outL[i] =
-          (sep.lead_vocal.left[idxA] * winA + sep.lead_vocal.left[idxB] * winB) * leadGain +
-          (sep.backing_vocal.left[idxA] * winA + sep.backing_vocal.left[idxB] * winB) * backingGain +
-          (sep.instrumental.left[idxA] * winA + sep.instrumental.left[idxB] * winB) * instGain +
-          (sep.reverb_tail.left[idxA] * winA + sep.reverb_tail.left[idxB] * winB) * reverbGain;
-        outR[i] =
-          (sep.lead_vocal.right[idxA] * winA + sep.lead_vocal.right[idxB] * winB) * leadGain +
-          (sep.backing_vocal.right[idxA] * winA + sep.backing_vocal.right[idxB] * winB) * backingGain +
-          (sep.instrumental.right[idxA] * winA + sep.instrumental.right[idxB] * winB) * instGain +
-          (sep.reverb_tail.right[idxA] * winA + sep.reverb_tail.right[idxB] * winB) * reverbGain;
+        if (leadGain > 1e-4) {
+          vocL +=
+            (cubicHermiteAt(sep.lead_vocal.left, vPosA) * vWinA +
+              cubicHermiteAt(sep.lead_vocal.left, vPosB) * vWinB) *
+            leadGain;
+          vocR +=
+            (cubicHermiteAt(sep.lead_vocal.right, vPosA) * vWinA +
+              cubicHermiteAt(sep.lead_vocal.right, vPosB) * vWinB) *
+            leadGain;
+        }
+        if (backingGain > 1e-4) {
+          vocL +=
+            (cubicHermiteAt(sep.backing_vocal.left, vPosA) * vWinA +
+              cubicHermiteAt(sep.backing_vocal.left, vPosB) * vWinB) *
+            backingGain;
+          vocR +=
+            (cubicHermiteAt(sep.backing_vocal.right, vPosA) * vWinA +
+              cubicHermiteAt(sep.backing_vocal.right, vPosB) * vWinB) *
+            backingGain;
+        }
+        if (instGain > 1e-4) {
+          insL +=
+            (cubicHermiteAt(sep.instrumental.left, iPosA) * iWinA +
+              cubicHermiteAt(sep.instrumental.left, iPosB) * iWinB) *
+            instGain;
+          insR +=
+            (cubicHermiteAt(sep.instrumental.right, iPosA) * iWinA +
+              cubicHermiteAt(sep.instrumental.right, iPosB) * iWinB) *
+            instGain;
+        }
+        if (reverbGain > 1e-4) {
+          insL +=
+            (cubicHermiteAt(sep.reverb_tail.left, iPosA) * iWinA +
+              cubicHermiteAt(sep.reverb_tail.left, iPosB) * iWinB) *
+            reverbGain;
+          insR +=
+            (cubicHermiteAt(sep.reverb_tail.right, iPosA) * iWinA +
+              cubicHermiteAt(sep.reverb_tail.right, iPosB) * iWinB) *
+            reverbGain;
+        }
       } else {
-        const l = rawL[idxA] * winA + rawL[idxB] * winB;
-        const r = rawR[idxA] * winA + rawR[idxB] * winB;
-        const mid = 0.5 * (l + r);
-        const side = 0.5 * (l - r);
-        outL[i] = mid * leadGain * 0.75 + side * backingGain * 0.9 + (l - mid * 0.55) * instGain + side * reverbGain * 0.35;
-        outR[i] = mid * leadGain * 0.75 - side * backingGain * 0.9 + (r - mid * 0.55) * instGain - side * reverbGain * 0.35;
+        const l = cubicHermiteAt(rawL, iPosA) * iWinA + cubicHermiteAt(rawL, iPosB) * iWinB;
+        const r = cubicHermiteAt(rawR, iPosA) * iWinA + cubicHermiteAt(rawR, iPosB) * iWinB;
+        if (settings.formantPreservation) {
+          const mid = 0.5 * (l + r);
+          const side = 0.5 * (l - r);
+          vocL = mid;
+          vocR = mid;
+          insL = side;
+          insR = -side;
+        } else {
+          insL = l;
+          insR = r;
+        }
       }
 
+      const filtVocL = b0 * vocL + z1L;
+      z1L = b1 * vocL - a1 * filtVocL + z2L;
+      z2L = b2 * vocL - a2 * filtVocL;
+      vocL = filtVocL;
+
+      const filtVocR = b0 * vocR + z1R;
+      z1R = b1 * vocR - a1 * filtVocR + z2R;
+      z2R = b2 * vocR - a2 * filtVocR;
+      vocR = filtVocR;
+
+      outL[i] = (vocL + insL) * this.masterGain;
+      outR[i] = (vocR + insR) * this.masterGain;
       playhead += speedRatio;
-      grainPhaseA = (grainPhaseA + grainRate + 1.0) % 1.0;
     }
 
     return encodeStereoAudioBlob(outL, outR, sampleRate, format);

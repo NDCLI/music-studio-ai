@@ -284,6 +284,23 @@ pub fn export_audio_file<P: AsRef<Path>>(
     }
 }
 
+/// Soft-limits an audio sample smoothly into `[-1.0, 1.0]` without hard square-wave clipping.
+#[inline]
+fn soft_limit_sample(s: f32) -> f32 {
+    if !s.is_finite() {
+        return 0.0;
+    }
+    let abs = s.abs();
+    let ceiling = 0.975_f32;
+    let limited = if abs > ceiling {
+        let excess = abs - ceiling;
+        s.signum() * (ceiling + (1.0 - ceiling) * (excess / (excess + (1.0 - ceiling)))).min(0.9999)
+    } else {
+        s
+    };
+    limited.clamp(-1.0, 1.0)
+}
+
 /// Encodes a stereo buffer into in-memory 16-bit PCM WAV bytes for low-overhead IPC preview transfer.
 pub fn encode_wav_16bit_bytes(buffer: &StereoAudioBuffer) -> Result<Vec<u8>, String> {
     let frames = buffer.num_frames();
@@ -303,6 +320,54 @@ pub fn encode_wav_16bit_bytes(buffer: &StereoAudioBuffer) -> Result<Vec<u8>, Str
             .map_err(|e| format!("Failed to finalize WAV buffer: {}", e))?;
     }
     Ok(bytes)
+}
+
+/// Encodes a stereo buffer into standard 44-byte RIFF `WAVE_FORMAT_PCM` 24-bit WAV bytes
+/// for studio-grade 144 dB dynamic range WebView stem transfer without quantization chatter.
+pub fn encode_wav_24bit_bytes(buffer: &StereoAudioBuffer) -> Result<Vec<u8>, String> {
+    let frames = buffer.num_frames();
+    let block_align: usize = 6; // 2 channels * 3 bytes (24-bit)
+    let data_bytes = frames
+        .checked_mul(block_align)
+        .ok_or_else(|| "WAV buffer too large".to_string())?;
+    if data_bytes > (u32::MAX as usize - 36) {
+        return Err("WAV buffer exceeds 4 GB RIFF limit".to_string());
+    }
+
+    let mut out = Vec::with_capacity(44 + data_bytes);
+    let data_len_u32 = data_bytes as u32;
+    let riff_size = 36_u32 + data_len_u32;
+    let byte_rate = buffer.sample_rate.saturating_mul(block_align as u32);
+
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&riff_size.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16_u32.to_le_bytes());
+    out.extend_from_slice(&1_u16.to_le_bytes()); // WAVE_FORMAT_PCM
+    out.extend_from_slice(&2_u16.to_le_bytes()); // Stereo
+    out.extend_from_slice(&buffer.sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&(block_align as u16).to_le_bytes());
+    out.extend_from_slice(&24_u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len_u32.to_le_bytes());
+
+    let max_i24 = 8_388_607.0_f32;
+    for i in 0..frames {
+        let l = (soft_limit_sample(buffer.left[i]) * max_i24).round() as i32;
+        let r = (soft_limit_sample(buffer.right[i]) * max_i24).round() as i32;
+        let lb = l.to_le_bytes();
+        let rb = r.to_le_bytes();
+        out.push(lb[0]);
+        out.push(lb[1]);
+        out.push(lb[2]);
+        out.push(rb[0]);
+        out.push(rb[1]);
+        out.push(rb[2]);
+    }
+
+    Ok(out)
 }
 
 fn export_wav_internal<P: AsRef<Path>>(
@@ -337,9 +402,22 @@ fn write_wav_samples<W: Write + Seek>(
     let frames = buffer.num_frames();
     match (bits_per_sample, sample_format) {
         (16, SampleFormat::Int) => {
+            // Rectangular/triangular dithered rounding prevents low-level crossover distortion
+            let mut dither_state: u32 = 0x1234_5678;
+            let mut next_tpdf = || -> f32 {
+                dither_state = dither_state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let r1 = (dither_state as f32) * (1.0 / 4_294_967_296.0);
+                dither_state = dither_state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let r2 = (dither_state as f32) * (1.0 / 4_294_967_296.0);
+                (r1 - r2) * 0.5
+            };
             for i in 0..frames {
-                let l = (buffer.left[i].clamp(-1.0, 1.0) * 32_767.0) as i16;
-                let r = (buffer.right[i].clamp(-1.0, 1.0) * 32_767.0) as i16;
+                let l = (soft_limit_sample(buffer.left[i]) * 32_766.0 + next_tpdf())
+                    .round()
+                    .clamp(-32_768.0, 32_767.0) as i16;
+                let r = (soft_limit_sample(buffer.right[i]) * 32_766.0 + next_tpdf())
+                    .round()
+                    .clamp(-32_768.0, 32_767.0) as i16;
                 writer.write_sample(l).map_err(|e| e.to_string())?;
                 writer.write_sample(r).map_err(|e| e.to_string())?;
             }
@@ -347,8 +425,8 @@ fn write_wav_samples<W: Write + Seek>(
         (24, SampleFormat::Int) => {
             let max_i24 = 8_388_607.0_f32;
             for i in 0..frames {
-                let l = (buffer.left[i].clamp(-1.0, 1.0) * max_i24) as i32;
-                let r = (buffer.right[i].clamp(-1.0, 1.0) * max_i24) as i32;
+                let l = (soft_limit_sample(buffer.left[i]) * max_i24).round() as i32;
+                let r = (soft_limit_sample(buffer.right[i]) * max_i24).round() as i32;
                 writer.write_sample(l).map_err(|e| e.to_string())?;
                 writer.write_sample(r).map_err(|e| e.to_string())?;
             }
@@ -356,10 +434,10 @@ fn write_wav_samples<W: Write + Seek>(
         _ => {
             for i in 0..frames {
                 writer
-                    .write_sample(buffer.left[i].clamp(-1.0, 1.0))
+                    .write_sample(soft_limit_sample(buffer.left[i]))
                     .map_err(|e| e.to_string())?;
                 writer
-                    .write_sample(buffer.right[i].clamp(-1.0, 1.0))
+                    .write_sample(soft_limit_sample(buffer.right[i]))
                     .map_err(|e| e.to_string())?;
             }
         }

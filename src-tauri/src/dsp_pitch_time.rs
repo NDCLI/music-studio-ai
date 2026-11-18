@@ -77,14 +77,8 @@ pub fn process_stereo_pitch_and_speed(
         return rb_out;
     }
 
-    let mut left_out = process_channel_vocoder(
+    let (mut left_out, mut right_out) = process_stereo_vocoder(
         &input.left,
-        pitch_ratio,
-        speed_ratio,
-        config.preserve_formants,
-        config.transient_crisp_lock,
-    );
-    let mut right_out = process_channel_vocoder(
         &input.right,
         pitch_ratio,
         speed_ratio,
@@ -216,7 +210,21 @@ fn try_rubberband_r3_pitch_and_speed(
     result
 }
 
-/// Core Spectral Phase Vocoder with Formant Envelope Preservation and Transient Phase Reset.
+#[inline]
+fn wrap_phase_pi(angle: f32) -> f32 {
+    (angle + PI).rem_euclid(2.0 * PI) - PI
+}
+
+#[inline]
+fn vocoder_smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    if edge1 <= edge0 {
+        return if x >= edge0 { 1.0 } else { 0.0 };
+    }
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Single-channel wrapper delegating to the phase-coherent stereo vocoder.
 pub fn process_channel_vocoder(
     samples: &[f32],
     pitch_ratio: f32,
@@ -224,15 +232,56 @@ pub fn process_channel_vocoder(
     preserve_formants: bool,
     transient_lock: bool,
 ) -> Vec<f32> {
-    if samples.len() < VOCODER_FFT_SIZE {
-        return samples.to_vec();
+    let (left, _) = process_stereo_vocoder(
+        samples,
+        samples,
+        pitch_ratio,
+        speed_ratio,
+        preserve_formants,
+        transient_lock,
+    );
+    left
+}
+
+/// Stereo Phase-Coherent Spectral Vocoder with:
+/// - Exact fractional analysis hop tracking (eliminates hop-quantization drift & beating)
+/// - Mirror-reflected boundary padding (preserves full duration to the last sample)
+/// - Inter-Channel Phase Difference (ICPD) locking (keeps centered kick/bass/vocals rock-solid)
+/// - Sub-band >350 Hz soft transient alignment (eliminates low-end phase-reset "splat/bẹp" pops)
+/// - Temporal Formant envelope smoothing + Anti-Aliasing rolloff prior to pitch resampling
+pub fn process_stereo_vocoder(
+    left_samples: &[f32],
+    right_samples: &[f32],
+    pitch_ratio: f32,
+    speed_ratio: f32,
+    preserve_formants: bool,
+    transient_lock: bool,
+) -> (Vec<f32>, Vec<f32>) {
+    let orig_len = left_samples.len().min(right_samples.len());
+    if orig_len < VOCODER_FFT_SIZE {
+        return (
+            left_samples[..orig_len].to_vec(),
+            right_samples[..orig_len].to_vec(),
+        );
     }
 
-    // Resampling by pitch_ratio scales duration by 1 / pitch_ratio,
-    // so the vocoder must first scale duration by pitch_ratio / speed_ratio.
-    let time_stretch = pitch_ratio / speed_ratio;
-    let analysis_hop = ((VOCODER_SYNTH_HOP as f32) / time_stretch).round().max(1.0) as usize;
+    let time_stretch = (pitch_ratio as f64) / (speed_ratio as f64);
+    let analysis_hop_f64 = (VOCODER_SYNTH_HOP as f64) / time_stretch;
+    let target_stretched_frames = ((orig_len as f64) * time_stretch).round().max(1.0) as usize;
+    let target_final_frames = ((orig_len as f64) / (speed_ratio as f64)).round().max(1.0) as usize;
     let num_bins = VOCODER_FFT_SIZE / 2 + 1;
+    let pad = VOCODER_FFT_SIZE / 2;
+
+    let pad_l = crate::ai_separator::reflect_pad_slice(
+        &left_samples[..orig_len],
+        pad,
+        pad + VOCODER_FFT_SIZE * 2,
+    );
+    let pad_r = crate::ai_separator::reflect_pad_slice(
+        &right_samples[..orig_len],
+        pad,
+        pad + VOCODER_FFT_SIZE * 2,
+    );
 
     let mut planner = RealFftPlanner::<f32>::new();
     let r2c = planner.plan_fft_forward(VOCODER_FFT_SIZE);
@@ -242,57 +291,112 @@ pub fn process_channel_vocoder(
         .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / VOCODER_FFT_SIZE as f32).cos()))
         .collect();
 
-    let mut prev_analysis_phase = vec![0.0_f32; num_bins];
-    let mut sum_synthesis_phase = vec![0.0_f32; num_bins];
-    let mut prev_magnitudes = vec![0.0_f32; num_bins];
+    let mut prev_phase_l = vec![0.0_f32; num_bins];
+    let mut prev_phase_r = vec![0.0_f32; num_bins];
+    let mut sum_synth_phase_l = vec![0.0_f32; num_bins];
+    let mut sum_synth_phase_r = vec![0.0_f32; num_bins];
+    let mut prev_joint_mag = vec![0.0_f32; num_bins];
+    let mut smooth_env: Vec<f32> = Vec::new();
 
-    let estimated_stretched_len =
-        ((samples.len() as f32) * time_stretch) as usize + VOCODER_FFT_SIZE * 2;
-    let mut stretched_buf = vec![0.0_f32; estimated_stretched_len];
-    let mut window_norm = vec![0.0_f32; estimated_stretched_len];
+    let total_synth_steps = (target_stretched_frames + pad) / VOCODER_SYNTH_HOP + 2;
+    let buf_len = total_synth_steps * VOCODER_SYNTH_HOP + VOCODER_FFT_SIZE;
+    let mut stretched_l = vec![0.0_f32; buf_len];
+    let mut stretched_r = vec![0.0_f32; buf_len];
+    let mut window_norm = vec![0.0_f32; buf_len];
 
-    let mut time_in = vec![0.0_f32; VOCODER_FFT_SIZE];
-    let mut spectrum = r2c.make_output_vec();
-    let mut synth_spectrum = vec![Complex::new(0.0_f32, 0.0_f32); num_bins];
-    let mut time_out = c2r.make_output_vec();
+    let mut time_in_l = vec![0.0_f32; VOCODER_FFT_SIZE];
+    let mut time_in_r = vec![0.0_f32; VOCODER_FFT_SIZE];
+    let mut spec_l = r2c.make_output_vec();
+    let mut spec_r = r2c.make_output_vec();
+    let mut synth_l = vec![Complex::new(0.0_f32, 0.0_f32); num_bins];
+    let mut synth_r = vec![Complex::new(0.0_f32, 0.0_f32); num_bins];
+    let mut time_out_l = c2r.make_output_vec();
+    let mut time_out_r = c2r.make_output_vec();
 
-    let mut in_pos = 0usize;
-    let mut out_pos = 0usize;
+    let mut mag_l = vec![0.0_f32; num_bins];
+    let mut mag_r = vec![0.0_f32; num_bins];
+    let mut joint_mag = vec![0.0_f32; num_bins];
+    let mut phase_l = vec![0.0_f32; num_bins];
+    let mut phase_r = vec![0.0_f32; num_bins];
+    let mut locked_l = vec![0.0_f32; num_bins];
+    let mut locked_r = vec![0.0_f32; num_bins];
 
-    while in_pos + VOCODER_FFT_SIZE <= samples.len()
-        && out_pos + VOCODER_FFT_SIZE <= stretched_buf.len()
-    {
-        for i in 0..VOCODER_FFT_SIZE {
-            time_in[i] = samples[in_pos + i] * hann_window[i];
-        }
+    let mut prev_in_idx = 0usize;
+    let inv_scale = 1.0 / (VOCODER_FFT_SIZE as f32);
 
-        let _ = r2c.process(&mut time_in, &mut spectrum);
+    // Anti-aliasing Nyquist limit when pitching UP (pitch_ratio > 1.0)
+    let aa_limit = if pitch_ratio > 1.001 {
+        ((num_bins - 2) as f32) / pitch_ratio
+    } else {
+        (num_bins + 16) as f32
+    };
+    let aa_roll_start = (aa_limit * 0.92).max(16.0);
 
-        let magnitudes: Vec<f32> = spectrum.iter().map(|c| c.norm()).collect();
-        let phases: Vec<f32> = spectrum.iter().map(|c| c.arg()).collect();
-
-        // Detect percussive transients via positive spectral flux
-        let mut spectral_flux = 0.0_f32;
-        let mut energy_sum = 1e-6_f32;
-        for k in 1..num_bins {
-            let diff = (magnitudes[k] - prev_magnitudes[k]).max(0.0);
-            spectral_flux += diff;
-            energy_sum += magnitudes[k];
-        }
-        let is_transient = transient_lock && (spectral_flux / energy_sum > 0.42);
-
-        // Extract smooth spectral envelope (Formant curve) if Formant Preservation is active
-        let envelope = if preserve_formants && (pitch_ratio - 1.0).abs() > 1e-3 {
-            compute_spectral_envelope(&magnitudes, 28)
+    for step_idx in 0..total_synth_steps {
+        let out_pos = step_idx * VOCODER_SYNTH_HOP;
+        let in_idx = (((step_idx as f64) * analysis_hop_f64).round() as usize)
+            .min(pad_l.len().saturating_sub(VOCODER_FFT_SIZE));
+        let actual_hop = if step_idx == 0 {
+            analysis_hop_f64.round().max(1.0) as f32
         } else {
-            Vec::new()
+            (in_idx.saturating_sub(prev_in_idx)).max(1) as f32
         };
+        prev_in_idx = in_idx;
 
-        // Detect spectral peaks for Laroche-Dolson Identity Phase Locking
-        // (eliminates metallic/robotic phasiness by preserving harmonic phase coherence).
-        let mut peaks = Vec::new();
+        if out_pos + VOCODER_FFT_SIZE > buf_len {
+            break;
+        }
+
+        for i in 0..VOCODER_FFT_SIZE {
+            let w = hann_window[i];
+            time_in_l[i] = pad_l[in_idx + i] * w;
+            time_in_r[i] = pad_r[in_idx + i] * w;
+        }
+
+        let _ = r2c.process(&mut time_in_l, &mut spec_l);
+        let _ = r2c.process(&mut time_in_r, &mut spec_r);
+
+        let mut frame_peak_mag = 1e-7_f32;
+        for k in 0..num_bins {
+            let ml = spec_l[k].norm();
+            let mr = spec_r[k].norm();
+            let jm = (0.5 * (ml * ml + mr * mr)).sqrt();
+            mag_l[k] = ml;
+            mag_r[k] = mr;
+            joint_mag[k] = jm;
+            phase_l[k] = spec_l[k].arg();
+            phase_r[k] = spec_r[k].arg();
+            if jm > frame_peak_mag {
+                frame_peak_mag = jm;
+            }
+        }
+
+        // Measure positive high-band (>350 Hz) spectral flux for soft percussive attack preservation
+        let mut hi_flux = 0.0_f32;
+        let mut hi_energy = 1e-6_f32;
+        for k in 33..num_bins {
+            hi_flux += (joint_mag[k] - prev_joint_mag[k]).max(0.0);
+            hi_energy += joint_mag[k];
+        }
+        let is_percussive_onset =
+            transient_lock && step_idx > 0 && (hi_flux / hi_energy > 0.52);
+
+        // Temporal-smoothed spectral envelope for Formant preservation
+        if preserve_formants && (pitch_ratio - 1.0).abs() > 1e-3 {
+            let inst_env = compute_spectral_envelope(&joint_mag, 28);
+            if smooth_env.is_empty() {
+                smooth_env = inst_env;
+            } else {
+                for k in 0..num_bins {
+                    smooth_env[k] = 0.38 * inst_env[k] + 0.62 * smooth_env[k];
+                }
+            }
+        }
+
+        // Detect joint spectral peaks for Laroche-Dolson Identity Phase Locking
+        let mut peaks = Vec::with_capacity(128);
         for k in 1..(num_bins - 1) {
-            if magnitudes[k] >= magnitudes[k - 1] && magnitudes[k] >= magnitudes[k + 1] {
+            if joint_mag[k] >= joint_mag[k - 1] && joint_mag[k] >= joint_mag[k + 1] {
                 peaks.push(k);
             }
         }
@@ -300,28 +404,43 @@ pub fn process_channel_vocoder(
             peaks.push(0);
         }
 
-        let mut peak_idx = 0usize;
-        let mut locked_phase = vec![0.0_f32; num_bins];
-
-        if is_transient {
-            for k in 0..num_bins {
-                prev_analysis_phase[k] = phases[k];
-                sum_synthesis_phase[k] = phases[k];
-                locked_phase[k] = phases[k];
-            }
+        if step_idx == 0 {
+            prev_phase_l.copy_from_slice(&phase_l);
+            prev_phase_r.copy_from_slice(&phase_r);
+            sum_synth_phase_l.copy_from_slice(&phase_l);
+            sum_synth_phase_r.copy_from_slice(&phase_r);
+            locked_l.copy_from_slice(&phase_l);
+            locked_r.copy_from_slice(&phase_r);
         } else {
             for &p in &peaks {
-                let expected_phase_adv =
-                    2.0 * PI * (p as f32) * (analysis_hop as f32) / (VOCODER_FFT_SIZE as f32);
-                let delta_phase = phases[p] - prev_analysis_phase[p] - expected_phase_adv;
-                let wrapped_dev = (delta_phase + PI).rem_euclid(2.0 * PI) - PI;
-                let true_freq_per_sample =
-                    (expected_phase_adv + wrapped_dev) / (analysis_hop as f32);
-                sum_synthesis_phase[p] += true_freq_per_sample * (VOCODER_SYNTH_HOP as f32);
+                let expected_adv =
+                    2.0 * PI * (p as f32) * actual_hop / (VOCODER_FFT_SIZE as f32);
+
+                let dev_l = wrap_phase_pi(phase_l[p] - prev_phase_l[p] - expected_adv);
+                let freq_l = (expected_adv + dev_l) / actual_hop;
+                sum_synth_phase_l[p] =
+                    wrap_phase_pi(sum_synth_phase_l[p] + freq_l * (VOCODER_SYNTH_HOP as f32));
+
+                let dev_r = wrap_phase_pi(phase_r[p] - prev_phase_r[p] - expected_adv);
+                let freq_r = (expected_adv + dev_r) / actual_hop;
+                sum_synth_phase_r[p] =
+                    wrap_phase_pi(sum_synth_phase_r[p] + freq_r * (VOCODER_SYNTH_HOP as f32));
+
+                // Soft transient phase coherence ONLY on surging mid/high bins (>355 Hz),
+                // leaving bass/fundamental sustain completely untouched (zero "bẹp" clicks!)
+                if is_percussive_onset && p >= 33 && joint_mag[p] > 1.75 * prev_joint_mag[p] {
+                    let err_l = wrap_phase_pi(phase_l[p] - sum_synth_phase_l[p]);
+                    sum_synth_phase_l[p] = wrap_phase_pi(sum_synth_phase_l[p] + 0.55 * err_l);
+                    let err_r = wrap_phase_pi(phase_r[p] - sum_synth_phase_r[p]);
+                    sum_synth_phase_r[p] = wrap_phase_pi(sum_synth_phase_r[p] + 0.55 * err_r);
+                }
             }
 
+            let mut peak_idx = 0usize;
             for k in 0..num_bins {
-                prev_analysis_phase[k] = phases[k];
+                prev_phase_l[k] = phase_l[k];
+                prev_phase_r[k] = phase_r[k];
+
                 while peak_idx + 1 < peaks.len()
                     && (peaks[peak_idx + 1] as isize - k as isize).abs()
                         < (peaks[peak_idx] as isize - k as isize).abs()
@@ -329,60 +448,87 @@ pub fn process_channel_vocoder(
                     peak_idx += 1;
                 }
                 let p = peaks[peak_idx];
-                locked_phase[k] = sum_synthesis_phase[p] + (phases[k] - phases[p]);
+                let pl = wrap_phase_pi(sum_synth_phase_l[p] + (phase_l[k] - phase_l[p]));
+                locked_l[k] = pl;
+
+                // Preserve exact Inter-Channel Phase Difference (ICPD) when Left has signal
+                // so centered kick, bass, and lead vocals never drift out of stereo phase!
+                if mag_l[k] >= 0.12 * mag_r[k] && mag_l[k] > 1e-8 {
+                    let icpd = wrap_phase_pi(phase_r[k] - phase_l[k]);
+                    locked_r[k] = wrap_phase_pi(pl + icpd);
+                } else {
+                    locked_r[k] = wrap_phase_pi(sum_synth_phase_r[p] + (phase_r[k] - phase_r[p]));
+                }
+
                 if k != p {
-                    sum_synthesis_phase[k] = locked_phase[k];
+                    sum_synth_phase_l[k] = locked_l[k];
+                    sum_synth_phase_r[k] = locked_r[k];
                 }
             }
         }
 
         for k in 0..num_bins {
-            // Formant-Preserved Magnitude Compensation:
-            // Keeps the original vocal tract envelope E[k] while pitch-shifting harmonics
-            let mut out_mag = magnitudes[k];
-            if !envelope.is_empty() {
+            let mut gain = 1.0_f32;
+            if !smooth_env.is_empty() {
                 let target_env_bin =
                     ((k as f32) * pitch_ratio).round().clamp(0.0, (num_bins - 1) as f32) as usize;
-                let src_env = envelope[k].max(1e-5);
-                let dst_env = envelope[target_env_bin];
-                let formant_gain = (dst_env / src_env).clamp(0.15, 6.0);
-                out_mag *= formant_gain;
+                let src_env = smooth_env[k].max(1e-5);
+                let dst_env = smooth_env[target_env_bin];
+                let raw_fg = (dst_env / src_env).clamp(0.25, 3.8);
+                // Fade formant boost back to unity in noise-floor regions to prevent formant chatter
+                let weight = vocoder_smoothstep(
+                    frame_peak_mag * 8e-4,
+                    frame_peak_mag * 6e-3,
+                    joint_mag[k],
+                );
+                gain *= 1.0 + weight * (raw_fg - 1.0);
             }
 
-            synth_spectrum[k] = Complex::from_polar(out_mag, locked_phase[k]);
+            // Anti-aliasing low-pass rolloff before pitch-up resampling
+            if (k as f32) > aa_roll_start {
+                gain *= 1.0 - vocoder_smoothstep(aa_roll_start, aa_limit, k as f32);
+            }
+
+            synth_l[k] = Complex::from_polar(mag_l[k] * gain, locked_l[k]);
+            synth_r[k] = Complex::from_polar(mag_r[k] * gain, locked_r[k]);
         }
 
-        // Enforce real-valued DC and Nyquist bins for inverse real FFT
-        synth_spectrum[0].im = 0.0;
-        synth_spectrum[num_bins - 1].im = 0.0;
-        prev_magnitudes.copy_from_slice(&magnitudes);
+        synth_l[0].im = 0.0;
+        synth_l[num_bins - 1].im = 0.0;
+        synth_r[0].im = 0.0;
+        synth_r[num_bins - 1].im = 0.0;
+        prev_joint_mag.copy_from_slice(&joint_mag);
 
-        let _ = c2r.process(&mut synth_spectrum, &mut time_out);
-        let inv_scale = 1.0 / (VOCODER_FFT_SIZE as f32);
+        let _ = c2r.process(&mut synth_l, &mut time_out_l);
+        let _ = c2r.process(&mut synth_r, &mut time_out_r);
 
         for i in 0..VOCODER_FFT_SIZE {
             let w = hann_window[i];
-            stretched_buf[out_pos + i] += time_out[i] * inv_scale * w;
+            stretched_l[out_pos + i] += time_out_l[i] * inv_scale * w;
+            stretched_r[out_pos + i] += time_out_r[i] * inv_scale * w;
             window_norm[out_pos + i] += w * w;
         }
-
-        in_pos += analysis_hop;
-        out_pos += VOCODER_SYNTH_HOP;
     }
 
-    let valid_stretched_len = (out_pos + VOCODER_FFT_SIZE).min(stretched_buf.len());
-    for i in 0..valid_stretched_len {
-        if window_norm[i] > 1e-4 {
-            stretched_buf[i] /= window_norm[i];
-        }
+    let extract_end = (pad + target_stretched_frames).min(buf_len);
+    let mut clean_stretched_l = Vec::with_capacity(target_stretched_frames);
+    let mut clean_stretched_r = Vec::with_capacity(target_stretched_frames);
+    for i in pad..extract_end {
+        let denom = window_norm[i].max(1e-5);
+        clean_stretched_l.push(stretched_l[i] / denom);
+        clean_stretched_r.push(stretched_r[i] / denom);
     }
-    stretched_buf.truncate(valid_stretched_len);
 
-    // Resample by 1 / pitch_ratio to complete the pitch shift while keeping target duration = original / speed_ratio
     if (pitch_ratio - 1.0).abs() > 1e-4 {
-        resample_channel_linear(&stretched_buf, pitch_ratio)
+        let mut rl = resample_channel_linear(&clean_stretched_l, pitch_ratio);
+        let mut rr = resample_channel_linear(&clean_stretched_r, pitch_ratio);
+        rl.resize(target_final_frames, 0.0);
+        rr.resize(target_final_frames, 0.0);
+        (rl, rr)
     } else {
-        stretched_buf
+        clean_stretched_l.resize(target_final_frames, 0.0);
+        clean_stretched_r.resize(target_final_frames, 0.0);
+        (clean_stretched_l, clean_stretched_r)
     }
 }
 
@@ -583,5 +729,55 @@ mod tests {
             "Pitch shift -4st at 1.0x speed should preserve duration, got ratio {}",
             ratio
         );
+    }
+
+    #[test]
+    fn test_stereo_vocoder_icpd_lock_and_transient_smoothness() {
+        let sr = 44_100u32;
+        let len = sr as usize * 2;
+        let mut center_mix = Vec::with_capacity(len);
+        for i in 0..len {
+            let t = i as f32 / sr as f32;
+            // Sustained 70 Hz bass + 440 Hz vocal + sharp transient snare hit at t = 0.80..0.82s
+            let mut s = 0.35 * (2.0 * PI * 70.0 * t).sin() + 0.25 * (2.0 * PI * 440.0 * t).sin();
+            if (0.80..0.82).contains(&t) {
+                let env = 1.0 - ((t - 0.80) / 0.02);
+                s += 0.40 * env * (2.0 * PI * 1850.0 * t).sin();
+            }
+            center_mix.push(s);
+        }
+
+        let input = StereoAudioBuffer::new(sr, center_mix.clone(), center_mix);
+        for &semi in &[3.0_f32, -3.0_f32] {
+            let (out_l, out_r) = process_stereo_vocoder(
+                &input.left,
+                &input.right,
+                2.0_f32.powf(semi / 12.0),
+                1.0,
+                true,
+                true,
+            );
+            assert_eq!(out_l.len(), len);
+            assert_eq!(out_r.len(), len);
+
+            let mut max_lr_diff = 0.0_f32;
+            let mut max_sample_step = 0.0_f32;
+            for i in 1..len {
+                max_lr_diff = max_lr_diff.max((out_l[i] - out_r[i]).abs());
+                max_sample_step = max_sample_step.max((out_l[i] - out_l[i - 1]).abs());
+            }
+            assert!(
+                max_lr_diff < 1e-5,
+                "Centered stereo signal drifted out of phase (semi={}): max_lr_diff={}",
+                semi,
+                max_lr_diff
+            );
+            assert!(
+                max_sample_step < 0.45,
+                "Unexpected click/step discontinuity during transient pitch shift (semi={}): {}",
+                semi,
+                max_sample_step
+            );
+        }
     }
 }

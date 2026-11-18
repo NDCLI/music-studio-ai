@@ -18,7 +18,7 @@ use crate::ai_separator::{
 };
 use crate::audio_engine::{render_stem_aware_master_mix, StemChannelParams, StemRole, StemTrackData};
 use crate::audio_io::{
-    decode_audio_file, encode_wav_16bit_bytes, export_audio_file, is_video_container_path,
+    decode_audio_file, encode_wav_24bit_bytes, export_audio_file, is_video_container_path,
     AudioExportFormat, LoadedTrackSummary, StereoAudioBuffer,
 };
 use crate::dsp_pitch_time::{
@@ -27,6 +27,7 @@ use crate::dsp_pitch_time::{
 use crate::model_manager::{
     discover_onnxruntime_library, CachedModelStatus, ModelCatalogEntry, ModelManager,
 };
+#[cfg_attr(not(feature = "desktop-tauri"), allow(unused_imports))]
 use crate::youtube_loader::{
     download_youtube_audio_file, parse_youtube_single_video_url, ParsedYouTubeTarget,
 };
@@ -322,7 +323,7 @@ pub fn handle_read_file_base64(file_path: &str) -> Result<String, String> {
     Ok(encode_base64(&bytes))
 }
 
-/// Encodes the currently loaded Rust track into 16-bit WAV Base64 for containers Chromium cannot decode directly (e.g. MKV/FLAC).
+/// Encodes the currently loaded Rust track into 24-bit PCM WAV Base64 for studio-grade WebAudio preview.
 pub fn handle_prepare_preview_wav_b64(state: &Arc<Mutex<StudioAppState>>) -> Result<String, String> {
     let track = {
         let guard = state
@@ -333,7 +334,7 @@ pub fn handle_prepare_preview_wav_b64(state: &Arc<Mutex<StudioAppState>>) -> Res
             .clone()
             .ok_or_else(|| "No track loaded in Rust studio state".to_string())?
     };
-    let wav_bytes = encode_wav_16bit_bytes(&track)?;
+    let wav_bytes = encode_wav_24bit_bytes(&track)?;
     Ok(encode_base64(&wav_bytes))
 }
 
@@ -370,7 +371,7 @@ pub struct SeparatedStemsWavB64Response {
     pub reverb_tail_b64: String,
 }
 
-/// Exports the 4 Rust ONNX-separated stems as Base64 16-bit WAV buffers for live WebView stem mixing.
+/// Exports the 4 Rust ONNX-separated stems as Base64 24-bit PCM WAV buffers for artifact-free WebView stem mixing.
 pub fn handle_export_separated_stems_b64(
     state: &Arc<Mutex<StudioAppState>>,
 ) -> Result<SeparatedStemsWavB64Response, String> {
@@ -385,10 +386,10 @@ pub fn handle_export_separated_stems_b64(
     };
 
     Ok(SeparatedStemsWavB64Response {
-        lead_vocal_b64: encode_base64(&encode_wav_16bit_bytes(&sep.lead_vocal)?),
-        backing_vocal_b64: encode_base64(&encode_wav_16bit_bytes(&sep.backing_vocal)?),
-        instrumental_b64: encode_base64(&encode_wav_16bit_bytes(&sep.instrumental)?),
-        reverb_tail_b64: encode_base64(&encode_wav_16bit_bytes(&sep.reverb_tail)?),
+        lead_vocal_b64: encode_base64(&encode_wav_24bit_bytes(&sep.lead_vocal)?),
+        backing_vocal_b64: encode_base64(&encode_wav_24bit_bytes(&sep.backing_vocal)?),
+        instrumental_b64: encode_base64(&encode_wav_24bit_bytes(&sep.instrumental)?),
+        reverb_tail_b64: encode_base64(&encode_wav_24bit_bytes(&sep.reverb_tail)?),
     })
 }
 
@@ -1350,7 +1351,8 @@ mod tests {
             vec![0.25_f32; 44_100],
             vec![-0.25_f32; 44_100],
         );
-        let wav_bytes = encode_wav_16bit_bytes(&buf).expect("encode preview wav");
+        let wav_bytes = encode_wav_24bit_bytes(&buf).expect("encode 24-bit preview wav");
+        let _wav16 = crate::audio_io::encode_wav_16bit_bytes(&buf).expect("encode 16-bit wav");
         let wav_b64 = encode_base64(&wav_bytes);
 
         let summary = handle_load_audio_bytes_b64(&state, "real_test.wav", &wav_b64)

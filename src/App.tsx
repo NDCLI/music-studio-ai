@@ -435,7 +435,7 @@ export const App: React.FC = () => {
           if (!decodedBuf) return null;
           const left = decodedBuf.getChannelData(0);
           const right = decodedBuf.numberOfChannels > 1 ? decodedBuf.getChannelData(1) : left;
-          const wavBlob = encodeStereoAudioBlob(left, right, decodedBuf.sampleRate, 'wav16');
+          const wavBlob = encodeStereoAudioBlob(left, right, decodedBuf.sampleRate, 'wav24');
           const wavBuf = await wavBlob.arrayBuffer();
           const wavName = `${file.name.replace(/\.[^/.]+$/, '')}.wav`;
           return loadAudioBytesViaRustBackend(wavName, wavBuf).catch(() => null);
@@ -520,7 +520,7 @@ export const App: React.FC = () => {
         }
         const left = decodedBuf.getChannelData(0);
         const right = decodedBuf.numberOfChannels > 1 ? decodedBuf.getChannelData(1) : left;
-        const wavBlob = encodeStereoAudioBlob(left, right, decodedBuf.sampleRate, 'wav16');
+        const wavBlob = encodeStereoAudioBlob(left, right, decodedBuf.sampleRate, 'wav24');
         const wavBuffer = await wavBlob.arrayBuffer();
         const fileName = pickedPath.split(/[\\/]/).pop() || 'audio.mkv';
         const wavName = `${fileName.replace(/\.[^/.]+$/, '')}.wav`;

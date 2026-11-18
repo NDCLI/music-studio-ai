@@ -349,6 +349,8 @@ export async function separateAudioBuffer3Stage(
 
   // Stage 2: Extract Lead Vocal (focused centered formant ridges) vs Backing Vocal / Harmony
   const stage2ModelName = isPro ? 'Chế độ Siêu Nét' : 'Chế độ Nhanh';
+  const prevStage2Mask = new Float32Array(halfBins);
+  const tempMaskBuf = new Float32Array(halfBins);
 
   const leadWithReverb = await runStftSpectralMaskPass(
     allVocals,
@@ -368,17 +370,25 @@ export async function separateAudioBuffer3Stage(
         const sidePow = sideRe * sideRe + sideIm * sideIm;
         const centerFocus = midPow / (midPow + sidePow + 1e-12);
 
-        // Lead vocals sit tightly centered with strong formant clarity between 160 Hz and 5.5 kHz
-        const leadBand = freq >= 150 && freq <= 5800 ? 1.0 : 0.65;
-        const strictness = isPro ? 0.84 : 0.78;
-        const leadMask =
-          centerFocus >= strictness
-            ? Math.min(1, ((centerFocus - strictness) / (1 - strictness)) * 0.85 + 0.15) *
-              leadBand
-            : 0.08 * centerFocus;
+        // Smooth S-curve transition eliminates hard threshold musical-noise chatter
+        const leadBand = freq >= 150 && freq <= 5800 ? 1.0 : 0.72;
+        const lo = isPro ? 0.62 : 0.56;
+        const hi = isPro ? 0.90 : 0.86;
+        const u = Math.max(0, Math.min(1, (centerFocus - lo) / (hi - lo)));
+        const sCurve = u * u * (3 - 2 * u);
+        tempMaskBuf[k] = (0.06 + 0.94 * sCurve) * leadBand;
+      }
 
-        outL[k] = leadMask;
-        outR[k] = leadMask;
+      for (let k = 0; k < numBins; k++) {
+        const k0 = k > 0 ? k - 1 : 0;
+        const k2 = k + 1 < numBins ? k + 1 : numBins - 1;
+        const freqSmooth = 0.25 * tempMaskBuf[k0] + 0.5 * tempMaskBuf[k] + 0.25 * tempMaskBuf[k2];
+        const prev = prevStage2Mask[k];
+        const alpha = freqSmooth > prev ? 0.65 : 0.32;
+        const smoothed = alpha * freqSmooth + (1 - alpha) * prev;
+        prevStage2Mask[k] = smoothed;
+        outL[k] = smoothed;
+        outR[k] = smoothed;
       }
     },
     (ratio) => {

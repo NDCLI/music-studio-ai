@@ -352,32 +352,108 @@ pub fn hann_window(size: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Maps any signed index `k` into `0..len` using PyTorch-compatible mirror reflection (`mode='reflect'`).
+#[inline]
+fn reflect_index(k: isize, len: usize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    let period = (2 * (len - 1)) as isize;
+    let mut m = k.rem_euclid(period);
+    if m >= len as isize {
+        m = period - m;
+    }
+    m as usize
+}
+
+/// Pads a 1D audio slice using mirror reflection (`pad_mode='reflect'`) so STFT/chunk boundaries
+/// never suffer from step-to-zero broadband click/splatter artifacts.
+pub fn reflect_pad_slice(src: &[f32], pad_left: usize, pad_right: usize) -> Vec<f32> {
+    let total = pad_left + src.len() + pad_right;
+    if src.is_empty() {
+        return vec![0.0_f32; total];
+    }
+    if src.len() == 1 {
+        return vec![src[0]; total];
+    }
+    let mut out = Vec::with_capacity(total);
+    let len = src.len();
+    for i in 0..total {
+        let k = (i as isize) - (pad_left as isize);
+        if k >= 0 && (k as usize) < len {
+            out.push(src[k as usize]);
+        } else {
+            out.push(src[reflect_index(k, len)]);
+        }
+    }
+    out
+}
+
+/// Builds a center-weighted raised-cosine overlap-add window that zeros out the outermost ~6.25%
+/// edges of each neural chunk (eliminating U-Net / Transformer receptive-field border chatter)
+/// while summing to an exact constant `1.0` at 50% hop (`step = chunk_len / 2`).
+pub fn trimmed_chunk_window(chunk_len: usize, step: usize) -> Vec<f32> {
+    if chunk_len < 32 || step < 8 {
+        return hann_window(chunk_len.max(1));
+    }
+    let trim = (step / 8).max(1);
+    let fade_len = step.saturating_sub(2 * trim).max(1);
+    let flat_start = trim + fade_len;
+    let flat_end = step + trim;
+    let fade_out_end = flat_end + fade_len;
+
+    let mut win = vec![0.0_f32; chunk_len];
+    for (i, slot) in win.iter_mut().enumerate() {
+        *slot = if i < trim {
+            0.0
+        } else if i < flat_start {
+            let theta = (i - trim) as f32 / (fade_len as f32);
+            let s = (0.5 * PI * theta).sin();
+            s * s
+        } else if i < flat_end {
+            1.0
+        } else if i < fade_out_end {
+            let theta = (i - flat_end) as f32 / (fade_len as f32);
+            let c = (0.5 * PI * theta).cos();
+            c * c
+        } else {
+            0.0
+        };
+    }
+    win
+}
+
+/// Computes chunk start offsets covering `[margin_pad .. margin_pad + total_frames]` with full
+/// center-weighted overlap so even the final samples of the song have unity blend weight.
+fn build_chunk_starts(total_frames: usize, step: usize, margin_pad: usize) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut pos = 0usize;
+    let target_end = margin_pad + total_frames;
+    while pos <= target_end {
+        starts.push(pos);
+        pos += step.max(1);
+    }
+    if starts.is_empty() {
+        starts.push(0);
+    }
+    starts
+}
+
 /// Computes the number of audio samples corresponding to one `dim_t` STFT chunk.
 pub fn chunk_sample_length(cfg: &StftModelConfig) -> usize {
     (cfg.dim_t.saturating_sub(1)) * cfg.hop_length
 }
 
-/// Converts a centered stereo chunk of length `chunk_sample_length(cfg)` into an ONNX tensor
-/// with shape `[1, 4, dim_f, dim_t]` containing `[Re_L, Im_L, Re_R, Im_R]`.
-pub fn stft_stereo_chunk(
-    left_chunk: &[f32],
-    right_chunk: &[f32],
+/// Computes `[1, 4, dim_f, dim_t]` complex spectrogram tensor from pre-padded stereo slices
+/// of length `chunk_sample_length(cfg) + 2 * (cfg.n_fft / 2)`.
+fn stft_stereo_from_padded(
+    pad_l: &[f32],
+    pad_r: &[f32],
     cfg: &StftModelConfig,
+    window: &[f32],
+    r2c: &dyn realfft::RealToComplex<f32>,
 ) -> Array4<f32> {
-    let chunk_len = chunk_sample_length(cfg);
-    let pad = cfg.n_fft / 2;
-    let padded_len = chunk_len + 2 * pad;
-
-    let mut pad_l = vec![0.0_f32; padded_len];
-    let mut pad_r = vec![0.0_f32; padded_len];
-    let copy_len = chunk_len.min(left_chunk.len()).min(right_chunk.len());
-    pad_l[pad..pad + copy_len].copy_from_slice(&left_chunk[..copy_len]);
-    pad_r[pad..pad + copy_len].copy_from_slice(&right_chunk[..copy_len]);
-
-    let window = hann_window(cfg.n_fft);
-    let mut planner = RealFftPlanner::<f32>::new();
-    let r2c = planner.plan_fft_forward(cfg.n_fft);
-
+    let padded_len = pad_l.len().min(pad_r.len());
     let mut frame_buf = vec![0.0_f32; cfg.n_fft];
     let mut spectrum = r2c.make_output_vec();
     let valid_bins = cfg.dim_f.min(spectrum.len());
@@ -412,6 +488,38 @@ pub fn stft_stereo_chunk(
     }
 
     tensor
+}
+
+/// Converts a centered stereo chunk of length `chunk_sample_length(cfg)` into an ONNX tensor
+/// with shape `[1, 4, dim_f, dim_t]` containing `[Re_L, Im_L, Re_R, Im_R]` using reflect padding.
+pub fn stft_stereo_chunk(
+    left_chunk: &[f32],
+    right_chunk: &[f32],
+    cfg: &StftModelConfig,
+) -> Array4<f32> {
+    let chunk_len = chunk_sample_length(cfg);
+    let pad = cfg.n_fft / 2;
+    let copy_len = chunk_len.min(left_chunk.len()).min(right_chunk.len());
+
+    let pad_l = if copy_len == chunk_len {
+        reflect_pad_slice(&left_chunk[..copy_len], pad, pad)
+    } else {
+        let mut tmp = vec![0.0_f32; chunk_len];
+        tmp[..copy_len].copy_from_slice(&left_chunk[..copy_len]);
+        reflect_pad_slice(&tmp, pad, pad)
+    };
+    let pad_r = if copy_len == chunk_len {
+        reflect_pad_slice(&right_chunk[..copy_len], pad, pad)
+    } else {
+        let mut tmp = vec![0.0_f32; chunk_len];
+        tmp[..copy_len].copy_from_slice(&right_chunk[..copy_len]);
+        reflect_pad_slice(&tmp, pad, pad)
+    };
+
+    let window = hann_window(cfg.n_fft);
+    let mut planner = RealFftPlanner::<f32>::new();
+    let r2c = planner.plan_fft_forward(cfg.n_fft);
+    stft_stereo_from_padded(&pad_l, &pad_r, cfg, &window, r2c.as_ref())
 }
 
 /// Reconstructs a stereo time-domain chunk of length `chunk_sample_length(cfg)` from
@@ -498,7 +606,7 @@ pub fn istft_stereo_chunk(
 }
 
 /// Runs a single MDX-Net ONNX separation model over a full-length audio buffer
-/// using chunked STFT -> ONNX inference -> iSTFT + 50% Windowed Overlap-Add.
+/// using continuous reflect-padded STFT -> ONNX inference -> iSTFT + Trimmed Cosine Overlap-Add.
 pub fn run_mdx_onnx_model<F>(
     session: &mut Session,
     audio: &StereoAudioBuffer,
@@ -515,42 +623,43 @@ where
 
     let chunk_len = chunk_sample_length(cfg);
     let step = (chunk_len / 2).max(1); // 50% overlap between adjacent chunks
-    let margin_pad = chunk_len / 2;
-    let padded_total = total_frames + 2 * margin_pad;
+    let margin_pad = step;
+    let stft_pad = cfg.n_fft / 2;
 
-    let mut src_l = vec![0.0_f32; padded_total];
-    let mut src_r = vec![0.0_f32; padded_total];
-    src_l[margin_pad..margin_pad + total_frames].copy_from_slice(&audio.left[..total_frames]);
-    src_r[margin_pad..margin_pad + total_frames].copy_from_slice(&audio.right[..total_frames]);
-
-    let mut out_l = vec![0.0_f32; padded_total];
-    let mut out_r = vec![0.0_f32; padded_total];
-    let mut weight_acc = vec![0.0_f32; padded_total];
-
-    // Raised-cosine crossfade window across chunks so chunk borders are completely seamless
-    let chunk_blend = hann_window(chunk_len);
-
-    let mut starts = Vec::new();
-    let mut pos = 0usize;
-    while pos < total_frames + margin_pad {
-        starts.push(pos);
-        if pos + chunk_len >= padded_total {
-            break;
-        }
-        pos += step;
-    }
+    let starts = build_chunk_starts(total_frames, step, margin_pad);
     let total_chunks = starts.len().max(1);
+    let acc_len = starts.last().copied().unwrap_or(0) + chunk_len;
+    let right_pad_needed = acc_len.saturating_sub(margin_pad + total_frames);
+
+    // Continuous mirror-reflected audio with extra `stft_pad` on both sides so every STFT frame
+    // in every chunk sees true neighboring waveform samples instead of zero-step discontinuities.
+    let ext_l = reflect_pad_slice(
+        &audio.left[..total_frames],
+        margin_pad + stft_pad,
+        right_pad_needed + stft_pad,
+    );
+    let ext_r = reflect_pad_slice(
+        &audio.right[..total_frames],
+        margin_pad + stft_pad,
+        right_pad_needed + stft_pad,
+    );
+
+    let mut out_l = vec![0.0_f32; acc_len];
+    let mut out_r = vec![0.0_f32; acc_len];
+    let mut weight_acc = vec![0.0_f32; acc_len];
+
+    let chunk_blend = trimmed_chunk_window(chunk_len, step);
+    let stft_win = hann_window(cfg.n_fft);
+    let mut planner = RealFftPlanner::<f32>::new();
+    let r2c = planner.plan_fft_forward(cfg.n_fft);
+    let padded_slice_len = chunk_len + 2 * stft_pad;
 
     for (idx, &start) in starts.iter().enumerate() {
-        let end = (start + chunk_len).min(padded_total);
-        let valid_len = end - start;
+        let pad_slice_l = &ext_l[start..start + padded_slice_len];
+        let pad_slice_r = &ext_r[start..start + padded_slice_len];
 
-        let mut chunk_l = vec![0.0_f32; chunk_len];
-        let mut chunk_r = vec![0.0_f32; chunk_len];
-        chunk_l[..valid_len].copy_from_slice(&src_l[start..end]);
-        chunk_r[..valid_len].copy_from_slice(&src_r[start..end]);
-
-        let input_tensor = stft_stereo_chunk(&chunk_l, &chunk_r, cfg);
+        let input_tensor =
+            stft_stereo_from_padded(pad_slice_l, pad_slice_r, cfg, &stft_win, r2c.as_ref());
         let tensor_ref = TensorRef::from_array_view(&input_tensor)
             .map_err(|e| format!("Failed to wrap STFT tensor: {}", e))?;
 
@@ -564,7 +673,7 @@ where
 
         let (pred_l, pred_r) = istft_stereo_chunk(output_view, cfg)?;
 
-        for i in 0..valid_len {
+        for i in 0..chunk_len {
             let w = chunk_blend[i];
             out_l[start + i] += pred_l[i] * w;
             out_r[start + i] += pred_r[i] * w;
@@ -602,8 +711,9 @@ pub fn subtract_stereo_buffers(
     StereoAudioBuffer::new(minuend.sample_rate, out_l, out_r)
 }
 
-/// Runs HTDemucs ONNX (`[1, 2, 343980]` -> `[1, 4, 2, 343980]`) with 50% Hann overlap-add.
-/// Sums Demucs stems 0..3 (`drums + bass + other`) as Instrumental and stem 3 as Vocals.
+/// Runs HTDemucs ONNX (`[1, 2, 343980]` -> `[1, 4, 2, 343980]`) with reflect-padded Trimmed Cosine overlap-add.
+/// Sums Demucs stems 0..3 (`drums + bass + other`) as Instrumental and stem 3 as Vocals,
+/// followed by Complex Wiener Phase-Consistent projection onto the original mixture.
 pub fn run_htdemucs_onnx_model<F>(
     session: &mut Session,
     audio: &StereoAudioBuffer,
@@ -619,39 +729,26 @@ where
     }
 
     let step = HTDEMUCS_CHUNK / 2;
-    let margin_pad = HTDEMUCS_CHUNK / 2;
-    let padded_total = total_frames + 2 * margin_pad;
-
-    let mut src_l = vec![0.0_f32; padded_total];
-    let mut src_r = vec![0.0_f32; padded_total];
-    src_l[margin_pad..margin_pad + total_frames].copy_from_slice(&audio.left[..total_frames]);
-    src_r[margin_pad..margin_pad + total_frames].copy_from_slice(&audio.right[..total_frames]);
-
-    let mut inst_l = vec![0.0_f32; padded_total];
-    let mut inst_r = vec![0.0_f32; padded_total];
-    let mut voc_l = vec![0.0_f32; padded_total];
-    let mut voc_r = vec![0.0_f32; padded_total];
-    let mut weight_acc = vec![0.0_f32; padded_total];
-
-    let chunk_blend = hann_window(HTDEMUCS_CHUNK);
-
-    let mut starts = Vec::new();
-    let mut pos = 0usize;
-    while pos < total_frames + margin_pad {
-        starts.push(pos);
-        if pos + HTDEMUCS_CHUNK >= padded_total {
-            break;
-        }
-        pos += step;
-    }
+    let margin_pad = step;
+    let starts = build_chunk_starts(total_frames, step, margin_pad);
     let total_chunks = starts.len().max(1);
+    let acc_len = starts.last().copied().unwrap_or(0) + HTDEMUCS_CHUNK;
+    let right_pad_needed = acc_len.saturating_sub(margin_pad + total_frames);
+
+    let src_l = reflect_pad_slice(&audio.left[..total_frames], margin_pad, right_pad_needed);
+    let src_r = reflect_pad_slice(&audio.right[..total_frames], margin_pad, right_pad_needed);
+
+    let mut inst_l = vec![0.0_f32; acc_len];
+    let mut inst_r = vec![0.0_f32; acc_len];
+    let mut voc_l = vec![0.0_f32; acc_len];
+    let mut voc_r = vec![0.0_f32; acc_len];
+    let mut weight_acc = vec![0.0_f32; acc_len];
+
+    let chunk_blend = trimmed_chunk_window(HTDEMUCS_CHUNK, step);
+    let mut input_tensor = ndarray::Array3::<f32>::zeros((1, 2, HTDEMUCS_CHUNK));
 
     for (idx, &start) in starts.iter().enumerate() {
-        let end = (start + HTDEMUCS_CHUNK).min(padded_total);
-        let valid_len = end - start;
-
-        let mut input_tensor = ndarray::Array3::<f32>::zeros((1, 2, HTDEMUCS_CHUNK));
-        for i in 0..valid_len {
+        for i in 0..HTDEMUCS_CHUNK {
             input_tensor[[0, 0, i]] = src_l[start + i];
             input_tensor[[0, 1, i]] = src_r[start + i];
         }
@@ -666,8 +763,11 @@ where
             .try_extract_array::<f32>()
             .map_err(|e| format!("Failed to extract HTDemucs output tensor: {}", e))?;
 
-        for i in 0..valid_len {
+        for i in 0..HTDEMUCS_CHUNK {
             let w = chunk_blend[i];
+            if w <= 0.0 {
+                continue;
+            }
             let il = out_view[[0, 0, 0, i]] + out_view[[0, 1, 0, i]] + out_view[[0, 2, 0, i]];
             let ir = out_view[[0, 0, 1, i]] + out_view[[0, 1, 1, i]] + out_view[[0, 2, 1, i]];
             let vl = out_view[[0, 3, 0, i]];
@@ -694,15 +794,13 @@ where
         final_voc_r.push(voc_r[i] / w);
     }
 
-    Ok((
-        StereoAudioBuffer::new(audio.sample_rate, final_inst_l, final_inst_r),
-        StereoAudioBuffer::new(audio.sample_rate, final_voc_l, final_voc_r),
-    ))
+    let raw_inst = StereoAudioBuffer::new(audio.sample_rate, final_inst_l, final_inst_r);
+    let raw_voc = StereoAudioBuffer::new(audio.sample_rate, final_voc_l, final_voc_r);
+    Ok(apply_htdemucs_wiener_consistency(audio, &raw_inst, &raw_voc))
 }
 
 /// Runs `mel_band_roformer_karaoke_aufr33_viperx.onnx` (`stft_features [1, T, 4100]` -> `mask [1, 1, 2050, T, 2]`)
-/// with `n_fft = 2048`, `hop_length = 441` and 50% Hann overlap-add.
-/// Returns the extracted Lead Vocal buffer.
+/// with `n_fft = 2048`, `hop_length = 441` and continuous-context Trimmed Cosine overlap-add.
 pub fn run_roformer_karaoke_onnx_model<F>(
     session: &mut Session,
     audio: &StereoAudioBuffer,
@@ -723,18 +821,30 @@ where
     let dim_t = cfg.dim_t;
     let chunk_len = chunk_sample_length(cfg);
     let step = (chunk_len / 2).max(1);
-    let margin_pad = chunk_len / 2;
-    let padded_total = total_frames + 2 * margin_pad;
+    let margin_pad = step;
+    let pad = n_fft / 2;
 
-    let mut src_l = vec![0.0_f32; padded_total];
-    let mut src_r = vec![0.0_f32; padded_total];
-    src_l[margin_pad..margin_pad + total_frames].copy_from_slice(&audio.left[..total_frames]);
-    src_r[margin_pad..margin_pad + total_frames].copy_from_slice(&audio.right[..total_frames]);
+    let starts = build_chunk_starts(total_frames, step, margin_pad);
+    let total_chunks = starts.len().max(1);
+    let acc_len = starts.last().copied().unwrap_or(0) + chunk_len;
+    let right_pad_needed = acc_len.saturating_sub(margin_pad + total_frames);
 
-    let mut out_l = vec![0.0_f32; padded_total];
-    let mut out_r = vec![0.0_f32; padded_total];
-    let mut weight_acc = vec![0.0_f32; padded_total];
-    let chunk_blend = hann_window(chunk_len);
+    // Continuous mirror-reflected waveform context across chunks (zero boundary step clicks)
+    let ext_l = reflect_pad_slice(
+        &audio.left[..total_frames],
+        margin_pad + pad,
+        right_pad_needed + pad,
+    );
+    let ext_r = reflect_pad_slice(
+        &audio.right[..total_frames],
+        margin_pad + pad,
+        right_pad_needed + pad,
+    );
+
+    let mut out_l = vec![0.0_f32; acc_len];
+    let mut out_r = vec![0.0_f32; acc_len];
+    let mut weight_acc = vec![0.0_f32; acc_len];
+    let chunk_blend = trimmed_chunk_window(chunk_len, step);
 
     let window = hann_window(n_fft);
     let mut planner = RealFftPlanner::<f32>::new();
@@ -742,35 +852,17 @@ where
     let c2r = planner.plan_fft_inverse(n_fft);
     let fft_scale = 1.0 / (n_fft as f32);
 
-    let mut starts = Vec::new();
-    let mut pos = 0usize;
-    while pos < total_frames + margin_pad {
-        starts.push(pos);
-        if pos + chunk_len >= padded_total {
-            break;
-        }
-        pos += step;
-    }
-    let total_chunks = starts.len().max(1);
-
-    let pad = n_fft / 2;
     let padded_chunk = chunk_len + 2 * pad;
+    let mut stft_features = ndarray::Array3::<f32>::zeros((1, dim_t, 4100));
+    let mut spec_l = vec![vec![Complex::new(0.0_f32, 0.0_f32); num_bins]; dim_t];
+    let mut spec_r = vec![vec![Complex::new(0.0_f32, 0.0_f32); num_bins]; dim_t];
+    let mut frame_buf = vec![0.0_f32; n_fft];
+    let mut spectrum = r2c.make_output_vec();
 
     for (idx, &start) in starts.iter().enumerate() {
-        let end = (start + chunk_len).min(padded_total);
-        let valid_len = end - start;
-
-        let mut pad_l = vec![0.0_f32; padded_chunk];
-        let mut pad_r = vec![0.0_f32; padded_chunk];
-        pad_l[pad..pad + valid_len].copy_from_slice(&src_l[start..end]);
-        pad_r[pad..pad + valid_len].copy_from_slice(&src_r[start..end]);
-
-        let mut stft_features = ndarray::Array3::<f32>::zeros((1, dim_t, 4100));
-        let mut spec_l = vec![vec![Complex::new(0.0_f32, 0.0_f32); num_bins]; dim_t];
-        let mut spec_r = vec![vec![Complex::new(0.0_f32, 0.0_f32); num_bins]; dim_t];
-
-        let mut frame_buf = vec![0.0_f32; n_fft];
-        let mut spectrum = r2c.make_output_vec();
+        let pad_l = &ext_l[start..start + padded_chunk];
+        let pad_r = &ext_r[start..start + padded_chunk];
+        stft_features.fill(0.0);
 
         for t in 0..dim_t {
             let s = t * hop;
@@ -851,11 +943,14 @@ where
             }
         }
 
-        for i in 0..valid_len {
-            let denom = win_norm[pad + i].max(1e-6);
-            let pl = acc_l[pad + i] / denom;
-            let pr = acc_r[pad + i] / denom;
+        for i in 0..chunk_len {
             let w = chunk_blend[i];
+            if w <= 0.0 {
+                continue;
+            }
+            let denom = win_norm[pad + i].max(1e-6);
+            let pl = (acc_l[pad + i] / denom) * cfg.compensate;
+            let pr = (acc_r[pad + i] / denom) * cfg.compensate;
             out_l[start + i] += pl * w;
             out_r[start + i] += pr * w;
             weight_acc[start + i] += w;
@@ -875,10 +970,700 @@ where
     Ok(StereoAudioBuffer::new(audio.sample_rate, final_l, final_r))
 }
 
+#[inline]
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    if edge1 <= edge0 {
+        return if x >= edge0 { 1.0 } else { 0.0 };
+    }
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[inline]
+fn median3(a: f32, b: f32, c: f32) -> f32 {
+    a.max(b).min(a.min(b).max(c))
+}
+
+/// Computes a 1D sliding-window median (up to window size 11 on stack) to reject short
+/// `< 45 ms` transient splats while preserving sustained vocal/harmony phrases intact.
+fn sliding_median_1d(values: &[f32], half_win: usize) -> Vec<f32> {
+    let n = values.len();
+    let hw = half_win.min(5);
+    let mut out = vec![0.0_f32; n];
+    let mut buf = [0.0_f32; 11];
+    for i in 0..n {
+        let lo = i.saturating_sub(hw);
+        let hi = (i + hw).min(n.saturating_sub(1));
+        let count = hi - lo + 1;
+        buf[..count].copy_from_slice(&values[lo..=hi]);
+        buf[..count].sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        out[i] = buf[count / 2];
+    }
+    out
+}
+
+struct StereoStftGrid {
+    sample_rate: u32,
+    orig_frames: usize,
+    n_fft: usize,
+    hop: usize,
+    num_bins: usize,
+    num_time: usize,
+    left: Vec<Complex<f32>>,
+    right: Vec<Complex<f32>>,
+}
+
+/// Computes a flat row-major `[num_time, num_bins]` stereo STFT with mirror-reflected boundaries.
+fn stereo_stft_grid(audio: &StereoAudioBuffer, n_fft: usize, hop: usize) -> StereoStftGrid {
+    let orig_frames = audio.num_frames();
+    let num_bins = n_fft / 2 + 1;
+    if orig_frames == 0 {
+        return StereoStftGrid {
+            sample_rate: audio.sample_rate,
+            orig_frames: 0,
+            n_fft,
+            hop,
+            num_bins,
+            num_time: 0,
+            left: Vec::new(),
+            right: Vec::new(),
+        };
+    }
+
+    let pad = n_fft / 2;
+    let pad_right = pad + hop;
+    let pad_l = reflect_pad_slice(&audio.left[..orig_frames], pad, pad_right);
+    let pad_r = reflect_pad_slice(&audio.right[..orig_frames], pad, pad_right);
+    let padded_len = pad_l.len().min(pad_r.len());
+    let num_time = (padded_len.saturating_sub(n_fft)) / hop + 1;
+
+    let window = hann_window(n_fft);
+    let mut planner = RealFftPlanner::<f32>::new();
+    let r2c = planner.plan_fft_forward(n_fft);
+
+    let mut frame_buf = vec![0.0_f32; n_fft];
+    let mut spec = r2c.make_output_vec();
+    let mut left = vec![Complex::new(0.0_f32, 0.0_f32); num_time * num_bins];
+    let mut right = vec![Complex::new(0.0_f32, 0.0_f32); num_time * num_bins];
+
+    for t in 0..num_time {
+        let s = t * hop;
+        let row = t * num_bins;
+
+        for i in 0..n_fft {
+            frame_buf[i] = pad_l[s + i] * window[i];
+        }
+        let _ = r2c.process(&mut frame_buf, &mut spec);
+        left[row..row + num_bins].copy_from_slice(&spec[..num_bins]);
+
+        for i in 0..n_fft {
+            frame_buf[i] = pad_r[s + i] * window[i];
+        }
+        let _ = r2c.process(&mut frame_buf, &mut spec);
+        right[row..row + num_bins].copy_from_slice(&spec[..num_bins]);
+    }
+
+    StereoStftGrid {
+        sample_rate: audio.sample_rate,
+        orig_frames,
+        n_fft,
+        hop,
+        num_bins,
+        num_time,
+        left,
+        right,
+    }
+}
+
+/// Exact linear inverse STFT matching `stereo_stft_grid` via Hann COLA normalization.
+fn stereo_istft_grid(grid: &StereoStftGrid) -> StereoAudioBuffer {
+    if grid.orig_frames == 0 || grid.num_time == 0 {
+        return StereoAudioBuffer::new(grid.sample_rate, Vec::new(), Vec::new());
+    }
+
+    let pad = grid.n_fft / 2;
+    let padded_len = (grid.num_time - 1) * grid.hop + grid.n_fft;
+    let window = hann_window(grid.n_fft);
+    let mut planner = RealFftPlanner::<f32>::new();
+    let c2r = planner.plan_fft_inverse(grid.n_fft);
+    let fft_scale = 1.0 / (grid.n_fft as f32);
+
+    let mut acc_l = vec![0.0_f32; padded_len];
+    let mut acc_r = vec![0.0_f32; padded_len];
+    let mut win_norm = vec![0.0_f32; padded_len];
+    let mut spec = vec![Complex::new(0.0_f32, 0.0_f32); grid.num_bins];
+    let mut time_frame = c2r.make_output_vec();
+
+    for t in 0..grid.num_time {
+        let s = t * grid.hop;
+        let row = t * grid.num_bins;
+
+        spec.copy_from_slice(&grid.left[row..row + grid.num_bins]);
+        spec[0].im = 0.0;
+        if grid.num_bins > 1 {
+            spec[grid.num_bins - 1].im = 0.0;
+        }
+        let _ = c2r.process(&mut spec, &mut time_frame);
+        for i in 0..grid.n_fft {
+            let w = window[i];
+            acc_l[s + i] += time_frame[i] * fft_scale * w;
+            win_norm[s + i] += w * w;
+        }
+
+        spec.copy_from_slice(&grid.right[row..row + grid.num_bins]);
+        spec[0].im = 0.0;
+        if grid.num_bins > 1 {
+            spec[grid.num_bins - 1].im = 0.0;
+        }
+        let _ = c2r.process(&mut spec, &mut time_frame);
+        for i in 0..grid.n_fft {
+            acc_r[s + i] += time_frame[i] * fft_scale * window[i];
+        }
+    }
+
+    let mut out_l = Vec::with_capacity(grid.orig_frames);
+    let mut out_r = Vec::with_capacity(grid.orig_frames);
+    for i in pad..(pad + grid.orig_frames) {
+        let denom = win_norm[i].max(1e-6);
+        out_l.push(acc_l[i] / denom);
+        out_r.push(acc_r[i] / denom);
+    }
+
+    StereoAudioBuffer::new(grid.sample_rate, out_l, out_r)
+}
+
+/// Applies Complex Wiener mixture consistency to HTDemucs raw outputs, suppressing ConvTranspose1d
+/// time-domain popping/splat artifacts while guaranteeing `instrumental + vocals == mix`.
+pub fn apply_htdemucs_wiener_consistency(
+    mix: &StereoAudioBuffer,
+    raw_inst: &StereoAudioBuffer,
+    raw_voc: &StereoAudioBuffer,
+) -> (StereoAudioBuffer, StereoAudioBuffer) {
+    const N_FFT: usize = 2048;
+    const HOP: usize = 512;
+    let frames = mix.num_frames().min(raw_inst.num_frames()).min(raw_voc.num_frames());
+    if frames < N_FFT {
+        return (raw_inst.clone(), raw_voc.clone());
+    }
+
+    let mix_g = stereo_stft_grid(mix, N_FFT, HOP);
+    let inst_g = stereo_stft_grid(raw_inst, N_FFT, HOP);
+    let voc_g = stereo_stft_grid(raw_voc, N_FFT, HOP);
+
+    let nt = mix_g.num_time.min(inst_g.num_time).min(voc_g.num_time);
+    let nb = mix_g.num_bins;
+
+    let mut raw_mask_l = vec![0.0_f32; nt * nb];
+    let mut raw_mask_r = vec![0.0_f32; nt * nb];
+
+    for idx in 0..(nt * nb) {
+        let vl2 = voc_g.left[idx].norm_sqr();
+        let vr2 = voc_g.right[idx].norm_sqr();
+        let il2 = inst_g.left[idx].norm_sqr();
+        let ir2 = inst_g.right[idx].norm_sqr();
+
+        // Power-law p = 1.6 (0.8 on squared magnitude) suppresses low-energy checkerboard noise
+        let pv_st = (vl2 + vr2 + 1e-18).powf(0.8);
+        let pi_st = (il2 + ir2 + 1e-18).powf(0.8);
+        let m_st = pv_st / (pv_st + pi_st + 1e-12);
+
+        let pv_l = (vl2 + 1e-18).powf(0.8);
+        let pi_l = (il2 + 1e-18).powf(0.8);
+        let m_l = pv_l / (pv_l + pi_l + 1e-12);
+
+        let pv_r = (vr2 + 1e-18).powf(0.8);
+        let pi_r = (ir2 + 1e-18).powf(0.8);
+        let m_r = pv_r / (pv_r + pi_r + 1e-12);
+
+        raw_mask_l[idx] = 0.70 * m_st + 0.30 * m_l;
+        raw_mask_r[idx] = 0.70 * m_st + 0.30 * m_r;
+    }
+
+    let mut out_voc = StereoStftGrid {
+        sample_rate: mix_g.sample_rate,
+        orig_frames: mix_g.orig_frames,
+        n_fft: N_FFT,
+        hop: HOP,
+        num_bins: nb,
+        num_time: nt,
+        left: vec![Complex::new(0.0, 0.0); nt * nb],
+        right: vec![Complex::new(0.0, 0.0); nt * nb],
+    };
+    let mut out_inst = StereoStftGrid {
+        sample_rate: mix_g.sample_rate,
+        orig_frames: mix_g.orig_frames,
+        n_fft: N_FFT,
+        hop: HOP,
+        num_bins: nb,
+        num_time: nt,
+        left: vec![Complex::new(0.0, 0.0); nt * nb],
+        right: vec![Complex::new(0.0, 0.0); nt * nb],
+    };
+
+    for t in 0..nt {
+        let row = t * nb;
+        for f in 0..nb {
+            let idx = row + f;
+            // Light 3-bin frequency smoothing on Wiener mask prevents spectral notches
+            let f_prev = f.saturating_sub(1);
+            let f_next = (f + 1).min(nb - 1);
+            let ml = 0.25 * raw_mask_l[row + f_prev] + 0.50 * raw_mask_l[idx] + 0.25 * raw_mask_l[row + f_next];
+            let mr = 0.25 * raw_mask_r[row + f_prev] + 0.50 * raw_mask_r[idx] + 0.25 * raw_mask_r[row + f_next];
+
+            let xl = mix_g.left[idx];
+            let xr = mix_g.right[idx];
+
+            // Clamp raw HTDemucs prediction magnitude against mixture magnitude to eliminate spurious pops
+            let cap_l = xl.norm() * 1.04 + 1e-9;
+            let raw_vl = voc_g.left[idx];
+            let raw_vl_norm = raw_vl.norm();
+            let safe_vl = if raw_vl_norm > cap_l {
+                raw_vl * (cap_l / raw_vl_norm)
+            } else {
+                raw_vl
+            };
+
+            let cap_r = xr.norm() * 1.04 + 1e-9;
+            let raw_vr = voc_g.right[idx];
+            let raw_vr_norm = raw_vr.norm();
+            let safe_vr = if raw_vr_norm > cap_r {
+                raw_vr * (cap_r / raw_vr_norm)
+            } else {
+                raw_vr
+            };
+
+            let vl = xl * (ml * 0.82) + safe_vl * 0.18;
+            let vr = xr * (mr * 0.82) + safe_vr * 0.18;
+
+            out_voc.left[idx] = vl;
+            out_voc.right[idx] = vr;
+            out_inst.left[idx] = xl - vl;
+            out_inst.right[idx] = xr - vr;
+        }
+    }
+
+    (stereo_istft_grid(&out_inst), stereo_istft_grid(&out_voc))
+}
+
+/// Applies two-dimensional spectro-temporal smoothing to a `[nt, nb]` gain mask:
+/// - 3-tap frequency smoothing `[0.25, 0.50, 0.25]`
+/// - Asymmetric attack/release forward pass + 1-frame pre-attack lookahead pass
+fn smooth_gain_mask_2d(raw: &[f32], nt: usize, nb: usize) -> Vec<f32> {
+    let mut freq_smoothed = vec![0.0_f32; nt * nb];
+    for t in 0..nt {
+        let row = t * nb;
+        for f in 0..nb {
+            let f0 = f.saturating_sub(1);
+            let f2 = (f + 1).min(nb - 1);
+            freq_smoothed[row + f] =
+                0.25 * raw[row + f0] + 0.50 * raw[row + f] + 0.25 * raw[row + f2];
+        }
+    }
+
+    let mut temporal = freq_smoothed.clone();
+    let alpha_attack = 0.80_f32;
+    let alpha_release = 0.32_f32;
+
+    for f in 0..nb {
+        let mut env = freq_smoothed[f];
+        for t in 1..nt {
+            let idx = t * nb + f;
+            let target = freq_smoothed[idx];
+            if target > env {
+                env = alpha_attack * target + (1.0 - alpha_attack) * env;
+            } else {
+                env = alpha_release * target + (1.0 - alpha_release) * env;
+            }
+            temporal[idx] = env;
+        }
+
+        // Gentle backward lookahead prevents clipping vocal consonant onsets
+        for t in (0..nt.saturating_sub(1)).rev() {
+            let idx = t * nb + f;
+            let next_val = temporal[(t + 1) * nb + f] * 0.65;
+            if next_val > temporal[idx] {
+                temporal[idx] = next_val;
+            }
+        }
+    }
+
+    temporal
+}
+
+/// Eliminates low-level percussive transient splats ("bẹp bẹp nhỏ") and isolated musical-noise
+/// islands leaking into `vocals`, returning the removed instrument energy back into `inst`
+/// so `inst_clean + vocals_clean == inst + vocals` with zero phase distortion.
+pub fn suppress_vocal_bleed_and_musical_noise(
+    inst: &StereoAudioBuffer,
+    vocals: &StereoAudioBuffer,
+) -> (StereoAudioBuffer, StereoAudioBuffer) {
+    const N_FFT: usize = 2048;
+    const HOP: usize = 512;
+    let frames = inst.num_frames().min(vocals.num_frames());
+    if frames < N_FFT {
+        return (inst.clone(), vocals.clone());
+    }
+
+    let mut inst_g = stereo_stft_grid(inst, N_FFT, HOP);
+    let mut voc_g = stereo_stft_grid(vocals, N_FFT, HOP);
+    let nt = inst_g.num_time.min(voc_g.num_time);
+    let nb = inst_g.num_bins;
+    let bin_hz = (vocals.sample_rate.max(1) as f32) / (N_FFT as f32);
+
+    let mut ev = vec![0.0_f32; nt * nb];
+    let mut ei = vec![0.0_f32; nt * nb];
+    let mut ratio = vec![0.0_f32; nt * nb];
+    let mut peak_ev = 0.0_f32;
+
+    for idx in 0..(nt * nb) {
+        let v_pow = voc_g.left[idx].norm_sqr() + voc_g.right[idx].norm_sqr();
+        let i_pow = inst_g.left[idx].norm_sqr() + inst_g.right[idx].norm_sqr();
+        ev[idx] = v_pow;
+        ei[idx] = i_pow;
+        ratio[idx] = v_pow / (v_pow + i_pow + 1e-14);
+        if v_pow > peak_ev {
+            peak_ev = v_pow;
+        }
+    }
+
+    if peak_ev < 1e-14 {
+        return (inst.clone(), vocals.clone());
+    }
+
+    // 1. Frame-level Vocal Activity Detection across core vocal band (140 Hz .. 4800 Hz)
+    let f_lo = ((140.0 / bin_hz).round() as usize).min(nb.saturating_sub(1));
+    let f_hi = ((4800.0 / bin_hz).round() as usize).min(nb.saturating_sub(1)).max(f_lo + 1);
+    let mut vad_raw = vec![0.0_f32; nt];
+    let mut band_ev = vec![0.0_f32; nt];
+    let mut peak_band_ev = 1e-14_f32;
+
+    for t in 0..nt {
+        let row = t * nb;
+        let mut sum_v = 0.0_f32;
+        let mut sum_i = 0.0_f32;
+        for f in f_lo..=f_hi {
+            sum_v += ev[row + f];
+            sum_i += ei[row + f];
+        }
+        band_ev[t] = sum_v;
+        if sum_v > peak_band_ev {
+            peak_band_ev = sum_v;
+        }
+        vad_raw[t] = sum_v / (sum_v + sum_i + 1e-12);
+    }
+
+    // Gate out ultra-quiet ambient frames (< -42 dB below peak vocal phrase) before dilating
+    for t in 0..nt {
+        let rel_gate = smoothstep(peak_band_ev * 2e-5, peak_band_ev * 2e-4, band_ev[t]);
+        vad_raw[t] *= rel_gate;
+    }
+
+    // Reject <35 ms transient drum spikes via 7-frame median, then max-dilate +-4 frames (~93 ms)
+    // so consonant attacks & breath releases around real vocal phrases stay 100% protected
+    let vad_med = sliding_median_1d(&vad_raw, 3);
+    let mut vad_dilated = vec![0.0_f32; nt];
+    for t in 0..nt {
+        let t0 = t.saturating_sub(4);
+        let t1 = (t + 4).min(nt - 1);
+        let mut m = 0.0_f32;
+        for item in &vad_med[t0..=t1] {
+            if *item > m {
+                m = *item;
+            }
+        }
+        vad_dilated[t] = m;
+    }
+
+    // 2. Spectro-temporal morphological island suppression & sub-bass thump cleanup
+    let mut raw_gain = vec![1.0_f32; nt * nb];
+    for t in 0..nt {
+        let presence = smoothstep(0.025, 0.11, vad_dilated[t]);
+        let low_thr = 0.060 * (1.0 - presence) + 0.006 * presence;
+        let high_thr = 0.240 * (1.0 - presence) + 0.038 * presence;
+
+        let t_prev = t.saturating_sub(1);
+        let t_next = (t + 1).min(nt - 1);
+
+        for f in 0..nb {
+            let f_prev = f.saturating_sub(1);
+            let f_next = (f + 1).min(nb - 1);
+
+            // 3x3 weighted neighborhood suppresses isolated single-bin musical noise blips
+            let r_center = ratio[t * nb + f];
+            let r_cross = ratio[t_prev * nb + f]
+                + ratio[t_next * nb + f]
+                + ratio[t * nb + f_prev]
+                + ratio[t * nb + f_next];
+            let r_diag = ratio[t_prev * nb + f_prev]
+                + ratio[t_prev * nb + f_next]
+                + ratio[t_next * nb + f_prev]
+                + ratio[t_next * nb + f_next];
+            let r_bar = (4.0 * r_center + 2.0 * r_cross + r_diag) * (1.0 / 16.0);
+
+            // 3-frame temporal median rejects broadband 1-2 frame snare/kick transient splats
+            let r_med = median3(
+                ratio[t_prev * nb + f],
+                r_center,
+                ratio[t_next * nb + f],
+            );
+            let r_eff = 0.50 * r_bar + 0.50 * r_med;
+
+            let frame_guard = presence.max(smoothstep(0.55, 0.88, r_eff));
+            let mut g = smoothstep(low_thr, high_thr, r_eff) * (0.04 + 0.96 * frame_guard);
+
+            // Sub-bass kick/tom thump cleanup (< 82 Hz) where fundamental human vocals do not exist
+            let freq = (f as f32) * bin_hz;
+            if freq < 82.0 && r_eff < 0.50 {
+                let sub_roll = smoothstep(38.0, 82.0, freq);
+                g *= sub_roll * (0.20 + 0.80 * presence);
+            }
+
+            // Quiet-tail floor cleanup for residual -58 dBFS chatter
+            let v_pow = ev[t * nb + f];
+            if v_pow < peak_ev * 2e-6 && r_eff < 0.14 {
+                g *= smoothstep(peak_ev * 1.5e-7, peak_ev * 2e-6, v_pow);
+            }
+
+            raw_gain[t * nb + f] = g;
+        }
+    }
+
+    let gain = smooth_gain_mask_2d(&raw_gain, nt, nb);
+
+    for idx in 0..(nt * nb) {
+        let g = gain[idx];
+        let keep_l = voc_g.left[idx] * g;
+        let keep_r = voc_g.right[idx] * g;
+        let bleed_l = voc_g.left[idx] - keep_l;
+        let bleed_r = voc_g.right[idx] - keep_r;
+
+        voc_g.left[idx] = keep_l;
+        voc_g.right[idx] = keep_r;
+        inst_g.left[idx] += bleed_l;
+        inst_g.right[idx] += bleed_r;
+    }
+
+    (stereo_istft_grid(&inst_g), stereo_istft_grid(&voc_g))
+}
+
+/// Suppresses intermittent lead-vocal consonant chatter leaking into `backing_vocal` during solo
+/// passages (returning those fragments cleanly to `lead_vocal`) and smoothly restores high-band
+/// air above 17.4 kHz when `restore_high_band` is true (e.g. `UVR_MDXNET_KARA_2` cropped `dim_f`).
+pub fn suppress_backing_chatter_and_restore_highs(
+    lead: &StereoAudioBuffer,
+    backing: &StereoAudioBuffer,
+    restore_high_band: bool,
+) -> (StereoAudioBuffer, StereoAudioBuffer) {
+    const N_FFT: usize = 2048;
+    const HOP: usize = 512;
+    let frames = lead.num_frames().min(backing.num_frames());
+    if frames < N_FFT {
+        return (lead.clone(), backing.clone());
+    }
+
+    let mut lead_g = stereo_stft_grid(lead, N_FFT, HOP);
+    let mut back_g = stereo_stft_grid(backing, N_FFT, HOP);
+    let nt = lead_g.num_time.min(back_g.num_time);
+    let nb = lead_g.num_bins;
+    let bin_hz = (lead.sample_rate.max(1) as f32) / (N_FFT as f32);
+
+    // Optional anti-Gibbs high-shelf continuity for MDX models cropped at ~17.6 kHz
+    if restore_high_band {
+        let ref_lo = ((11_500.0 / bin_hz).round() as usize).min(nb.saturating_sub(1));
+        let ref_hi = ((16_800.0 / bin_hz).round() as usize).min(nb.saturating_sub(1)).max(ref_lo + 1);
+        let cut_start = ((17_200.0 / bin_hz).round() as usize).min(nb.saturating_sub(1));
+
+        for t in 0..nt {
+            let row = t * nb;
+            let mut eb_ref = 0.0_f32;
+            let mut el_ref = 0.0_f32;
+            for f in ref_lo..=ref_hi {
+                eb_ref += back_g.left[row + f].norm_sqr() + back_g.right[row + f].norm_sqr();
+                el_ref += lead_g.left[row + f].norm_sqr() + lead_g.right[row + f].norm_sqr();
+            }
+            let hi_share = (eb_ref / (eb_ref + el_ref + 1e-12)).clamp(0.0, 0.85);
+            if hi_share > 0.02 {
+                for f in cut_start..nb {
+                    let freq = (f as f32) * bin_hz;
+                    let blend = smoothstep(17_200.0, 18_100.0, freq) * hi_share;
+                    let idx = row + f;
+                    let tot_l = lead_g.left[idx] + back_g.left[idx];
+                    let tot_r = lead_g.right[idx] + back_g.right[idx];
+                    let new_bl = back_g.left[idx] * (1.0 - blend) + tot_l * blend;
+                    let new_br = back_g.right[idx] * (1.0 - blend) + tot_r * blend;
+                    back_g.left[idx] = new_bl;
+                    back_g.right[idx] = new_br;
+                    lead_g.left[idx] = tot_l - new_bl;
+                    lead_g.right[idx] = tot_r - new_br;
+                }
+            }
+        }
+    }
+
+    let mut eb = vec![0.0_f32; nt * nb];
+    let mut el = vec![0.0_f32; nt * nb];
+    let mut ratio = vec![0.0_f32; nt * nb];
+    let mut peak_tot = 1e-14_f32;
+
+    for idx in 0..(nt * nb) {
+        let b_pow = back_g.left[idx].norm_sqr() + back_g.right[idx].norm_sqr();
+        let l_pow = lead_g.left[idx].norm_sqr() + lead_g.right[idx].norm_sqr();
+        eb[idx] = b_pow;
+        el[idx] = l_pow;
+        ratio[idx] = b_pow / (b_pow + l_pow + 1e-14);
+        if b_pow + l_pow > peak_tot {
+            peak_tot = b_pow + l_pow;
+        }
+    }
+
+    // Sustain detector across 160 Hz .. 12000 Hz (~104 ms median window) distinguishes true
+    // harmony phrases from short solo-vocal consonant splatter leaking into the backing stem.
+    let f_lo = ((160.0 / bin_hz).round() as usize).min(nb.saturating_sub(1));
+    let f_wide_hi = ((12_000.0 / bin_hz).round() as usize).min(nb.saturating_sub(1)).max(f_lo + 1);
+    let mut wide_b_ratio = vec![0.0_f32; nt];
+    let mut band_b_pow = vec![0.0_f32; nt];
+    let mut peak_band = 1e-14_f32;
+
+    for t in 0..nt {
+        let row = t * nb;
+        let mut sb = 0.0_f32;
+        let mut sl = 0.0_f32;
+        for f in f_lo..=f_wide_hi {
+            sb += eb[row + f];
+            sl += el[row + f];
+        }
+        band_b_pow[t] = sb;
+        if sb + sl > peak_band {
+            peak_band = sb + sl;
+        }
+        wide_b_ratio[t] = sb / (sb + sl + 1e-12);
+    }
+
+    for t in 0..nt {
+        let gate = smoothstep(peak_band * 2e-5, peak_band * 2.5e-4, band_b_pow[t]);
+        wide_b_ratio[t] *= gate;
+    }
+
+    // 9-frame (~104 ms) sliding median rejects transient <45 ms consonant/drum splats completely
+    // while keeping any real harmony note (>= 60 ms) at full strength, dilated by +-2 frames for attack/release
+    let med_b = sliding_median_1d(&wide_b_ratio, 4);
+    let mut b_sustain = vec![0.0_f32; nt];
+    for t in 0..nt {
+        let t0 = t.saturating_sub(2);
+        let t1 = (t + 2).min(nt - 1);
+        let mut m = 0.0_f32;
+        for &v in &med_b[t0..=t1] {
+            if v > m {
+                m = v;
+            }
+        }
+        b_sustain[t] = m;
+    }
+
+    let mut raw_gain = vec![1.0_f32; nt * nb];
+    for t in 0..nt {
+        let harmony_active = smoothstep(0.025, 0.10, b_sustain[t]);
+        let low_thr = 0.055 * (1.0 - harmony_active) + 0.006 * harmony_active;
+        let high_thr = 0.220 * (1.0 - harmony_active) + 0.035 * harmony_active;
+
+        let t_prev = t.saturating_sub(1);
+        let t_next = (t + 1).min(nt - 1);
+
+        for f in 0..nb {
+            let f_prev = f.saturating_sub(1);
+            let f_next = (f + 1).min(nb - 1);
+            let r_c = ratio[t * nb + f];
+            let r_cross = ratio[t_prev * nb + f]
+                + ratio[t_next * nb + f]
+                + ratio[t * nb + f_prev]
+                + ratio[t * nb + f_next];
+            let r_bar = (2.0 * r_c + r_cross) * (1.0 / 6.0);
+            let r_med = median3(ratio[t_prev * nb + f], r_c, ratio[t_next * nb + f]);
+            let r_eff = 0.55 * r_bar + 0.45 * r_med;
+
+            // Scale by frame-level harmony envelope so isolated consonant splats stolen from lead
+            // (even if el[f] == 0 at that specific harmonic bin) return cleanly to `lead_vocal`!
+            let mut g = smoothstep(low_thr, high_thr, r_eff) * harmony_active;
+            let b_pow = eb[t * nb + f];
+            if b_pow < peak_tot * 1.5e-6 && r_eff < 0.12 {
+                g *= smoothstep(peak_tot * 1.5e-7, peak_tot * 1.5e-6, b_pow);
+            }
+            raw_gain[t * nb + f] = g;
+        }
+    }
+
+    let gain = smooth_gain_mask_2d(&raw_gain, nt, nb);
+
+    for idx in 0..(nt * nb) {
+        let g = gain[idx];
+        let keep_l = back_g.left[idx] * g;
+        let keep_r = back_g.right[idx] * g;
+        let leak_l = back_g.left[idx] - keep_l;
+        let leak_r = back_g.right[idx] - keep_r;
+
+        back_g.left[idx] = keep_l;
+        back_g.right[idx] = keep_r;
+        lead_g.left[idx] += leak_l;
+        lead_g.right[idx] += leak_r;
+    }
+
+    (stereo_istft_grid(&lead_g), stereo_istft_grid(&back_g))
+}
+
+/// Applies a single uniform scalar across all 4 stems only if any stem or the summed mix exceeds
+/// `0.985`, preventing hard clipping while preserving 100% phase cancellation relationships.
+fn normalize_stems_headroom_coherent(
+    lead: &mut StereoAudioBuffer,
+    backing: &mut StereoAudioBuffer,
+    inst: &mut StereoAudioBuffer,
+    reverb: &mut StereoAudioBuffer,
+) {
+    let frames = lead
+        .num_frames()
+        .min(backing.num_frames())
+        .min(inst.num_frames())
+        .min(reverb.num_frames());
+    let mut peak = 0.0_f32;
+    for i in 0..frames {
+        let ll = lead.left[i];
+        let lr = lead.right[i];
+        let bl = backing.left[i];
+        let br = backing.right[i];
+        let il = inst.left[i];
+        let ir = inst.right[i];
+        let rl = reverb.left[i];
+        let rr = reverb.right[i];
+
+        peak = peak
+            .max(ll.abs())
+            .max(lr.abs())
+            .max(bl.abs())
+            .max(br.abs())
+            .max(il.abs())
+            .max(ir.abs())
+            .max(rl.abs())
+            .max(rr.abs())
+            .max((ll + bl + il + rl).abs())
+            .max((lr + br + ir + rr).abs());
+    }
+
+    if peak > 0.985 {
+        let scale = 0.985 / peak;
+        for buf in [lead, backing, inst, reverb] {
+            for s in &mut buf.left {
+                *s *= scale;
+            }
+            for s in &mut buf.right {
+                *s *= scale;
+            }
+        }
+    }
+}
+
 /// Runs the complete 3-Stage Local AI Separation Pipeline:
-/// 1. Instrumental vs. All Vocals
-/// 2. Backing Vocal vs. Lead Vocal
-/// 3. Dry Lead Vocal vs. Reverb Tail
+/// 1. Instrumental vs. All Vocals (+ Spectro-Temporal De-Bleed & Sub-Bass Cleanup)
+/// 2. Backing Vocal vs. Lead Vocal (+ Backing De-Chatter & High-Band Continuity)
+/// 3. Dry Lead Vocal vs. Reverb Tail (+ Coherent Headroom Protection)
 pub fn separate_3_stage_stems<F>(
     env: &Environment,
     models_dir: &Path,
@@ -897,7 +1682,7 @@ where
     // Stage 1: Instrumental & All Vocals
     let stage1_path = models_dir.join(&pipeline.stage1_inst_model.model_filename);
     let (mut sess1, mut active_backend) = create_mdx_session(env, &stage1_path, device)?;
-    let (instrumental, all_vocals) = if pipeline.stage1_inst_model.model_filename == "htdemucs.onnx" {
+    let (raw_inst, raw_all_vocals) = if pipeline.stage1_inst_model.model_filename == "htdemucs.onnx" {
         let dml_res = run_htdemucs_onnx_model(&mut sess1, audio, |c, total| {
             let pct = (c as f32 / total as f32) * 40.0;
             on_progress(SeparationProgress {
@@ -953,92 +1738,105 @@ where
         }
     };
 
+    // Clean percussive transient bleed ("bẹp bẹp nhỏ") from vocals before Stage 2 Karaoke split
+    let (mut instrumental, all_vocals) =
+        suppress_vocal_bleed_and_musical_noise(&raw_inst, &raw_all_vocals);
+
     // Stage 2: Backing Vocal & Lead Vocal
     let stage2_path = models_dir.join(&pipeline.stage2_karaoke_model.model_filename);
     let (mut sess2, ep2) = create_mdx_session(env, &stage2_path, device)?;
     if active_backend.contains("CPU") || ep2.contains("CUDA") {
         active_backend = ep2;
     }
-    let (backing_vocal, lead_with_reverb) =
-        if pipeline.stage2_karaoke_model.model_filename == "mel_band_roformer_karaoke_aufr33_viperx.onnx" {
-            let dml_res = run_roformer_karaoke_onnx_model(
-                &mut sess2,
-                &all_vocals,
-                &pipeline.stage2_karaoke_model,
-                |c, total| {
-                    let pct = 40.0 + (c as f32 / total as f32) * 35.0;
-                    on_progress(SeparationProgress {
-                        stage_index: 2,
-                        stage_name: format!("Stage 2/3: {}", pipeline.stage2_karaoke_model.model_filename),
-                        chunk_index: c,
-                        total_chunks: total,
-                        overall_percent: pct,
-                    });
-                },
-            );
-            let model_out = match dml_res {
-                Ok(out) => out,
-                Err(_) if !matches!(device, ExecutionDevice::Cpu { .. }) => {
-                    drop(sess2);
-                    let (mut cpu_sess, cpu_ep) = create_mdx_session(
-                        env,
-                        &stage2_path,
-                        ExecutionDevice::Cpu {
-                            intra_threads: auto_threads,
-                        },
-                    )?;
-                    active_backend = cpu_ep;
-                    run_roformer_karaoke_onnx_model(
-                        &mut cpu_sess,
-                        &all_vocals,
-                        &pipeline.stage2_karaoke_model,
-                        |c, total| {
-                            let pct = 40.0 + (c as f32 / total as f32) * 35.0;
-                            on_progress(SeparationProgress {
-                                stage_index: 2,
-                                stage_name: format!("Stage 2/3 (CPU): {}", pipeline.stage2_karaoke_model.model_filename),
-                                chunk_index: c,
-                                total_chunks: total,
-                                overall_percent: pct,
-                            });
-                        },
-                    )?
-                }
-                Err(e) => return Err(e),
-            };
-            if pipeline.stage2_karaoke_model.outputs_vocals {
-                let backing = subtract_stereo_buffers(&all_vocals, &model_out);
-                (backing, model_out)
-            } else {
-                // mel_band_roformer_karaoke_aufr33_viperx outputs Karaoke/Backing Vocal (lead removed)
-                let lead = subtract_stereo_buffers(&all_vocals, &model_out);
-                (model_out, lead)
+    let is_roformer_kara =
+        pipeline.stage2_karaoke_model.model_filename == "mel_band_roformer_karaoke_aufr33_viperx.onnx";
+    let (raw_backing, raw_lead_with_reverb) = if is_roformer_kara {
+        let dml_res = run_roformer_karaoke_onnx_model(
+            &mut sess2,
+            &all_vocals,
+            &pipeline.stage2_karaoke_model,
+            |c, total| {
+                let pct = 40.0 + (c as f32 / total as f32) * 35.0;
+                on_progress(SeparationProgress {
+                    stage_index: 2,
+                    stage_name: format!("Stage 2/3: {}", pipeline.stage2_karaoke_model.model_filename),
+                    chunk_index: c,
+                    total_chunks: total,
+                    overall_percent: pct,
+                });
+            },
+        );
+        let model_out = match dml_res {
+            Ok(out) => out,
+            Err(_) if !matches!(device, ExecutionDevice::Cpu { .. }) => {
+                drop(sess2);
+                let (mut cpu_sess, cpu_ep) = create_mdx_session(
+                    env,
+                    &stage2_path,
+                    ExecutionDevice::Cpu {
+                        intra_threads: auto_threads,
+                    },
+                )?;
+                active_backend = cpu_ep;
+                run_roformer_karaoke_onnx_model(
+                    &mut cpu_sess,
+                    &all_vocals,
+                    &pipeline.stage2_karaoke_model,
+                    |c, total| {
+                        let pct = 40.0 + (c as f32 / total as f32) * 35.0;
+                        on_progress(SeparationProgress {
+                            stage_index: 2,
+                            stage_name: format!("Stage 2/3 (CPU): {}", pipeline.stage2_karaoke_model.model_filename),
+                            chunk_index: c,
+                            total_chunks: total,
+                            overall_percent: pct,
+                        });
+                    },
+                )?
             }
-        } else {
-            let backing = run_mdx_onnx_model(
-                &mut sess2,
-                &all_vocals,
-                &pipeline.stage2_karaoke_model,
-                |c, total| {
-                    let pct = 40.0 + (c as f32 / total as f32) * 35.0;
-                    on_progress(SeparationProgress {
-                        stage_index: 2,
-                        stage_name: format!("Stage 2/3: {}", pipeline.stage2_karaoke_model.model_filename),
-                        chunk_index: c,
-                        total_chunks: total,
-                        overall_percent: pct,
-                    });
-                },
-            )?;
-            let lead = subtract_stereo_buffers(&all_vocals, &backing);
-            (backing, lead)
+            Err(e) => return Err(e),
         };
+        if pipeline.stage2_karaoke_model.outputs_vocals {
+            let backing = subtract_stereo_buffers(&all_vocals, &model_out);
+            (backing, model_out)
+        } else {
+            // mel_band_roformer_karaoke_aufr33_viperx outputs Karaoke/Backing Vocal (lead removed)
+            let lead = subtract_stereo_buffers(&all_vocals, &model_out);
+            (model_out, lead)
+        }
+    } else {
+        let backing = run_mdx_onnx_model(
+            &mut sess2,
+            &all_vocals,
+            &pipeline.stage2_karaoke_model,
+            |c, total| {
+                let pct = 40.0 + (c as f32 / total as f32) * 35.0;
+                on_progress(SeparationProgress {
+                    stage_index: 2,
+                    stage_name: format!("Stage 2/3: {}", pipeline.stage2_karaoke_model.model_filename),
+                    chunk_index: c,
+                    total_chunks: total,
+                    overall_percent: pct,
+                });
+            },
+        )?;
+        let lead = subtract_stereo_buffers(&all_vocals, &backing);
+        (backing, lead)
+    };
+
+    let stage2_cropped_highs = !is_roformer_kara
+        && pipeline.stage2_karaoke_model.dim_f + 64 < (pipeline.stage2_karaoke_model.n_fft / 2 + 1);
+    let (lead_with_reverb, mut backing_vocal) = suppress_backing_chatter_and_restore_highs(
+        &raw_lead_with_reverb,
+        &raw_backing,
+        stage2_cropped_highs,
+    );
 
     // Stage 3: Optional De-Reverb (Dry Lead Vocal vs. Reverb Tail)
     let stage3_path = models_dir.join(&pipeline.stage3_dereverb_model.model_filename);
-    let (lead_vocal, reverb_tail) = if pipeline.enable_dereverb && stage3_path.is_file() {
+    let (mut lead_vocal, mut reverb_tail) = if pipeline.enable_dereverb && stage3_path.is_file() {
         let (mut sess3, _) = create_mdx_session(env, &stage3_path, device)?;
-        let dry_lead = run_mdx_onnx_model(
+        let raw_dry_lead = run_mdx_onnx_model(
             &mut sess3,
             &lead_with_reverb,
             &pipeline.stage3_dereverb_model,
@@ -1053,8 +1851,10 @@ where
                 });
             },
         )?;
-        let tail = subtract_stereo_buffers(&lead_with_reverb, &dry_lead);
-        (dry_lead, tail)
+        let raw_tail = subtract_stereo_buffers(&lead_with_reverb, &raw_dry_lead);
+        let stage3_cropped_highs = pipeline.stage3_dereverb_model.dim_f + 64
+            < (pipeline.stage3_dereverb_model.n_fft / 2 + 1);
+        suppress_backing_chatter_and_restore_highs(&raw_dry_lead, &raw_tail, stage3_cropped_highs)
     } else {
         let silent = vec![0.0_f32; lead_with_reverb.num_frames()];
         let empty_reverb = StereoAudioBuffer::new(audio.sample_rate, silent.clone(), silent);
@@ -1067,6 +1867,13 @@ where
         });
         (lead_with_reverb, empty_reverb)
     };
+
+    normalize_stems_headroom_coherent(
+        &mut lead_vocal,
+        &mut backing_vocal,
+        &mut instrumental,
+        &mut reverb_tail,
+    );
 
     Ok(SeparatedStems {
         lead_vocal,
@@ -1129,6 +1936,206 @@ mod tests {
         assert!((diff.left[0] - 0.5).abs() < 1e-6);
         assert!((diff.left[1] - (-0.3)).abs() < 1e-6);
         assert!((diff.right[2] - (-0.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_reflect_padding_and_trimmed_chunk_seamless_unity() {
+        let src = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        let padded = reflect_pad_slice(&src, 3, 3);
+        assert_eq!(
+            padded,
+            vec![40.0, 30.0, 20.0, 10.0, 20.0, 30.0, 40.0, 50.0, 40.0, 30.0, 20.0]
+        );
+
+        // Verify unity overlap-add for both even (MDX 4096) and odd (RoFormer-like 3999) chunk lengths
+        for &chunk_len in &[4096usize, 3999usize] {
+            let total_frames = 11_250usize;
+            let step = chunk_len / 2;
+            let margin_pad = step;
+            let starts = build_chunk_starts(total_frames, step, margin_pad);
+            let acc_len = starts.last().copied().unwrap_or(0) + chunk_len;
+            let win = trimmed_chunk_window(chunk_len, step);
+
+            // Outermost edges of each chunk must be strictly 0.0 to trim neural border artifacts
+            assert_eq!(win[0], 0.0);
+            assert_eq!(win[chunk_len - 1], 0.0);
+
+            let mut weight_acc = vec![0.0_f32; acc_len];
+            for &s in &starts {
+                for i in 0..chunk_len {
+                    weight_acc[s + i] += win[i];
+                }
+            }
+
+            for i in margin_pad..(margin_pad + total_frames) {
+                assert!(
+                    weight_acc[i] > 0.98,
+                    "Overlap weight dipped too low at sample {} (chunk_len={}): {}",
+                    i,
+                    chunk_len,
+                    weight_acc[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_vocal_bleed_and_musical_noise_suppression_preserves_sum_and_removes_splats() {
+        let sr = 44_100u32;
+        let frames = sr as usize * 2; // 2.0 seconds
+        let mut inst_l = vec![0.0_f32; frames];
+        let mut inst_r = vec![0.0_f32; frames];
+        let mut voc_l = vec![0.0_f32; frames];
+        let mut voc_r = vec![0.0_f32; frames];
+
+        for i in 0..frames {
+            let t = i as f32 / sr as f32;
+            // Instrumental: continuous 55 Hz bass/kick + sharp snare transient burst at t = 0.30..0.33s
+            let kick = 0.45 * (2.0 * PI * 55.0 * t).sin();
+            let snare = if (0.30..0.33).contains(&t) {
+                0.55 * (2.0 * PI * 920.0 * t).sin() + 0.35 * (2.0 * PI * 2450.0 * t).cos()
+            } else {
+                0.0
+            };
+            inst_l[i] = kick + snare;
+            inst_r[i] = kick + snare * 0.9;
+
+            // Vocals: silent in 0.0..0.85s EXCEPT a 6% drum splat ("bẹp bẹp nhỏ") + 55 Hz thump bleed,
+            // followed by a real sustained harmonic vocal phrase in 1.0..1.75s.
+            let bleed_splat = 0.055 * kick + 0.065 * snare;
+            let real_vocal = if (1.0..1.75).contains(&t) {
+                0.42 * (2.0 * PI * 330.0 * t).sin()
+                    + 0.24 * (2.0 * PI * 660.0 * t).sin()
+                    + 0.12 * (2.0 * PI * 1320.0 * t).cos()
+            } else {
+                0.0
+            };
+            voc_l[i] = bleed_splat + real_vocal;
+            voc_r[i] = bleed_splat + real_vocal;
+        }
+
+        let raw_inst = StereoAudioBuffer::new(sr, inst_l, inst_r);
+        let raw_voc = StereoAudioBuffer::new(sr, voc_l, voc_r);
+
+        let (clean_inst, clean_voc) = suppress_vocal_bleed_and_musical_noise(&raw_inst, &raw_voc);
+
+        // 1. Exact mixture conservation: clean_inst + clean_voc == raw_inst + raw_voc
+        let mut max_sum_err = 0.0_f32;
+        for i in 2048..(frames - 2048) {
+            let orig_sum = raw_inst.left[i] + raw_voc.left[i];
+            let new_sum = clean_inst.left[i] + clean_voc.left[i];
+            max_sum_err = max_sum_err.max((orig_sum - new_sum).abs());
+        }
+        assert!(
+            max_sum_err < 1e-4,
+            "Phase/mixture sum drifted by {}",
+            max_sum_err
+        );
+
+        // 2. Drum splat + sub-bass bleed in non-vocal region (0.15..0.55s) must be heavily attenuated (> 95% power drop)
+        let splat_range = (sr as usize * 15 / 100)..(sr as usize * 55 / 100);
+        let raw_bleed_pow: f32 = splat_range.clone().map(|i| raw_voc.left[i].powi(2)).sum();
+        let clean_bleed_pow: f32 = splat_range.map(|i| clean_voc.left[i].powi(2)).sum();
+        assert!(
+            clean_bleed_pow < raw_bleed_pow * 0.04,
+            "Expected >14 dB bleed power reduction, got raw={} clean={}",
+            raw_bleed_pow,
+            clean_bleed_pow
+        );
+
+        // 3. Real sustained vocal phrase (1.15..1.60s) must remain intact
+        let phrase_range = (sr as usize * 115 / 100)..(sr as usize * 160 / 100);
+        let raw_voc_pow: f32 = phrase_range.clone().map(|i| raw_voc.left[i].powi(2)).sum();
+        let clean_voc_pow: f32 = phrase_range.map(|i| clean_voc.left[i].powi(2)).sum();
+        let ratio_preserved = clean_voc_pow / raw_voc_pow;
+        assert!(
+            ratio_preserved > 0.94,
+            "Sustained vocal phrase attenuated too much: ratio={}",
+            ratio_preserved
+        );
+    }
+
+    #[test]
+    fn test_backing_chatter_suppression_and_htdemucs_wiener_consistency() {
+        let sr = 44_100u32;
+        let frames = sr as usize * 2;
+        let mut lead_l = vec![0.0_f32; frames];
+        let mut back_l = vec![0.0_f32; frames];
+
+        for i in 0..frames {
+            let t = i as f32 / sr as f32;
+            // Lead vocal sings solo in 0.2..0.9s, then duet harmony joins in 1.1..1.8s
+            let solo_lead = if (0.2..1.8).contains(&t) {
+                0.45 * (2.0 * PI * 440.0 * t).sin() + 0.20 * (2.0 * PI * 880.0 * t).sin()
+            } else {
+                0.0
+            };
+            // Spurious short 20ms consonant leak at t=0.50..0.52s on backing stem vs true harmony in 1.1..1.8s
+            let chatter = if (0.50..0.52).contains(&t) {
+                0.05 * (2.0 * PI * 1760.0 * t).sin()
+            } else {
+                0.0
+            };
+            let true_harmony = if (1.1..1.8).contains(&t) {
+                0.32 * (2.0 * PI * 554.37 * t).sin() + 0.16 * (2.0 * PI * 1108.73 * t).sin()
+            } else {
+                0.0
+            };
+            lead_l[i] = solo_lead;
+            back_l[i] = chatter + true_harmony;
+        }
+
+        let lead_buf = StereoAudioBuffer::new(sr, lead_l.clone(), lead_l);
+        let back_buf = StereoAudioBuffer::new(sr, back_l.clone(), back_l);
+        let (clean_lead, clean_back) =
+            suppress_backing_chatter_and_restore_highs(&lead_buf, &back_buf, true);
+
+        let chatter_slice = (sr as usize * 48 / 100)..(sr as usize * 55 / 100);
+        let raw_chat_pow: f32 = chatter_slice.clone().map(|i| back_buf.left[i].powi(2)).sum();
+        let clean_chat_pow: f32 = chatter_slice.map(|i| clean_back.left[i].powi(2)).sum();
+        assert!(
+            clean_chat_pow < raw_chat_pow * 0.05,
+            "Backing chatter not sufficiently suppressed: raw={} clean={}",
+            raw_chat_pow,
+            clean_chat_pow
+        );
+
+        let harmony_slice = (sr as usize * 125 / 100)..(sr as usize * 165 / 100);
+        let raw_harm_pow: f32 = harmony_slice.clone().map(|i| back_buf.left[i].powi(2)).sum();
+        let clean_harm_pow: f32 = harmony_slice.map(|i| clean_back.left[i].powi(2)).sum();
+        assert!(
+            clean_harm_pow > raw_harm_pow * 0.90,
+            "True backing harmony should remain intact"
+        );
+
+        // Verify HTDemucs Wiener consistency removes synthetic time-domain pops & preserves mix sum
+        let mix = StereoAudioBuffer::new(
+            sr,
+            (0..frames)
+                .map(|i| clean_lead.left[i] + clean_back.left[i])
+                .collect(),
+            (0..frames)
+                .map(|i| clean_lead.right[i] + clean_back.right[i])
+                .collect(),
+        );
+        let mut noisy_voc = clean_back.clone();
+        // Inject an artificial ConvTranspose1d pop where mix is completely silent (t = 0.08s)
+        for i in 3500..3600 {
+            noisy_voc.left[i] += 0.35;
+            noisy_voc.right[i] += 0.35;
+        }
+        let (w_inst, w_voc) = apply_htdemucs_wiener_consistency(&mix, &clean_lead, &noisy_voc);
+        for i in 3500..3600 {
+            assert!(
+                w_voc.left[i].abs() < 0.02,
+                "HTDemucs Wiener projection must suppress spurious pop in silent mix region, got {}",
+                w_voc.left[i]
+            );
+            assert!(
+                (w_inst.left[i] + w_voc.left[i] - mix.left[i]).abs() < 1e-4,
+                "HTDemucs Wiener sum must equal original mix"
+            );
+        }
     }
 
     #[test]
